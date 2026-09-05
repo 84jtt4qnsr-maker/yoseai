@@ -25,7 +25,7 @@ const AGENT_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_BACKLOG = 10;
 
 function defaultAgent() {
-  return { auto: true, sessionId: null, lastSeenTs: Date.now(), lastError: "" };
+  return { auto: true, sessionId: null, lastSeenTs: Date.now(), lastError: "", model: "" };
 }
 
 function defaultRelay() {
@@ -206,7 +206,29 @@ async function callClaude(prompt, sessionId) {
   if (code !== 0) throw new Error((err || out || "claude CLI エラー").trim().slice(0, 500));
   const parsed = JSON.parse(out);
   if (parsed.is_error) throw new Error(String(parsed.result || "claude エラー").slice(0, 500));
-  return { text: parsed.result || "(空の応答)", sessionId: parsed.session_id || sessionId };
+  // modelUsage のキーがモデルID（"claude-opus-5[1m]" の [1m] はfastモード印なので除く）
+  const model = Object.keys(parsed.modelUsage || {})[0]?.replace(/\[.*\]$/, "") || "";
+  return { text: parsed.result || "(空の応答)", sessionId: parsed.session_id || sessionId, model };
+}
+
+// codex は --json だとモデル名を出力しないため、セッションの rollout ファイル冒頭から読む
+function codexModelFromRollout(sessionId) {
+  if (!sessionId) return "";
+  try {
+    const files = fs.globSync(path.join(os.homedir(), ".codex/sessions/**/rollout-*" + sessionId + ".jsonl"));
+    if (!files.length) return "";
+    for (const line of fs.readFileSync(files[0], "utf8").split("\n").slice(0, 10)) {
+      try {
+        const m = JSON.parse(line)?.payload?.model;
+        if (typeof m === "string" && m) return m;
+      } catch {
+        // JSON でない行は無視
+      }
+    }
+  } catch {
+    // rollout が読めなくてもモデル名表示を諦めるだけ
+  }
+  return "";
 }
 
 async function callCodex(prompt, sessionId) {
@@ -236,7 +258,7 @@ async function callCodex(prompt, sessionId) {
     }
   }
   if (code !== 0 && !text) throw new Error((err || out || "codex CLI エラー").trim().slice(0, 500));
-  return { text: text || "(空の応答)", sessionId: newSessionId };
+  return { text: text || "(空の応答)", sessionId: newSessionId, model: codexModelFromRollout(newSessionId) };
 }
 
 function unseenFor(agent) {
@@ -262,8 +284,9 @@ async function agentLoop(agent) {
       const prompt = buildPrompt(agent, msgs, !a.sessionId);
       try {
         const call = agent === "claude" ? callClaude : callCodex;
-        const { text, sessionId } = await call(prompt, a.sessionId);
+        const { text, sessionId, model } = await call(prompt, a.sessionId);
         a.sessionId = sessionId;
+        if (model) a.model = model;
         a.lastSeenTs = msgs[msgs.length - 1].ts;
         a.lastError = "";
         state.messages.push({ id: id(), thread: agent, author: agent, text, auto: true, ts: Date.now() });

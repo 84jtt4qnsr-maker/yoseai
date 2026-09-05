@@ -54,6 +54,7 @@
     resize: vertical;
   }
   #qa-hops { width: 64px; }
+  #qa-bar[hidden] { display: none; }
   #qa-bar {
     border-bottom: 1px solid var(--line);
     background: var(--panel);
@@ -131,6 +132,18 @@
   }
   .thread-head .auto-ctl input { accent-color: var(--user); }
   .agent-status { font-size: 11.5px; margin-left: 10px; font-weight: 400; }
+  .model-chip {
+    font-size: 11px;
+    font-weight: 400;
+    font-family: ui-monospace, "SF Mono", monospace;
+    color: var(--dim);
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 1px 9px;
+    margin-left: 10px;
+  }
+  .model-chip:empty { display: none; }
   .agent-status[data-s="running"] { color: var(--codex); }
   .agent-status[data-s="error"] { color: var(--danger); cursor: help; }
   .typing {
@@ -289,7 +302,7 @@
 <main>
   <!-- Claude Code 側スレッド -->
   <section class="thread-col" data-agent="claude">
-    <div class="thread-head"><span class="role-dot"></span>Claude Code 側スレッド<span class="count" id="count-claude"></span><span class="agent-status" id="status-claude"></span>
+    <div class="thread-head"><span class="role-dot"></span>Claude Code 側スレッド<span class="model-chip" id="model-claude"></span><span class="count" id="count-claude"></span><span class="agent-status" id="status-claude"></span>
       <label class="auto-ctl"><input type="checkbox" id="auto-claude" />自動応答</label>
     </div>
     <div class="messages" id="messages-claude"></div>
@@ -305,7 +318,7 @@
 
   <!-- Codex 側スレッド -->
   <section class="thread-col" data-agent="codex">
-    <div class="thread-head"><span class="role-dot"></span>Codex 側スレッド<span class="count" id="count-codex"></span><span class="agent-status" id="status-codex"></span>
+    <div class="thread-head"><span class="role-dot"></span>Codex 側スレッド<span class="model-chip" id="model-codex"></span><span class="count" id="count-codex"></span><span class="agent-status" id="status-codex"></span>
       <label class="auto-ctl"><input type="checkbox" id="auto-codex" />自動応答</label>
     </div>
     <div class="messages" id="messages-codex"></div>
@@ -428,6 +441,7 @@ function renderAgentStatus(agent) {
   const status = $("#status-" + agent);
   const checkbox = $("#auto-" + agent);
   checkbox.checked = !!a.auto;
+  $("#model-" + agent).textContent = a.model || "";
   if (state.running && state.running[agent]) {
     status.dataset.s = "running";
     status.textContent = "応答中…";
