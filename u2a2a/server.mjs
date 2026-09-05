@@ -25,7 +25,7 @@ const AGENT_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_BACKLOG = 10;
 
 function defaultAgent() {
-  return { auto: true, sessionId: null, lastSeenTs: Date.now(), lastError: "", model: "" };
+  return { auto: true, sessionId: null, lastSeenTs: Date.now(), lastError: "", model: "", modelOverride: "" };
 }
 
 function defaultRelay() {
@@ -198,10 +198,11 @@ function qaHop(agent, replyText) {
   if (state.agents[other].auto) agentLoop(other);
 }
 
-async function callClaude(prompt, sessionId) {
+async function callClaude(prompt, sessionId, modelOverride) {
   // プロンプトは stdin 渡し（"---" 等で始まってもオプションと誤認されないように）
   const args = ["-p", "--output-format", "json"];
   if (sessionId) args.push("--resume", sessionId);
+  if (modelOverride) args.push("--model", modelOverride);
   const { code, out, err } = await runCli("claude", args, prompt);
   if (code !== 0) throw new Error((err || out || "claude CLI エラー").trim().slice(0, 500));
   const parsed = JSON.parse(out);
@@ -231,13 +232,14 @@ function codexModelFromRollout(sessionId) {
   return "";
 }
 
-async function callCodex(prompt, sessionId) {
+async function callCodex(prompt, sessionId, modelOverride) {
   const outFile = path.join(os.tmpdir(), `u2a2a-codex-${id()}.txt`);
   const base = ["--json", "-o", outFile, "--skip-git-repo-check"];
   // resume は -s / -C を受け付けない（元セッションから継承）。config 経由で read-only を明示する
   const args = sessionId
     ? ["exec", "resume", sessionId, "-", ...base, "-c", 'sandbox_mode="read-only"']
     : ["exec", "-", ...base, "-s", "read-only", "-C", REPO_ROOT];
+  if (modelOverride) args.push("-m", modelOverride);
   const { code, out, err } = await runCli("codex", args, prompt);
   let text = "";
   try {
@@ -284,7 +286,7 @@ async function agentLoop(agent) {
       const prompt = buildPrompt(agent, msgs, !a.sessionId);
       try {
         const call = agent === "claude" ? callClaude : callCodex;
-        const { text, sessionId, model } = await call(prompt, a.sessionId);
+        const { text, sessionId, model } = await call(prompt, a.sessionId, a.modelOverride);
         a.sessionId = sessionId;
         if (model) a.model = model;
         a.lastSeenTs = msgs[msgs.length - 1].ts;
@@ -384,6 +386,10 @@ async function handleApi(req, res, url) {
     if (typeof body.auto === "boolean") {
       a.auto = body.auto;
       if (body.auto) a.lastSeenTs = Date.now(); // ON にした時点から先の新着のみ拾う
+      a.lastError = "";
+    }
+    if (typeof body.model === "string") {
+      a.modelOverride = body.model.trim();
       a.lastError = "";
     }
     if (body.resetSession) a.sessionId = null;
