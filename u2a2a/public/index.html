@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>U2A2A Orchestration</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b23;
+    --panel-2: #1c232e;
+    --line: #2a3341;
+    --text: #dce3ec;
+    --dim: #8a96a6;
+    --user: #7bd88f;
+    --claude: #ffab5e;
+    --codex: #6fd7ff;
+    --danger: #ff7b7b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.65 -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 10px 18px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: 0.04em; }
+  header .sub { color: var(--dim); font-size: 12px; }
+
+  /* ユーザー帯（Canvas 上段・緑） */
+  #user-band {
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    padding: 10px 18px;
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+  }
+  #user-band .role-dot { background: var(--user); }
+  #user-band textarea {
+    flex: 1;
+    min-height: 44px;
+    max-height: 140px;
+    resize: vertical;
+  }
+  .role-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    display: inline-block; margin-right: 6px; flex: none;
+    align-self: center;
+  }
+  textarea, select, input {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font: inherit;
+  }
+  textarea:focus, select:focus, input:focus { outline: 1px solid var(--dim); }
+  button {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 7px 14px;
+    font: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover { border-color: var(--dim); }
+  button.small { padding: 2px 8px; font-size: 11.5px; color: var(--dim); border-radius: 6px; }
+  button.small:hover { color: var(--text); }
+
+  /* スレッド 2 列（Canvas 中段） */
+  main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0;
+    min-height: 0;
+  }
+  .thread-col {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+  }
+  .thread-col + .thread-col { border-left: 1px solid var(--line); }
+  .thread-head {
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: center;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+  }
+  .thread-col[data-agent="claude"] .thread-head .role-dot { background: var(--claude); }
+  .thread-col[data-agent="codex"] .thread-head .role-dot { background: var(--codex); }
+  .thread-head .count { color: var(--dim); font-weight: 400; font-size: 12px; margin-left: 8px; }
+  .thread-head .auto-ctl {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--dim);
+    cursor: pointer;
+    user-select: none;
+  }
+  .thread-head .auto-ctl input { accent-color: var(--user); }
+  .agent-status { font-size: 11.5px; margin-left: 10px; font-weight: 400; }
+  .agent-status[data-s="running"] { color: var(--codex); }
+  .agent-status[data-s="error"] { color: var(--danger); cursor: help; }
+  .typing {
+    color: var(--dim);
+    font-size: 12.5px;
+    padding: 2px 4px;
+  }
+  .typing::after {
+    content: "…";
+    animation: dots 1.2s steps(4) infinite;
+  }
+  @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
+
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 120px;
+  }
+  .msg {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--dim);
+    border-radius: 8px;
+    padding: 8px 12px;
+  }
+  .msg[data-author="user"] { border-left-color: var(--user); }
+  .msg[data-author="claude"] { border-left-color: var(--claude); }
+  .msg[data-author="codex"] { border-left-color: var(--codex); }
+  .msg .meta {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    font-size: 11.5px;
+    color: var(--dim);
+    margin-bottom: 3px;
+  }
+  .msg .meta .who { font-weight: 600; }
+  .msg[data-author="user"] .who { color: var(--user); }
+  .msg[data-author="claude"] .who { color: var(--claude); }
+  .msg[data-author="codex"] .who { color: var(--codex); }
+  .msg .body { white-space: pre-wrap; word-break: break-word; }
+  .msg .actions { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .empty { color: var(--dim); font-size: 12.5px; text-align: center; margin-top: 24px; }
+
+  /* エージェント返答入力 */
+  .agent-input {
+    border-top: 1px solid var(--line);
+    padding: 10px 16px;
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    background: var(--panel);
+  }
+  .agent-input textarea { flex: 1; min-height: 38px; max-height: 120px; resize: vertical; }
+
+  /* タスクキュー（Canvas 下段） */
+  .task-zone {
+    border-top: 1px solid var(--line);
+    padding: 8px 16px 12px;
+    max-height: 34vh;
+    overflow-y: auto;
+  }
+  .task-zone h2 {
+    font-size: 12px;
+    color: var(--dim);
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    margin: 4px 0 8px;
+  }
+  .task {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 7px 10px;
+    margin-bottom: 8px;
+  }
+  .task .t-head { display: flex; gap: 8px; align-items: center; }
+  .task .t-title { font-weight: 600; flex: 1; word-break: break-word; }
+  .task .t-detail { color: var(--dim); font-size: 12.5px; white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
+  .task .t-result { font-size: 12.5px; white-space: pre-wrap; word-break: break-word; margin-top: 4px; border-top: 1px dashed var(--line); padding-top: 4px; }
+  .task .actions { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .status {
+    font-size: 11px;
+    border-radius: 999px;
+    padding: 1px 9px;
+    border: 1px solid var(--line);
+    color: var(--dim);
+    flex: none;
+  }
+  .status[data-s="queued"]   { color: #d8c56f; border-color: #d8c56f55; }
+  .status[data-s="working"]  { color: var(--codex); border-color: #6fd7ff55; }
+  .status[data-s="returned"] { color: var(--claude); border-color: #ffab5e55; }
+  .status[data-s="done"]     { color: var(--user); border-color: #7bd88f55; }
+
+  dialog {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 18px;
+    width: min(520px, 92vw);
+  }
+  dialog::backdrop { background: #0009; }
+  dialog h3 { margin: 0 0 12px; font-size: 15px; }
+  dialog .field { margin-bottom: 10px; display: flex; flex-direction: column; gap: 4px; }
+  dialog label { font-size: 12px; color: var(--dim); }
+  dialog input, dialog textarea { width: 100%; }
+  dialog textarea { min-height: 90px; resize: vertical; }
+  dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
+  #toast {
+    position: fixed;
+    bottom: 18px; left: 50%;
+    transform: translateX(-50%);
+    background: var(--panel-2);
+    border: 1px solid var(--dim);
+    border-radius: 8px;
+    padding: 7px 16px;
+    font-size: 13px;
+    opacity: 0;
+    transition: opacity 0.25s;
+    pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>U2A2A Orchestration</h1>
+  <span class="sub">ユーザー ⇄ Claude Code ⇄ Codex ／ やり取りから生まれたタスクを各アプリで作業し、結果を再入力する</span>
+</header>
+
+<!-- ユーザー側（閲覧・回答・質問） -->
+<div id="user-band">
+  <span class="role-dot" title="ユーザー"></span>
+  <textarea id="user-text" placeholder="ユーザーとして発言（回答・質問）— Cmd+Enter で送信"></textarea>
+  <select id="user-target" title="送信先スレッド">
+    <option value="claude">→ Claude Code</option>
+    <option value="codex">→ Codex</option>
+    <option value="both">→ 両方</option>
+  </select>
+  <button id="user-send">送信</button>
+</div>
+
+<main>
+  <!-- Claude Code 側スレッド -->
+  <section class="thread-col" data-agent="claude">
+    <div class="thread-head"><span class="role-dot"></span>Claude Code 側スレッド<span class="count" id="count-claude"></span><span class="agent-status" id="status-claude"></span>
+      <label class="auto-ctl"><input type="checkbox" id="auto-claude" />自動応答</label>
+    </div>
+    <div class="messages" id="messages-claude"></div>
+    <div class="agent-input">
+      <textarea id="input-claude" placeholder="Claude Code の返答・質問を貼り付け／入力 — Cmd+Enter で追加"></textarea>
+      <button data-agent-send="claude">Claude として追加</button>
+    </div>
+    <div class="task-zone">
+      <h2>CLAUDE CODE タスクキュー — Claude Code アプリ内で作業</h2>
+      <div id="tasks-claude"></div>
+    </div>
+  </section>
+
+  <!-- Codex 側スレッド -->
+  <section class="thread-col" data-agent="codex">
+    <div class="thread-head"><span class="role-dot"></span>Codex 側スレッド<span class="count" id="count-codex"></span><span class="agent-status" id="status-codex"></span>
+      <label class="auto-ctl"><input type="checkbox" id="auto-codex" />自動応答</label>
+    </div>
+    <div class="messages" id="messages-codex"></div>
+    <div class="agent-input">
+      <textarea id="input-codex" placeholder="Codex の返答・質問を貼り付け／入力 — Cmd+Enter で追加"></textarea>
+      <button data-agent-send="codex">Codex として追加</button>
+    </div>
+    <div class="task-zone">
+      <h2>CODEX タスクキュー — Codex アプリ内で作業</h2>
+      <div id="tasks-codex"></div>
+    </div>
+  </section>
+</main>
+
+<!-- タスク化ダイアログ -->
+<dialog id="task-dialog">
+  <h3>タスク化</h3>
+  <div class="field">
+    <label>担当</label>
+    <select id="task-agent">
+      <option value="claude">Claude Code</option>
+      <option value="codex">Codex</option>
+    </select>
+  </div>
+  <div class="field">
+    <label>タイトル</label>
+    <input id="task-title" />
+  </div>
+  <div class="field">
+    <label>詳細（各アプリへ貼るプロンプトに含まれます）</label>
+    <textarea id="task-detail"></textarea>
+  </div>
+  <div class="buttons">
+    <button id="task-cancel">キャンセル</button>
+    <button id="task-create">キューに追加</button>
+  </div>
+</dialog>
+
+<!-- 結果入力ダイアログ -->
+<dialog id="result-dialog">
+  <h3>作業結果を再入力</h3>
+  <div class="field">
+    <label id="result-task-label"></label>
+    <textarea id="result-text" placeholder="各アプリでの作業結果を貼り付け"></textarea>
+  </div>
+  <div class="buttons">
+    <button id="result-cancel">キャンセル</button>
+    <button id="result-save">スレッドへ戻す</button>
+  </div>
+</dialog>
+
+<div id="toast"></div>
+
+<script>
+const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
+const OTHER = { claude: "codex", codex: "claude" };
+const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
+let state = { messages: [], tasks: [], agents: {}, running: {} };
+
+const $ = (s) => document.querySelector(s);
+
+function toast(text) {
+  const el = $("#toast");
+  el.textContent = text;
+  el.classList.add("show");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove("show"), 1800);
+}
+
+async function api(path, method = "GET", body) {
+  const res = await fetch(path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    toast(err.error || "エラーが発生しました");
+    throw new Error(err.error || res.status);
+  }
+  return res.json();
+}
+
+function fmtTime(ts) {
+  return new Date(ts).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
+}
+
+function el(tag, attrs = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "text") node.textContent = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v);
+  }
+  for (const c of children) node.appendChild(c);
+  return node;
+}
+
+// ---- render ----
+function render() {
+  for (const agent of ["claude", "codex"]) {
+    renderThread(agent);
+    renderTasks(agent);
+    renderAgentStatus(agent);
+  }
+}
+
+function renderAgentStatus(agent) {
+  const a = (state.agents || {})[agent] || {};
+  const status = $("#status-" + agent);
+  const checkbox = $("#auto-" + agent);
+  checkbox.checked = !!a.auto;
+  if (state.running && state.running[agent]) {
+    status.dataset.s = "running";
+    status.textContent = "応答中…";
+    status.title = "";
+  } else if (a.lastError) {
+    status.dataset.s = "error";
+    status.textContent = "エラー（ホバーで詳細）";
+    status.title = a.lastError;
+  } else {
+    status.dataset.s = "";
+    status.textContent = a.auto ? "CLI 自動応答" : "手動（貼り付け）";
+    status.title = "";
+  }
+}
+
+function renderThread(agent) {
+  const box = $("#messages-" + agent);
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+  const msgs = state.messages.filter((m) => m.thread === agent);
+  $("#count-" + agent).textContent = msgs.length ? msgs.length + " 件" : "";
+  box.replaceChildren();
+  if (!msgs.length) {
+    if (state.running && state.running[agent]) {
+      box.appendChild(el("div", { class: "typing", text: NAMES[agent] + " が応答中" }));
+    } else {
+      box.appendChild(el("div", { class: "empty", text: "まだメッセージがありません" }));
+    }
+    return;
+  }
+  for (const m of msgs) {
+    const meta = el("div", { class: "meta" }, [
+      el("span", { class: "who", text: NAMES[m.author] }),
+      el("span", { text: fmtTime(m.ts) }),
+    ]);
+    if (m.relayedFrom) meta.appendChild(el("span", { text: "（" + NAMES[m.relayedFrom] + "スレッドから転送）" }));
+    if (m.taskId) meta.appendChild(el("span", { text: "（タスク結果）" }));
+    if (m.auto) meta.appendChild(el("span", { text: "（自動応答）" }));
+
+    const actions = el("div", { class: "actions" }, [
+      el("button", { class: "small", text: "タスク化", onclick: () => openTaskDialog(agent, m) }),
+      el("button", {
+        class: "small",
+        text: NAMES[OTHER[agent]] + " へ転送",
+        onclick: () => relay(agent, m),
+      }),
+      el("button", { class: "small", text: "コピー", onclick: () => copy(m.text) }),
+    ]);
+
+    box.appendChild(el("div", { class: "msg", "data-author": m.author }, [
+      meta,
+      el("div", { class: "body", text: m.text }),
+      actions,
+    ]));
+  }
+  if (state.running && state.running[agent]) {
+    box.appendChild(el("div", { class: "typing", text: NAMES[agent] + " が応答中" }));
+  }
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function taskPrompt(t) {
+  return [
+    "【U2A2A タスク】" + t.title,
+    t.detail ? "\n" + t.detail : "",
+    "\n\n完了したら結果テキストを U2A2A アプリのタスク「" + t.title + "」に再入力してください。",
+  ].join("");
+}
+
+function renderTasks(agent) {
+  const box = $("#tasks-" + agent);
+  box.replaceChildren();
+  const tasks = state.tasks.filter((t) => t.agent === agent);
+  if (!tasks.length) {
+    box.appendChild(el("div", { class: "empty", text: "タスクなし" }));
+    return;
+  }
+  for (const t of tasks) {
+    const actions = el("div", { class: "actions" });
+    actions.appendChild(el("button", { class: "small", text: "プロンプトをコピー", onclick: () => copy(taskPrompt(t)) }));
+    if (t.status === "queued")
+      actions.appendChild(el("button", { class: "small", text: "作業開始", onclick: () => patchTask(t.id, "working") }));
+    if (t.status === "queued" || t.status === "working")
+      actions.appendChild(el("button", { class: "small", text: "結果を入力", onclick: () => openResultDialog(t) }));
+    if (t.status === "returned")
+      actions.appendChild(el("button", { class: "small", text: "完了にする", onclick: () => patchTask(t.id, "done") }));
+    actions.appendChild(el("button", { class: "small", text: "削除", onclick: () => delTask(t) }));
+
+    const kids = [
+      el("div", { class: "t-head" }, [
+        el("span", { class: "status", "data-s": t.status, text: STATUS_LABEL[t.status] }),
+        el("span", { class: "t-title", text: t.title }),
+      ]),
+    ];
+    if (t.detail) kids.push(el("div", { class: "t-detail", text: t.detail }));
+    if (t.result) kids.push(el("div", { class: "t-result", text: "結果: " + t.result }));
+    kids.push(actions);
+    box.appendChild(el("div", { class: "task" }, kids));
+  }
+}
+
+// ---- actions ----
+async function copy(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("コピーしました");
+  } catch {
+    toast("コピーできませんでした");
+  }
+}
+
+async function relay(fromAgent, m) {
+  // 発言者本人（エージェント）の言葉として相手スレッドへ届ける
+  const author = m.author === "user" ? "user" : m.author;
+  await api("/api/messages", "POST", {
+    thread: OTHER[fromAgent],
+    author,
+    text: m.text,
+    relayedFrom: fromAgent,
+  });
+  toast(NAMES[OTHER[fromAgent]] + " スレッドへ転送しました");
+}
+
+async function patchTask(id, status) {
+  await api("/api/tasks/" + id, "PATCH", { status });
+}
+
+async function delTask(t) {
+  if (!confirm("タスク「" + t.title + "」を削除しますか？")) return;
+  await api("/api/tasks/" + t.id, "DELETE");
+}
+
+function sendUser() {
+  const text = $("#user-text").value.trim();
+  if (!text) return;
+  api("/api/messages", "POST", { thread: $("#user-target").value, author: "user", text })
+    .then(() => { $("#user-text").value = ""; });
+}
+
+function sendAgent(agent) {
+  const input = $("#input-" + agent);
+  const text = input.value.trim();
+  if (!text) return;
+  api("/api/messages", "POST", { thread: agent, author: agent, text })
+    .then(() => { input.value = ""; });
+}
+
+// ---- dialogs ----
+let dialogSourceMessage = null;
+function openTaskDialog(agent, m) {
+  dialogSourceMessage = m;
+  $("#task-agent").value = agent;
+  const firstLine = m.text.split("\n")[0];
+  $("#task-title").value = firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
+  $("#task-detail").value = m.text;
+  $("#task-dialog").showModal();
+}
+$("#task-cancel").addEventListener("click", () => $("#task-dialog").close());
+$("#task-create").addEventListener("click", async () => {
+  const title = $("#task-title").value.trim();
+  if (!title) return toast("タイトルを入力してください");
+  await api("/api/tasks", "POST", {
+    agent: $("#task-agent").value,
+    title,
+    detail: $("#task-detail").value.trim(),
+    fromMessageId: dialogSourceMessage ? dialogSourceMessage.id : null,
+  });
+  $("#task-dialog").close();
+  toast("タスクをキューに追加しました");
+});
+
+let resultTask = null;
+function openResultDialog(t) {
+  resultTask = t;
+  $("#result-task-label").textContent = "タスク: " + t.title;
+  $("#result-text").value = "";
+  $("#result-dialog").showModal();
+}
+$("#result-cancel").addEventListener("click", () => $("#result-dialog").close());
+$("#result-save").addEventListener("click", async () => {
+  const text = $("#result-text").value.trim();
+  if (!text) return toast("結果テキストを入力してください");
+  await api("/api/tasks/" + resultTask.id + "/result", "POST", { text });
+  $("#result-dialog").close();
+  toast("結果をスレッドへ戻しました");
+});
+
+// ---- wiring ----
+$("#user-send").addEventListener("click", sendUser);
+$("#user-text").addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") sendUser();
+});
+for (const agent of ["claude", "codex"]) {
+  $("#auto-" + agent).addEventListener("change", (e) => {
+    api("/api/agents/" + agent, "PATCH", { auto: e.target.checked });
+  });
+}
+for (const btn of document.querySelectorAll("[data-agent-send]")) {
+  const agent = btn.getAttribute("data-agent-send");
+  btn.addEventListener("click", () => sendAgent(agent));
+  $("#input-" + agent).addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") sendAgent(agent);
+  });
+}
+
+// ---- live sync ----
+const es = new EventSource("/api/events");
+es.onmessage = (e) => {
+  state = JSON.parse(e.data);
+  render();
+};
+render();
+</script>
+</body>
+</html>
