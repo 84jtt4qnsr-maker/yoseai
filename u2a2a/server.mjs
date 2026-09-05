@@ -28,8 +28,17 @@ function defaultAgent() {
   return { auto: true, sessionId: null, lastSeenTs: Date.now(), lastError: "" };
 }
 
+function defaultRelay() {
+  return { active: false, remaining: 0 };
+}
+
 function emptyState() {
-  return { messages: [], tasks: [], agents: { claude: defaultAgent(), codex: defaultAgent() } };
+  return {
+    messages: [],
+    tasks: [],
+    agents: { claude: defaultAgent(), codex: defaultAgent() },
+    relay: defaultRelay(),
+  };
 }
 
 function loadState() {
@@ -39,6 +48,7 @@ function loadState() {
     if (Array.isArray(parsed.messages) && Array.isArray(parsed.tasks)) {
       parsed.agents = parsed.agents || {};
       for (const a of AGENTS) parsed.agents[a] = { ...defaultAgent(), ...parsed.agents[a] };
+      parsed.relay = defaultRelay(); // 再起動後にリレーが勝手に再開しないよう常に解除
       return parsed;
     }
   } catch {
@@ -113,15 +123,19 @@ function readBody(req) {
 
 // ---- agent CLI runners ----
 const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
+const OTHER = { claude: "codex", codex: "claude" };
+const QA_END_MARK = "【質疑終了】";
 
 function spawnEnv() {
   const extra = [path.join(os.homedir(), ".homebrew/bin"), path.join(os.homedir(), ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin"];
   return { ...process.env, PATH: [process.env.PATH, ...extra].filter(Boolean).join(":") };
 }
 
-function runCli(cmd, args, timeoutMs = AGENT_TIMEOUT_MS) {
+function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd: REPO_ROOT, env: spawnEnv(), stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(cmd, args, { cwd: REPO_ROOT, env: spawnEnv(), stdio: ["pipe", "pipe", "pipe"] });
+    child.stdin.on("error", () => {});
+    child.stdin.end(stdinData);
     let out = "", err = "";
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
@@ -150,13 +164,45 @@ function buildPrompt(agent, msgs, isFirst) {
       `新着メッセージに ${NAMES[agent]} として日本語で簡潔に返答してください。` +
       `実装作業が必要な場合は作業内容を提案し、タスク化はユーザーに委ねてください。\n\n--- 新着メッセージ ---\n`
     : "--- 新着メッセージ ---\n";
-  return preamble + lines;
+  const qaNote = state.relay.active
+    ? `\n\n（現在 ${NAMES[other]} との質疑応答モードです。質問には簡潔に答え、確認したいことがあれば質問してください。` +
+      `質疑が尽きて結論に達したら、応答の末尾に ${QA_END_MARK} と書いてください。残り自動中継 ${state.relay.remaining} 手）`
+    : "";
+  return preamble + lines + qaNote;
+}
+
+// 質疑モード: エージェントの応答完了を待って相手スレッドへ中継する
+function qaHop(agent, replyText) {
+  const r = state.relay;
+  if (!r.active) return;
+  if (replyText.includes(QA_END_MARK)) {
+    r.active = false;
+    return;
+  }
+  if (r.remaining <= 0) {
+    r.active = false;
+    return;
+  }
+  r.remaining--;
+  const other = OTHER[agent];
+  state.messages.push({
+    id: id(),
+    thread: other,
+    author: agent,
+    text: replyText,
+    relayedFrom: agent,
+    qa: true,
+    ts: Date.now(),
+  });
+  if (r.remaining <= 0) r.active = false; // 最終手: 相手は応答するがそれ以上は中継しない
+  if (state.agents[other].auto) agentLoop(other);
 }
 
 async function callClaude(prompt, sessionId) {
-  const args = ["-p", prompt, "--output-format", "json"];
-  if (sessionId) args.splice(1, 0, "--resume", sessionId);
-  const { code, out, err } = await runCli("claude", args);
+  // プロンプトは stdin 渡し（"---" 等で始まってもオプションと誤認されないように）
+  const args = ["-p", "--output-format", "json"];
+  if (sessionId) args.push("--resume", sessionId);
+  const { code, out, err } = await runCli("claude", args, prompt);
   if (code !== 0) throw new Error((err || out || "claude CLI エラー").trim().slice(0, 500));
   const parsed = JSON.parse(out);
   if (parsed.is_error) throw new Error(String(parsed.result || "claude エラー").slice(0, 500));
@@ -165,9 +211,12 @@ async function callClaude(prompt, sessionId) {
 
 async function callCodex(prompt, sessionId) {
   const outFile = path.join(os.tmpdir(), `u2a2a-codex-${id()}.txt`);
-  const base = ["--json", "-s", "read-only", "-C", REPO_ROOT, "-o", outFile, "--skip-git-repo-check"];
-  const args = sessionId ? ["exec", "resume", sessionId, prompt, ...base] : ["exec", prompt, ...base];
-  const { code, out, err } = await runCli("codex", args);
+  const base = ["--json", "-o", outFile, "--skip-git-repo-check"];
+  // resume は -s / -C を受け付けない（元セッションから継承）。config 経由で read-only を明示する
+  const args = sessionId
+    ? ["exec", "resume", sessionId, "-", ...base, "-c", 'sandbox_mode="read-only"']
+    : ["exec", "-", ...base, "-s", "read-only", "-C", REPO_ROOT];
+  const { code, out, err } = await runCli("codex", args, prompt);
   let text = "";
   try {
     text = fs.readFileSync(outFile, "utf8").trim();
@@ -218,7 +267,9 @@ async function agentLoop(agent) {
         a.lastSeenTs = msgs[msgs.length - 1].ts;
         a.lastError = "";
         state.messages.push({ id: id(), thread: agent, author: agent, text, auto: true, ts: Date.now() });
+        qaHop(agent, text);
       } catch (e) {
+        state.relay.active = false; // エラーで質疑が空回りしないよう停止
         a.lastError = String(e.message || e);
         a.lastSeenTs = msgs[msgs.length - 1].ts; // 同じメッセージで無限リトライしない
       }
@@ -279,6 +330,29 @@ async function handleApi(req, res, url) {
     touch();
     maybeTrigger(created);
     return json(res, 201, created);
+  }
+
+  // 質疑モード開始: 先手エージェントへ発言し、以後は応答完了ごとに相手へ自動中継
+  if (req.method === "POST" && url.pathname === "/api/qa/start") {
+    const body = await readBody(req);
+    const first = AGENTS.includes(body.first) ? body.first : null;
+    const text = typeof body.text === "string" ? body.text.trim() : "";
+    const hops = Math.min(20, Math.max(1, Number(body.hops) || 6));
+    if (!first || !text) return json(res, 400, { error: "first と text は必須です" });
+    if (!state.agents.claude.auto || !state.agents.codex.auto)
+      return json(res, 400, { error: "質疑モードには両スレッドの自動応答をONにしてください" });
+    state.relay = { active: true, remaining: hops };
+    const msg = { id: id(), thread: first, author: "user", text, qa: true, ts: Date.now() };
+    state.messages.push(msg);
+    touch();
+    agentLoop(first);
+    return json(res, 201, { relay: state.relay });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/qa/stop") {
+    state.relay = defaultRelay();
+    touch();
+    return json(res, 200, { relay: state.relay });
   }
 
   if (req.method === "PATCH" && parts[0] === "api" && parts[1] === "agents" && AGENTS.includes(parts[2])) {

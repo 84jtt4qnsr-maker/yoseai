@@ -53,6 +53,17 @@
     max-height: 140px;
     resize: vertical;
   }
+  #qa-hops { width: 64px; }
+  #qa-bar {
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    padding: 6px 18px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 12.5px;
+    color: var(--codex);
+  }
   .role-dot {
     width: 10px; height: 10px; border-radius: 50%;
     display: inline-block; margin-right: 6px; flex: none;
@@ -264,8 +275,15 @@
     <option value="claude">→ Claude Code</option>
     <option value="codex">→ Codex</option>
     <option value="both">→ 両方</option>
+    <option value="qa-claude">🗨 質疑（Claude先手）</option>
+    <option value="qa-codex">🗨 質疑（Codex先手）</option>
   </select>
+  <input id="qa-hops" type="number" min="1" max="20" value="6" title="自動中継の上限手数" hidden />
   <button id="user-send">送信</button>
+</div>
+<div id="qa-bar" hidden>
+  <span id="qa-status"></span>
+  <button id="qa-stop" class="small">質疑を停止</button>
 </div>
 
 <main>
@@ -345,7 +363,7 @@
 const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
 const OTHER = { claude: "codex", codex: "claude" };
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
-let state = { messages: [], tasks: [], agents: {}, running: {} };
+let state = { messages: [], tasks: [], agents: {}, running: {}, relay: {} };
 
 const $ = (s) => document.querySelector(s);
 
@@ -393,6 +411,16 @@ function render() {
     renderTasks(agent);
     renderAgentStatus(agent);
   }
+  renderQaBar();
+}
+
+function renderQaBar() {
+  const r = state.relay || {};
+  const bar = $("#qa-bar");
+  bar.hidden = !r.active;
+  if (r.active) {
+    $("#qa-status").textContent = "🗨 質疑モード進行中 — 残り自動中継 " + r.remaining + " 手（各応答の完了を待って相手へ中継します）";
+  }
 }
 
 function renderAgentStatus(agent) {
@@ -437,6 +465,7 @@ function renderThread(agent) {
     if (m.relayedFrom) meta.appendChild(el("span", { text: "（" + NAMES[m.relayedFrom] + "スレッドから転送）" }));
     if (m.taskId) meta.appendChild(el("span", { text: "（タスク結果）" }));
     if (m.auto) meta.appendChild(el("span", { text: "（自動応答）" }));
+    if (m.qa) meta.appendChild(el("span", { text: "（質疑）" }));
 
     const actions = el("div", { class: "actions" }, [
       el("button", { class: "small", text: "タスク化", onclick: () => openTaskDialog(agent, m) }),
@@ -534,8 +563,11 @@ async function delTask(t) {
 function sendUser() {
   const text = $("#user-text").value.trim();
   if (!text) return;
-  api("/api/messages", "POST", { thread: $("#user-target").value, author: "user", text })
-    .then(() => { $("#user-text").value = ""; });
+  const target = $("#user-target").value;
+  const req = target.startsWith("qa-")
+    ? api("/api/qa/start", "POST", { first: target.slice(3), text, hops: Number($("#qa-hops").value) || 6 })
+    : api("/api/messages", "POST", { thread: target, author: "user", text });
+  req.then(() => { $("#user-text").value = ""; });
 }
 
 function sendAgent(agent) {
@@ -588,6 +620,10 @@ $("#result-save").addEventListener("click", async () => {
 
 // ---- wiring ----
 $("#user-send").addEventListener("click", sendUser);
+$("#user-target").addEventListener("change", () => {
+  $("#qa-hops").hidden = !$("#user-target").value.startsWith("qa-");
+});
+$("#qa-stop").addEventListener("click", () => api("/api/qa/stop", "POST", {}));
 $("#user-text").addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") sendUser();
 });
