@@ -94,6 +94,9 @@ const sseClients = new Set();
 // itemId -> 実行中レビュアー名の配列（永続化しない）
 const reviewPending = {};
 
+// itemId -> 修正中エージェント名（1件につき同時1修正。永続化しない）
+const fixPending = {};
+
 // 実行中 CLI の進捗実況（永続化しない）。key: "thread:claude" / "review:<itemId>:<reviewer>"
 const activity = {};
 
@@ -117,7 +120,7 @@ function actEnd(key) {
 }
 
 function publicState() {
-  return { ...state, running, reviewPending, activity };
+  return { ...state, running, reviewPending, fixPending, activity };
 }
 
 function broadcast() {
@@ -170,9 +173,9 @@ function spawnEnv() {
   return { ...process.env, PATH: [process.env.PATH, ...extra].filter(Boolean).join(":") };
 }
 
-function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = null) {
+function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = null, cwd = REPO_ROOT) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd: REPO_ROOT, env: spawnEnv(), stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(cmd, args, { cwd, env: spawnEnv(), stdio: ["pipe", "pipe", "pipe"] });
     child.stdin.on("error", () => {});
     child.stdin.end(stdinData);
     let out = "", err = "", lineBuf = "";
@@ -274,12 +277,13 @@ function claudeStepFrom(ev) {
   return null;
 }
 
-async function callClaude(prompt, sessionId, modelOverride, onStep) {
+async function callClaude(prompt, sessionId, modelOverride, onStep, opts = {}) {
   // プロンプトは stdin 渡し（"---" 等で始まってもオプションと誤認されないように）
   // stream-json でイベントを逐次受け取り、進捗を実況する
   const args = ["-p", "--output-format", "stream-json", "--verbose"];
   if (sessionId) args.push("--resume", sessionId);
   if (modelOverride) args.push("--model", modelOverride);
+  if (opts.extraArgs) args.push(...opts.extraArgs);
   let result = null;
   const onLine = (line) => {
     if (!line.trim()) return;
@@ -295,7 +299,7 @@ async function callClaude(prompt, sessionId, modelOverride, onStep) {
       if (s) onStep(s);
     }
   };
-  const { code, err, out } = await runCli("claude", args, prompt, AGENT_TIMEOUT_MS, onLine);
+  const { code, err, out } = await runCli("claude", args, prompt, AGENT_TIMEOUT_MS, onLine, opts.cwd);
   if (!result && code !== 0) throw new Error((err || out || "claude CLI エラー").trim().slice(0, 500));
   if (!result) throw new Error("claude: 結果イベントを受信できませんでした");
   if (result.is_error) throw new Error(String(result.result || "claude エラー").slice(0, 500));
@@ -339,13 +343,15 @@ function codexStepFrom(ev) {
   return null;
 }
 
-async function callCodex(prompt, sessionId, modelOverride, onStep) {
+async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
   const outFile = path.join(os.tmpdir(), `u2a2a-codex-${id()}.txt`);
   const base = ["--json", "-o", outFile, "--skip-git-repo-check"];
   // resume は -s / -C を受け付けない（元セッションから継承）。config 経由で read-only を明示する
   const args = sessionId
     ? ["exec", "resume", sessionId, "-", ...base, "-c", 'sandbox_mode="read-only"']
-    : ["exec", "-", ...base, "-s", "read-only", "-C", REPO_ROOT];
+    : opts.writeDir
+      ? ["exec", "-", ...base, "-s", "workspace-write", "-C", opts.writeDir]
+      : ["exec", "-", ...base, "-s", "read-only", "-C", REPO_ROOT];
   if (modelOverride) args.push("-m", modelOverride);
   const onLine = onStep
     ? (line) => {
@@ -552,6 +558,72 @@ async function runReview(itemId, reviewer) {
     actEnd(actKey);
     reviewPending[itemId] = (reviewPending[itemId] || []).filter((r) => r !== reviewer);
     if (!reviewPending[itemId].length) delete reviewPending[itemId];
+    touch();
+  }
+}
+
+// ---- レビュー後の修正: 担当エージェントがプールフォルダ限定の書き込み権限でファイルを直す ----
+
+function buildFixPrompt(item, agent) {
+  const reviews = (item.reviews || [])
+    .filter((r) => !r.error)
+    .map((r) => `--- ${NAMES[r.reviewer]} のレビュー（判定: ${r.verdict || "なし"}） ---\n${r.text}`)
+    .join("\n\n");
+  return (
+    `あなたは U2A2A 共有タスクプールの成果物を修正する担当（${NAMES[agent]}）です。` +
+    `カレントディレクトリにある成果物ファイル「${item.file}」を、以下のレビューを踏まえて修正し、` +
+    `**同じファイル名で上書き保存**してください。新しいファイルは作らないこと。\n` +
+    `- 妥当な指摘には対応する\n` +
+    `- 誤っている・過剰な指摘には従わず、応答で理由を述べる\n` +
+    `- ファイル保存を済ませてから、応答として「何をどう直したか／直さなかったか」の要約を簡潔に書く\n\n` +
+    (reviews || "（レビューはまだありません。成果物の品質を自己点検して改善してください）")
+  );
+}
+
+async function runFix(itemId, agent) {
+  const item = state.pool.find((p) => p.id === itemId);
+  if (!item || !item.file || fixPending[itemId]) return;
+  fixPending[itemId] = agent;
+  const actKey = "fix:" + itemId;
+  actStart(actKey, NAMES[agent] + " 修正");
+  // 修正前の版を .trash に世代バックアップ
+  try {
+    fs.copyFileSync(path.join(POOL_DIR, item.file), path.join(POOL_TRASH, Date.now() + "-prefix-" + item.file));
+  } catch {
+    // バックアップ失敗でも修正は続行
+  }
+  try {
+    const prompt = buildFixPrompt(item, agent);
+    const onStep = (s) => actStep(actKey, s);
+    const override = state.agents[agent].modelOverride;
+    const { text } =
+      agent === "claude"
+        ? await callClaude(prompt, null, override, onStep, {
+            cwd: POOL_DIR,
+            extraArgs: ["--permission-mode", "acceptEdits"], // 書き込みは cwd=pool/ 内のみ
+          })
+        : await callCodex(prompt, null, override, onStep, { writeDir: POOL_DIR });
+    item.fixes = item.fixes || [];
+    item.fixes.push({ id: id(), agent, text, ts: Date.now() });
+    const st = statPoolFile(item.file);
+    if (st) Object.assign(item, st);
+    item.status = "submitted";
+    touch();
+    // 元レビュアー（修正者以外）が自動で再レビュー
+    const reviewers = [...new Set((item.reviews || []).filter((r) => !r.error).map((r) => r.reviewer))].filter((r) => r !== agent);
+    for (const r of reviewers.length ? reviewers : [OTHER[agent]]) runReview(item.id, r);
+  } catch (e) {
+    item.fixes = item.fixes || [];
+    item.fixes.push({
+      id: id(),
+      agent,
+      text: "（修正失敗: " + String(e.message || e).slice(0, 300) + "）",
+      error: true,
+      ts: Date.now(),
+    });
+  } finally {
+    actEnd(actKey);
+    delete fixPending[itemId];
     touch();
   }
 }
@@ -861,6 +933,17 @@ async function handleApi(req, res, url) {
       const reviewer = AGENTS.includes(body.reviewer) ? body.reviewer : null;
       if (!reviewer) return json(res, 400, { error: "reviewer は claude / codex" });
       runReview(item.id, reviewer);
+      return json(res, 202, { ok: true });
+    }
+
+    // レビューを踏まえた修正（書き込みは pool/ 限定。完了後は元レビュアーが自動再レビュー）
+    if (req.method === "POST" && parts[3] === "fix") {
+      const body = await readBody(req);
+      const agent = AGENTS.includes(body.agent) ? body.agent : null;
+      if (!agent) return json(res, 400, { error: "agent は claude / codex" });
+      if (!item.file) return json(res, 400, { error: "ファイル実体のない旧形式アイテムは修正できません" });
+      if (fixPending[item.id]) return json(res, 409, { error: "このアイテムは修正実行中です" });
+      runFix(item.id, agent);
       return json(res, 202, { ok: true });
     }
 

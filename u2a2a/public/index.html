@@ -692,7 +692,7 @@
 const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
 const OTHER = { claude: "codex", codex: "claude" };
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
-let state = { messages: [], tasks: [], pool: [], agents: {}, running: {}, relay: {}, reviewPending: {}, activity: {} };
+let state = { messages: [], tasks: [], pool: [], agents: {}, running: {}, relay: {}, reviewPending: {}, fixPending: {}, activity: {} };
 const POOL_STATUS_LABEL = { submitted: "持ち込み", reviewing: "レビュー", approved: "承認", rejected: "差し戻し" };
 
 const $ = (s) => document.querySelector(s);
@@ -1036,9 +1036,36 @@ function renderPoolDetail(box, p) {
       }
       kids.push(el("div", { class: "review" }, reviewKids));
     }
+    // 修正履歴（レビューと同じ折りたたみ UI）
+    for (const f of p.fixes || []) {
+      const fOpen = openReviews.has(f.id);
+      const fHead = el("div", {
+        class: "r-head",
+        onclick: () => {
+          fOpen ? openReviews.delete(f.id) : openReviews.add(f.id);
+          renderPool();
+        },
+      }, [
+        el("span", { class: "chev", text: fOpen ? "▾" : "▸" }),
+        el("span", { class: "reviewer", "data-o": f.agent, text: "🔧 " + NAMES[f.agent] + " の修正" + (f.error ? "（失敗）" : "") }),
+        el("span", { class: "pf-size", text: fmtTime(f.ts) }),
+      ]);
+      const fixKids = [fHead];
+      if (fOpen) {
+        const fBody = el("div", { class: "r-body mdview" });
+        fBody.innerHTML = renderMarkdown(f.text);
+        fixKids.push(fBody);
+      }
+      kids.push(el("div", { class: "review" }, fixKids));
+    }
     for (const r of pending) {
       const act = (state.activity || {})["review:" + p.id + ":" + r];
       kids.push(act ? activityEl(act) : el("div", { class: "typing", text: NAMES[r] + " がレビュー中" }));
+    }
+    const fixer = (state.fixPending || {})[p.id];
+    if (fixer) {
+      const act = (state.activity || {})["fix:" + p.id];
+      kids.push(act ? activityEl(act) : el("div", { class: "typing", text: NAMES[fixer] + " が修正中" }));
     }
 
     const actions = el("div", { class: "actions" });
@@ -1048,6 +1075,16 @@ function renderPoolDetail(box, p) {
           class: "small",
           text: NAMES[agent] + " にレビュー依頼",
           onclick: () => api("/api/pool/" + p.id + "/review", "POST", { reviewer: agent }),
+        }));
+      }
+    }
+    if (p.file && !(state.fixPending || {})[p.id]) {
+      for (const agent of ["claude", "codex"]) {
+        actions.appendChild(el("button", {
+          class: "small",
+          text: NAMES[agent] + " に修正依頼",
+          onclick: () => api("/api/pool/" + p.id + "/fix", "POST", { agent })
+            .then(() => toast(NAMES[agent] + " が修正を開始しました（完了後、自動で再レビュー）")),
         }));
       }
     }
