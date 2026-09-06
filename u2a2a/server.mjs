@@ -25,11 +25,19 @@ const AGENT_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_BACKLOG = 10;
 
 function defaultAgent() {
-  return { auto: true, sessionId: null, lastSeenTs: Date.now(), lastError: "", model: "", modelOverride: "" };
+  return {
+    auto: true,
+    sessionId: null,
+    lastSeenTs: Date.now(),
+    lastError: "",
+    model: "",
+    modelOverride: "",
+    transcriptOffset: null,
+  };
 }
 
 function defaultRelay() {
-  return { active: false, remaining: 0 };
+  return { active: false, remaining: 0, hopsDone: 0 };
 }
 
 function emptyState() {
@@ -165,8 +173,9 @@ function buildPrompt(agent, msgs, isFirst) {
       `実装作業が必要な場合は作業内容を提案し、タスク化はユーザーに委ねてください。\n\n--- 新着メッセージ ---\n`
     : "--- 新着メッセージ ---\n";
   const qaNote = state.relay.active
-    ? `\n\n（現在 ${NAMES[other]} との質疑応答モードです。質問には簡潔に答え、確認したいことがあれば質問してください。` +
-      `質疑が尽きて結論に達したら、応答の末尾に ${QA_END_MARK} と書いてください。残り自動中継 ${state.relay.remaining} 手）`
+    ? `\n\n（現在 ${NAMES[other]} との質疑応答モードです。議論が浅いうちは結論に飛びつかず、質問・反論・検討を返してください。` +
+      `${QA_END_MARK} は、相手の見解を少なくとも一度聞いた上で合意・結論に達した場合のみ、応答の末尾に書いてください。` +
+      `相手がまだ発言していない段階での終了宣言は無効です。残り自動中継 ${state.relay.remaining} 手）`
     : "";
   return preamble + lines + qaNote;
 }
@@ -175,7 +184,9 @@ function buildPrompt(agent, msgs, isFirst) {
 function qaHop(agent, replyText) {
   const r = state.relay;
   if (!r.active) return;
-  if (replyText.includes(QA_END_MARK)) {
+  // 終了宣言は相手が一度でも発言した後（=中継が1回以上済み）のみ有効。
+  // 先手が初手で終了宣言しても、相手に見せるまではリレーを続ける。
+  if (replyText.includes(QA_END_MARK) && r.hopsDone > 0) {
     r.active = false;
     return;
   }
@@ -184,6 +195,7 @@ function qaHop(agent, replyText) {
     return;
   }
   r.remaining--;
+  r.hopsDone++;
   const other = OTHER[agent];
   state.messages.push({
     id: id(),
@@ -266,9 +278,131 @@ async function callCodex(prompt, sessionId, modelOverride) {
 function unseenFor(agent) {
   const a = state.agents[agent];
   return state.messages
-    .filter((m) => m.thread === agent && m.author !== agent && m.ts > a.lastSeenTs)
+    .filter((m) => m.thread === agent && m.author !== agent && !m.external && m.ts > a.lastSeenTs)
     .slice(-MAX_BACKLOG);
 }
+
+// ---- 外部セッション同期 ----
+// デスクトップ版/ターミナルで同じセッションを続けた分を、記録ファイルの増分から取り込む
+
+function transcriptPath(agent, sessionId) {
+  if (!sessionId) return null;
+  if (agent === "claude") {
+    const proj = REPO_ROOT.replace(/[^a-zA-Z0-9]/g, "-");
+    const f = path.join(os.homedir(), ".claude", "projects", proj, sessionId + ".jsonl");
+    return fs.existsSync(f) ? f : null;
+  }
+  const files = fs.globSync(path.join(os.homedir(), ".codex/sessions/**/rollout-*" + sessionId + ".jsonl"));
+  return files[0] || null;
+}
+
+function textFromBlocks(content, textKey) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  if (content.some((b) => b && b.type === "tool_result")) return ""; // ツール結果はユーザー発言ではない
+  return content
+    .filter((b) => b && (b.type === "text" || b.type === textKey) && typeof b.text === "string")
+    .map((b) => b.text)
+    .join("\n");
+}
+
+function extractExternalMessages(agent, chunk) {
+  const out = [];
+  for (const line of chunk.split("\n")) {
+    if (!line.trim()) continue;
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    let author = null;
+    let text = "";
+    if (agent === "claude") {
+      if (e.isMeta) continue;
+      if (e.type === "user") {
+        author = "user";
+        text = textFromBlocks(e.message?.content, "text");
+      } else if (e.type === "assistant") {
+        author = "claude";
+        text = textFromBlocks(e.message?.content, "text");
+      }
+    } else if (e.type === "response_item" && e.payload?.type === "message") {
+      if (e.payload.role === "user") {
+        author = "user";
+        text = textFromBlocks(e.payload.content, "input_text");
+      } else if (e.payload.role === "assistant") {
+        author = "codex";
+        text = textFromBlocks(e.payload.content, "output_text");
+      }
+    }
+    text = (text || "").trim();
+    if (!author || !text) continue;
+    if (text.startsWith("<")) continue; // 注入されたコンテキストブロック類は除く
+    out.push({ author, text });
+  }
+  return out;
+}
+
+// 応答完了直後に呼び、自分の発言分まで読み取り位置を進める
+function markTranscriptSynced(agent) {
+  const a = state.agents[agent];
+  const file = transcriptPath(agent, a.sessionId);
+  if (file) {
+    try {
+      a.transcriptOffset = fs.statSync(file).size;
+    } catch {
+      a.transcriptOffset = null;
+    }
+  } else {
+    a.transcriptOffset = null;
+  }
+}
+
+function syncExternal(agent) {
+  const a = state.agents[agent];
+  const file = transcriptPath(agent, a.sessionId);
+  if (!file) return false;
+  let size;
+  try {
+    size = fs.statSync(file).size;
+  } catch {
+    return false;
+  }
+  if (a.transcriptOffset == null || a.transcriptOffset > size) {
+    a.transcriptOffset = size; // 初回は履歴の一括取り込みをせず現在位置から
+    return false;
+  }
+  if (size <= a.transcriptOffset) return false;
+  const fd = fs.openSync(file, "r");
+  const buf = Buffer.alloc(size - a.transcriptOffset);
+  fs.readSync(fd, buf, 0, buf.length, a.transcriptOffset);
+  fs.closeSync(fd);
+  const chunk = buf.toString("utf8");
+  const lastNl = chunk.lastIndexOf("\n");
+  if (lastNl < 0) return false; // 書き込み途中の行しかない
+  a.transcriptOffset += Buffer.byteLength(chunk.slice(0, lastNl + 1), "utf8");
+  let added = false;
+  for (const m of extractExternalMessages(agent, chunk.slice(0, lastNl + 1))) {
+    state.messages.push({ id: id(), thread: agent, author: m.author, text: m.text, external: true, ts: Date.now() });
+    added = true;
+  }
+  return added;
+}
+
+// 外部での続きを受動的にも読めるよう定期チェック
+setInterval(() => {
+  let changed = false;
+  for (const agent of AGENTS) {
+    if (running[agent]) continue; // 自分の応答書き込み中は増分を読まない
+    try {
+      if (syncExternal(agent)) changed = true;
+    } catch {
+      // 同期失敗は次回に持ち越し
+    }
+  }
+  if (changed) touch();
+}, 30_000);
 
 async function agentLoop(agent) {
   if (running[agent]) {
@@ -281,6 +415,11 @@ async function agentLoop(agent) {
     while (true) {
       needsRun[agent] = false;
       const a = state.agents[agent];
+      try {
+        if (syncExternal(agent)) touch(); // 外部での続きを取り込んでから応答する
+      } catch {
+        // 同期失敗しても応答は続行
+      }
       const msgs = unseenFor(agent);
       if (!a.auto || !msgs.length) break;
       const prompt = buildPrompt(agent, msgs, !a.sessionId);
@@ -292,6 +431,7 @@ async function agentLoop(agent) {
         a.lastSeenTs = msgs[msgs.length - 1].ts;
         a.lastError = "";
         state.messages.push({ id: id(), thread: agent, author: agent, text, auto: true, ts: Date.now() });
+        markTranscriptSynced(agent); // 自分の応答分は外部同期の対象外にする
         qaHop(agent, text);
       } catch (e) {
         state.relay.active = false; // エラーで質疑が空回りしないよう停止
@@ -366,7 +506,7 @@ async function handleApi(req, res, url) {
     if (!first || !text) return json(res, 400, { error: "first と text は必須です" });
     if (!state.agents.claude.auto || !state.agents.codex.auto)
       return json(res, 400, { error: "質疑モードには両スレッドの自動応答をONにしてください" });
-    state.relay = { active: true, remaining: hops };
+    state.relay = { active: true, remaining: hops, hopsDone: 0 };
     const msg = { id: id(), thread: first, author: "user", text, qa: true, ts: Date.now() };
     state.messages.push(msg);
     touch();

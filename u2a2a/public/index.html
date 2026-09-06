@@ -181,6 +181,7 @@
   .msg[data-author="user"] { border-left-color: var(--user); }
   .msg[data-author="claude"] { border-left-color: var(--claude); }
   .msg[data-author="codex"] { border-left-color: var(--codex); }
+  .msg.external { border-style: dashed; border-left-style: solid; }
   .msg .meta {
     display: flex;
     gap: 8px;
@@ -493,6 +494,7 @@ function renderThread(agent) {
     if (m.taskId) meta.appendChild(el("span", { text: "（タスク結果）" }));
     if (m.auto) meta.appendChild(el("span", { text: "（自動応答）" }));
     if (m.qa) meta.appendChild(el("span", { text: "（質疑）" }));
+    if (m.external) meta.appendChild(el("span", { text: "（外部セッションから同期）" }));
 
     const actions = el("div", { class: "actions" }, [
       el("button", { class: "small", text: "タスク化", onclick: () => openTaskDialog(agent, m) }),
@@ -504,7 +506,7 @@ function renderThread(agent) {
       el("button", { class: "small", text: "コピー", onclick: () => copy(m.text) }),
     ]);
 
-    box.appendChild(el("div", { class: "msg", "data-author": m.author }, [
+    box.appendChild(el("div", { class: "msg" + (m.external ? " external" : ""), "data-author": m.author }, [
       meta,
       el("div", { class: "body", text: m.text }),
       actions,
