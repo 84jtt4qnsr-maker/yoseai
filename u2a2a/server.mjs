@@ -20,6 +20,8 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 // エージェント CLI（cwd=リポジトリ・読み取り可）からパスでそのまま読める。
 const POOL_DIR = path.join(__dirname, "pool");
 const POOL_TRASH = path.join(POOL_DIR, ".trash");
+// スレッド履歴の自動ミラー置き場（成果物アイテムとしては登録しないシステム領域）
+const POOL_THREADS = path.join(POOL_DIR, "threads");
 const PORT = Number(process.env.U2A2A_PORT || 4742);
 
 const AGENTS = ["claude", "codex"];
@@ -117,7 +119,59 @@ function saveState() {
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
     fs.renameSync(tmp, STATE_FILE);
+    try {
+      writeThreadMirrors(); // スレッド履歴を pool/threads/ の実ファイルへ同期
+    } catch {
+      // ミラー生成失敗で保存自体は止めない
+    }
   }, 100);
+}
+
+// ---- スレッド履歴ミラー ----
+// 各トピックの会話を pool/threads/<title>-<id8>.md として実ファイル化する。
+// DAS の一部としてブラウズ・検索・コピーでき、エージェントもパスで読める。
+const mirrorCache = {};
+
+function threadMirrorName(t) {
+  return "threads/" + (sanitizeSegment(t.title) || "thread") + "-" + t.id.slice(0, 8) + ".md";
+}
+
+function writeThreadMirrors() {
+  fs.mkdirSync(POOL_THREADS, { recursive: true });
+  const valid = new Set();
+  for (const t of state.topics) {
+    const rel = threadMirrorName(t);
+    valid.add(rel);
+    t.mirrorFile = rel;
+    const msgs = state.messages.filter((m) => m.topicId === t.id);
+    const body =
+      `# ${t.title}\n\n` +
+      `（U2A2A スレッド履歴 — 自動生成ミラー。編集しても会話には反映されません／メッセージ ${msgs.length} 件）\n\n` +
+      msgs
+        .map((m) => {
+          const time = new Date(m.ts).toLocaleString("ja-JP");
+          const tags = [m.auto ? "自動応答" : null, m.qa ? "質疑" : null, m.external ? "外部同期" : null]
+            .filter(Boolean)
+            .join("・");
+          return `## ${NAMES[m.author]} → ${NAMES[m.thread]} 側スレッド（${time}${tags ? "／" + tags : ""}）\n\n${m.text}\n`;
+        })
+        .join("\n");
+    if (mirrorCache[rel] === body) continue;
+    fs.writeFileSync(path.join(POOL_DIR, rel), body);
+    mirrorCache[rel] = body;
+  }
+  // 改名・削除で不要になった古いミラーは片付ける
+  for (const f of fs.readdirSync(POOL_THREADS)) {
+    const rel = "threads/" + f;
+    if (f.endsWith(".md") && !valid.has(rel)) {
+      try {
+        fs.unlinkSync(path.join(POOL_THREADS, f));
+      } catch {
+        // 消せなければ次回に持ち越し
+      }
+      delete mirrorCache[rel];
+    }
+  }
 }
 
 // ---- SSE ----
@@ -519,6 +573,7 @@ function scanPoolDir() {
     for (const e of entries) {
       if (e.name.startsWith(".")) continue; // .trash / 隠しファイルは対象外
       const childRel = rel ? rel + "/" + e.name : e.name;
+      if (childRel === "threads") continue; // スレッド履歴ミラーは成果物アイテムにしない（UI が特別扱い）
       if (e.isDirectory()) {
         dirs.push(childRel);
         walk(path.join(dir, e.name), childRel);
@@ -937,6 +992,19 @@ async function handleApi(req, res, url) {
     return json(res, 201, topic);
   }
 
+  // タブの並べ替え（ブラウザライクなドラッグ入れ替え）
+  if (req.method === "POST" && url.pathname === "/api/topics/reorder") {
+    const body = await readBody(req);
+    if (Array.isArray(body.order)) {
+      const byId = new Map(state.topics.map((t) => [t.id, t]));
+      const next = body.order.map((tid) => byId.get(tid)).filter(Boolean);
+      for (const t of state.topics) if (!next.includes(t)) next.push(t);
+      state.topics = next;
+      touch();
+    }
+    return json(res, 200, { ok: true });
+  }
+
   if (parts[0] === "api" && parts[1] === "topics" && parts[2]) {
     const topic = findTopic(parts[2]);
     if (!topic) return json(res, 404, { error: "topic not found" });
@@ -1310,6 +1378,11 @@ const server = http.createServer(async (req, res) => {
 fs.mkdirSync(POOL_TRASH, { recursive: true });
 migratePoolItems();
 scanPoolDir();
+try {
+  writeThreadMirrors();
+} catch {
+  // 起動時のミラー生成失敗は無視（次の保存時に再試行される）
+}
 saveState();
 
 server.listen(PORT, "127.0.0.1", () => {

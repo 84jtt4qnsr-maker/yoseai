@@ -825,6 +825,20 @@ function renderTopicBar() {
   for (const t of topics) {
     const active = t.id === (currentTopic() || {}).id;
     const tab = el("div", { class: "topic-tab" + (active ? " active" : ""), onclick: () => { if (!active) switchTopic(t.id); } });
+    // ブラウザライクなドラッグ入れ替え
+    tab.setAttribute("draggable", "true");
+    tab.addEventListener("dragstart", (e) => e.dataTransfer.setData("text/u2a2a-topic", t.id));
+    tab.addEventListener("dragover", (e) => {
+      if ([...e.dataTransfer.types].includes("text/u2a2a-topic")) e.preventDefault();
+    });
+    tab.addEventListener("drop", (e) => {
+      const src = e.dataTransfer.getData("text/u2a2a-topic");
+      if (!src || src === t.id) return;
+      e.preventDefault();
+      const order = topics.map((x) => x.id).filter((tid) => tid !== src);
+      order.splice(order.indexOf(t.id), 0, src);
+      api("/api/topics/reorder", "POST", { order });
+    });
     if (renamingTopicId === t.id) {
       const input = el("input", { value: t.title });
       const commit = () => {
@@ -1239,17 +1253,55 @@ function renderPool() {
   renderClipBar();
 
   listBox.replaceChildren();
-  if (!items.some((p) => p.id === poolSelectedId)) poolSelectedId = items.length ? items[0].id : null;
+  const isTopicSel = typeof poolSelectedId === "string" && poolSelectedId.startsWith("topic:");
+  if (!isTopicSel && !items.some((p) => p.id === poolSelectedId)) poolSelectedId = items.length ? items[0].id : null;
+
+  // 🧵 スレッド履歴（トピック一覧を DAS の一部としてブラウズ）
+  const topics = state.topics || [];
+  const topicRow = (t, depth) => {
+    const active = t.id === (currentTopic() || {}).id;
+    return el("div", {
+      class: "pf-row" + (poolSelectedId === "topic:" + t.id ? " sel" : ""),
+      style: "padding-left:" + (8 + depth * 14) + "px",
+      onclick: () => {
+        poolSelectedId = "topic:" + t.id;
+        if (document.body.classList.contains("pool-collapsed")) togglePool(false);
+        renderPool();
+      },
+    }, [
+      el("span", { class: "pf-dot", style: active ? "background:var(--user)" : "", title: active ? "表示中" : "" }),
+      el("span", { class: "pf-name", text: "🧵 " + t.title }),
+      el("span", { class: "pf-size", text: (state.messages || []).filter((m) => m.topicId === t.id).length + " msg" }),
+    ]);
+  };
+  const qTopics = q ? topics.filter((t) => t.title.toLowerCase().includes(q)) : [];
 
   if (q) {
-    // 検索中はフラット表示（パス付き）
-    if (!items.length) listBox.appendChild(el("div", { class: "empty", text: "検索に一致なし" }));
+    // 検索中はフラット表示（パス付き・スレッドも横断）
+    for (const t of qTopics) listBox.appendChild(topicRow(t, 0));
+    if (!items.length && !qTopics.length) listBox.appendChild(el("div", { class: "empty", text: "検索に一致なし" }));
     for (const p of items) {
       const row = fileRowEl(p, 0);
       row.querySelector(".pf-name").textContent = p.file || p.title;
       listBox.appendChild(row);
     }
   } else {
+    const thOpen = !closedDirs.has("threads");
+    listBox.appendChild(el("div", {
+      class: "pf-row folder",
+      title: "スレッド履歴（自動生成ミラー: pool/threads/）",
+      onclick: () => {
+        thOpen ? closedDirs.add("threads") : closedDirs.delete("threads");
+        renderPool();
+      },
+    }, [
+      el("span", { class: "chev", text: thOpen ? "▾" : "▸" }),
+      el("span", { class: "pf-name", text: "🧵 スレッド履歴" }),
+      el("span", { class: "pf-size", text: topics.length + " 件" }),
+    ]));
+    if (thOpen) for (const t of topics) listBox.appendChild(topicRow(t, 1));
+  }
+  if (!q) {
     // Finder 風ツリー（フォルダ＋ファイル）
     const dirs = state.poolDirs || [];
     const byDir = (dir) => items.filter((p) => {
@@ -1296,12 +1348,67 @@ function renderPool() {
 
   // 詳細
   detailBox.replaceChildren();
+  if (isTopicSel) {
+    const t = topics.find((x) => "topic:" + x.id === poolSelectedId);
+    if (t) {
+      renderTopicDetail(detailBox, t);
+      return;
+    }
+  }
   const sel = items.find((p) => p.id === poolSelectedId);
   if (!sel) {
     detailBox.appendChild(el("div", { class: "empty", text: "ファイルを選択してください" }));
     return;
   }
   renderPoolDetail(detailBox, sel);
+}
+
+function renderTopicDetail(box, t) {
+  const msgs = (state.messages || []).filter((m) => m.topicId === t.id);
+  const active = t.id === (currentTopic() || {}).id;
+  box.appendChild(el("div", { class: "p-head" }, [
+    el("span", { class: "origin", text: "🧵 スレッド履歴" }),
+    el("span", { class: "p-title", text: t.title }),
+    el("span", { class: "pf-size", text: msgs.length + " メッセージ" }),
+  ]));
+  if (t.mirrorFile) {
+    const url = "/api/pool/file/" + encodeURIComponent(t.mirrorFile);
+    box.appendChild(el("div", { class: "p-file" }, [
+      el("a", { href: url, target: "_blank", rel: "noopener", text: "📄 u2a2a/pool/" + t.mirrorFile }),
+      el("span", { class: "p-size", text: "自動生成ミラー（エージェントもこのパスで参照可）" }),
+    ]));
+  }
+  const actions = el("div", { class: "actions" }, [
+    el("button", { class: "small", text: active ? "表示中のスレッドです" : "このスレッドを開く", onclick: () => { if (!active) switchTopic(t.id); } }),
+    el("button", {
+      class: "small",
+      text: "履歴をコピー",
+      onclick: async () => {
+        if (!t.mirrorFile) return;
+        const r = await fetch("/api/pool/file/" + encodeURIComponent(t.mirrorFile));
+        copy(await r.text());
+      },
+    }),
+  ]);
+  box.appendChild(actions);
+  // 履歴プレビュー（ミラーファイルを取得して Markdown 表示）
+  const body = el("div", { class: "p-body mdview" });
+  box.appendChild(body);
+  if (!t.mirrorFile) return;
+  const key = t.mirrorFile + ":" + msgs.length + ":" + (msgs.length ? msgs[msgs.length - 1].ts : 0);
+  const cached = poolPreview[key];
+  if (cached && cached.text != null) {
+    body.innerHTML = renderMarkdown(cached.text);
+    return;
+  }
+  body.appendChild(el("div", { class: "empty", text: "読み込み中…" }));
+  if (!cached) {
+    poolPreview[key] = { pending: true };
+    fetch("/api/pool/file/" + encodeURIComponent(t.mirrorFile)).then((r) => r.text()).then((text) => {
+      poolPreview[key] = { text };
+      renderPool();
+    }).catch(() => { poolPreview[key] = { text: "（読み込み失敗）" }; });
+  }
 }
 
 function renderPoolDetail(box, p) {
