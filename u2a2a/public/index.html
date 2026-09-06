@@ -260,6 +260,15 @@
   .msg[data-author="claude"] { border-left-color: var(--claude); }
   .msg[data-author="codex"] { border-left-color: var(--codex); }
   .msg.external { border-style: dashed; border-left-style: solid; }
+  .relay-collapsed {
+    color: var(--dim);
+    font-size: 12.5px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .relay-collapsed:hover { color: var(--text); }
+  .relay-fold { cursor: pointer; }
+  .relay-fold:hover { color: var(--text); }
   .msg .meta {
     display: flex;
     gap: 8px;
@@ -1044,6 +1053,7 @@ function renderMarkdown(src) {
 }
 
 const rawView = new Set(); // 「生表示」に切り替えたメッセージ id（クライアント側のみ）
+const expandedRelays = new Set(); // 展開した転送/中継メッセージの id（既定は折りたたみ）
 
 function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
@@ -1616,9 +1626,32 @@ function renderThread(agent) {
       }),
     ]);
 
-    const body = el("div", { class: "mdview" + (isRaw ? " raw" : "") });
-    if (isRaw) body.textContent = m.text;
-    else body.innerHTML = renderMarkdown(m.text);
+    // 転送・質疑中継で届いた内容は送信元に原文があるため、受信側では折りたたみ表示
+    let body;
+    if (m.relayedFrom && !expandedRelays.has(m.id)) {
+      body = el("div", {
+        class: "relay-collapsed",
+        text: "📨 " + NAMES[m.relayedFrom] + " 側からの送信テキスト（" + m.text.length + " 文字）— クリックで展開",
+        onclick: () => {
+          expandedRelays.add(m.id);
+          renderThread(agent);
+        },
+      });
+    } else {
+      body = el("div", { class: "mdview" + (isRaw ? " raw" : "") });
+      if (isRaw) body.textContent = m.text;
+      else body.innerHTML = renderMarkdown(m.text);
+      if (m.relayedFrom) {
+        meta.appendChild(el("span", {
+          class: "relay-fold",
+          text: "（折りたたむ）",
+          onclick: () => {
+            expandedRelays.delete(m.id);
+            renderThread(agent);
+          },
+        }));
+      }
+    }
 
     box.appendChild(el("div", { class: "msg" + (m.external ? " external" : ""), "data-author": m.author }, [
       meta,
