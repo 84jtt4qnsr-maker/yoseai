@@ -25,7 +25,7 @@ const PORT = Number(process.env.U2A2A_PORT || 4742);
 const AGENTS = ["claude", "codex"];
 const AUTHORS = ["user", "claude", "codex"];
 const TASK_STATUSES = ["queued", "working", "returned", "done"];
-const AGENT_TIMEOUT_MS = 5 * 60 * 1000;
+const AGENT_TIMEOUT_MS = 15 * 60 * 1000; // 大きな成果物のレビューは5分では足りない
 const MAX_BACKLOG = 10;
 
 function defaultAgent() {
@@ -94,8 +94,30 @@ const sseClients = new Set();
 // itemId -> 実行中レビュアー名の配列（永続化しない）
 const reviewPending = {};
 
+// 実行中 CLI の進捗実況（永続化しない）。key: "thread:claude" / "review:<itemId>:<reviewer>"
+const activity = {};
+
+function actStart(key, label) {
+  activity[key] = { label, step: "CLI 起動中…", startedAt: Date.now(), steps: [] };
+  broadcast();
+}
+
+function actStep(key, step) {
+  const a = activity[key];
+  if (!a || !step || a.step === step) return;
+  a.step = step;
+  a.steps.push(step);
+  if (a.steps.length > 6) a.steps.shift();
+  broadcast();
+}
+
+function actEnd(key) {
+  delete activity[key];
+  broadcast();
+}
+
 function publicState() {
-  return { ...state, running, reviewPending };
+  return { ...state, running, reviewPending, activity };
 }
 
 function broadcast() {
@@ -148,12 +170,27 @@ function spawnEnv() {
   return { ...process.env, PATH: [process.env.PATH, ...extra].filter(Boolean).join(":") };
 }
 
-function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS) {
+function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = null) {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd: REPO_ROOT, env: spawnEnv(), stdio: ["pipe", "pipe", "pipe"] });
     child.stdin.on("error", () => {});
     child.stdin.end(stdinData);
-    let out = "", err = "";
+    let out = "", err = "", lineBuf = "";
+    if (onLine) {
+      child.stdout.on("data", (d) => {
+        lineBuf += d;
+        let idx;
+        while ((idx = lineBuf.indexOf("\n")) >= 0) {
+          const line = lineBuf.slice(0, idx);
+          lineBuf = lineBuf.slice(idx + 1);
+          try {
+            onLine(line);
+          } catch {
+            // 実況の失敗で本処理を止めない
+          }
+        }
+      });
+    }
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       err += `\n(タイムアウト: ${timeoutMs / 1000}秒)`;
@@ -219,18 +256,52 @@ function qaHop(agent, replyText) {
   if (state.agents[other].auto) agentLoop(other);
 }
 
-async function callClaude(prompt, sessionId, modelOverride) {
+// stream-json イベント → 実況用の1行テキスト
+function claudeStepFrom(ev) {
+  if (ev.type === "system" && ev.subtype === "init") return "セッション初期化";
+  if (ev.type === "system" && ev.subtype === "task_summary" && ev.detail) return "⚙ " + ev.detail;
+  if (ev.type === "system" && ev.subtype === "thinking_tokens") return "🧠 思考中（~" + ev.estimated_tokens + " tokens）";
+  if (ev.type === "assistant") {
+    for (const b of ev.message?.content || []) {
+      if (b.type === "tool_use") {
+        const i = b.input || {};
+        const target = i.file_path || i.path || i.command || i.pattern || i.query || "";
+        return "🔧 " + b.name + (target ? ": " + String(target).slice(-70) : "");
+      }
+      if (b.type === "text" && b.text) return "✍ 応答を作成中";
+    }
+  }
+  return null;
+}
+
+async function callClaude(prompt, sessionId, modelOverride, onStep) {
   // プロンプトは stdin 渡し（"---" 等で始まってもオプションと誤認されないように）
-  const args = ["-p", "--output-format", "json"];
+  // stream-json でイベントを逐次受け取り、進捗を実況する
+  const args = ["-p", "--output-format", "stream-json", "--verbose"];
   if (sessionId) args.push("--resume", sessionId);
   if (modelOverride) args.push("--model", modelOverride);
-  const { code, out, err } = await runCli("claude", args, prompt);
-  if (code !== 0) throw new Error((err || out || "claude CLI エラー").trim().slice(0, 500));
-  const parsed = JSON.parse(out);
-  if (parsed.is_error) throw new Error(String(parsed.result || "claude エラー").slice(0, 500));
+  let result = null;
+  const onLine = (line) => {
+    if (!line.trim()) return;
+    let ev;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (ev.type === "result") result = ev;
+    else if (onStep) {
+      const s = claudeStepFrom(ev);
+      if (s) onStep(s);
+    }
+  };
+  const { code, err, out } = await runCli("claude", args, prompt, AGENT_TIMEOUT_MS, onLine);
+  if (!result && code !== 0) throw new Error((err || out || "claude CLI エラー").trim().slice(0, 500));
+  if (!result) throw new Error("claude: 結果イベントを受信できませんでした");
+  if (result.is_error) throw new Error(String(result.result || "claude エラー").slice(0, 500));
   // modelUsage のキーがモデルID（"claude-opus-5[1m]" の [1m] はfastモード印なので除く）
-  const model = Object.keys(parsed.modelUsage || {})[0]?.replace(/\[.*\]$/, "") || "";
-  return { text: parsed.result || "(空の応答)", sessionId: parsed.session_id || sessionId, model };
+  const model = Object.keys(result.modelUsage || {})[0]?.replace(/\[.*\]$/, "") || "";
+  return { text: result.result || "(空の応答)", sessionId: result.session_id || sessionId, model };
 }
 
 // codex は --json だとモデル名を出力しないため、セッションの rollout ファイル冒頭から読む
@@ -253,7 +324,22 @@ function codexModelFromRollout(sessionId) {
   return "";
 }
 
-async function callCodex(prompt, sessionId, modelOverride) {
+// codex --json イベント → 実況用の1行テキスト
+function codexStepFrom(ev) {
+  if (ev.type === "thread.started") return "セッション開始";
+  if (ev.type === "turn.started") return "🧠 思考中…";
+  const it = ev.item || {};
+  if (ev.type === "item.started" || ev.type === "item.completed") {
+    if (it.type === "command_execution") return "🔧 exec: " + String(it.command || "").slice(0, 70);
+    if (it.type === "reasoning") return "🧠 思考中";
+    if (it.type === "file_change") return "📝 ファイル変更";
+    if (it.type === "agent_message") return "✍ 応答を作成中";
+    if (it.type === "web_search") return "🌐 検索: " + String(it.query || "").slice(0, 50);
+  }
+  return null;
+}
+
+async function callCodex(prompt, sessionId, modelOverride, onStep) {
   const outFile = path.join(os.tmpdir(), `u2a2a-codex-${id()}.txt`);
   const base = ["--json", "-o", outFile, "--skip-git-repo-check"];
   // resume は -s / -C を受け付けない（元セッションから継承）。config 経由で read-only を明示する
@@ -261,7 +347,20 @@ async function callCodex(prompt, sessionId, modelOverride) {
     ? ["exec", "resume", sessionId, "-", ...base, "-c", 'sandbox_mode="read-only"']
     : ["exec", "-", ...base, "-s", "read-only", "-C", REPO_ROOT];
   if (modelOverride) args.push("-m", modelOverride);
-  const { code, out, err } = await runCli("codex", args, prompt);
+  const onLine = onStep
+    ? (line) => {
+        if (!line.trim()) return;
+        let ev;
+        try {
+          ev = JSON.parse(line);
+        } catch {
+          return;
+        }
+        const s = codexStepFrom(ev);
+        if (s) onStep(s);
+      }
+    : null;
+  const { code, out, err } = await runCli("codex", args, prompt, AGENT_TIMEOUT_MS, onLine);
   let text = "";
   try {
     text = fs.readFileSync(outFile, "utf8").trim();
@@ -434,9 +533,11 @@ async function runReview(itemId, reviewer) {
   (reviewPending[itemId] ||= []).push(reviewer);
   if (item.status === "submitted") item.status = "reviewing";
   touch();
+  const actKey = "review:" + itemId + ":" + reviewer;
+  actStart(actKey, NAMES[reviewer] + " レビュー");
   try {
     const call = reviewer === "claude" ? callClaude : callCodex;
-    const { text } = await call(buildReviewPrompt(item, reviewer), null, state.agents[reviewer].modelOverride);
+    const { text } = await call(buildReviewPrompt(item, reviewer), null, state.agents[reviewer].modelOverride, (s) => actStep(actKey, s));
     item.reviews.push({ id: id(), reviewer, text, verdict: verdictFrom(text), ts: Date.now() });
   } catch (e) {
     item.reviews.push({
@@ -448,6 +549,7 @@ async function runReview(itemId, reviewer) {
       ts: Date.now(),
     });
   } finally {
+    actEnd(actKey);
     reviewPending[itemId] = (reviewPending[itemId] || []).filter((r) => r !== reviewer);
     if (!reviewPending[itemId].length) delete reviewPending[itemId];
     touch();
@@ -602,9 +704,11 @@ async function agentLoop(agent) {
       const msgs = unseenFor(agent);
       if (!a.auto || !msgs.length) break;
       const prompt = buildPrompt(agent, msgs, !a.sessionId);
+      const actKey = "thread:" + agent;
+      actStart(actKey, NAMES[agent] + " 応答");
       try {
         const call = agent === "claude" ? callClaude : callCodex;
-        const { text, sessionId, model } = await call(prompt, a.sessionId, a.modelOverride);
+        const { text, sessionId, model } = await call(prompt, a.sessionId, a.modelOverride, (s) => actStep(actKey, s));
         a.sessionId = sessionId;
         if (model) a.model = model;
         a.lastSeenTs = msgs[msgs.length - 1].ts;
@@ -616,6 +720,8 @@ async function agentLoop(agent) {
         state.relay.active = false; // エラーで質疑が空回りしないよう停止
         a.lastError = String(e.message || e);
         a.lastSeenTs = msgs[msgs.length - 1].ts; // 同じメッセージで無限リトライしない
+      } finally {
+        actEnd(actKey);
       }
       touch();
       if (!needsRun[agent]) break;

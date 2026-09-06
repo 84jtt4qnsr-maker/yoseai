@@ -168,6 +168,21 @@
     font-size: 12.5px;
     padding: 2px 4px;
   }
+  /* CLI 実況 */
+  .activity {
+    background: var(--panel);
+    border: 1px dashed var(--line);
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: var(--dim);
+    margin-top: 6px;
+  }
+  .activity .a-head { display: flex; gap: 8px; align-items: baseline; }
+  .activity .a-label { color: var(--codex); font-weight: 600; }
+  .activity .elapsed { font-family: ui-monospace, monospace; }
+  .activity .a-step { color: var(--text); margin-top: 2px; }
+  .activity .a-log { margin-top: 2px; opacity: 0.65; font-size: 11px; }
   .typing::after {
     content: "…";
     animation: dots 1.2s steps(4) infinite;
@@ -677,7 +692,7 @@
 const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
 const OTHER = { claude: "codex", codex: "claude" };
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
-let state = { messages: [], tasks: [], pool: [], agents: {}, running: {}, relay: {}, reviewPending: {} };
+let state = { messages: [], tasks: [], pool: [], agents: {}, running: {}, relay: {}, reviewPending: {}, activity: {} };
 const POOL_STATUS_LABEL = { submitted: "持ち込み", reviewing: "レビュー", approved: "承認", rejected: "差し戻し" };
 
 const $ = (s) => document.querySelector(s);
@@ -707,6 +722,32 @@ async function api(path, method = "GET", body) {
 function fmtTime(ts) {
   return new Date(ts).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
 }
+
+function fmtElapsed(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+
+// 実行中 CLI の実況ボックス
+function activityEl(a) {
+  const box = el("div", { class: "activity" }, [
+    el("div", { class: "a-head" }, [
+      el("span", { class: "a-label", text: "⏳ " + a.label + " 実行中" }),
+      el("span", { class: "elapsed", "data-started": a.startedAt, text: fmtElapsed(Date.now() - a.startedAt) }),
+    ]),
+    el("div", { class: "a-step", text: a.step || "" }),
+  ]);
+  const past = (a.steps || []).slice(0, -1).slice(-3);
+  if (past.length) box.appendChild(el("div", { class: "a-log", text: past.join("　→　") }));
+  return box;
+}
+
+// 経過時間だけ毎秒更新（全再描画はしない）
+setInterval(() => {
+  for (const e2 of document.querySelectorAll(".elapsed[data-started]")) {
+    e2.textContent = fmtElapsed(Date.now() - Number(e2.dataset.started));
+  }
+}, 1000);
 
 // ---- 軽量 Markdown レンダラー（HTML はすべてエスケープ＝無害化した上で装飾のみ付与） ----
 function escapeHtml(s) {
@@ -996,7 +1037,8 @@ function renderPoolDetail(box, p) {
       kids.push(el("div", { class: "review" }, reviewKids));
     }
     for (const r of pending) {
-      kids.push(el("div", { class: "typing", text: NAMES[r] + " がレビュー中" }));
+      const act = (state.activity || {})["review:" + p.id + ":" + r];
+      kids.push(act ? activityEl(act) : el("div", { class: "typing", text: NAMES[r] + " がレビュー中" }));
     }
 
     const actions = el("div", { class: "actions" });
@@ -1081,7 +1123,8 @@ function renderThread(agent) {
   box.replaceChildren();
   if (!msgs.length) {
     if (state.running && state.running[agent]) {
-      box.appendChild(el("div", { class: "typing", text: NAMES[agent] + " が応答中" }));
+      const act = (state.activity || {})["thread:" + agent];
+      box.appendChild(act ? activityEl(act) : el("div", { class: "typing", text: NAMES[agent] + " が応答中" }));
     } else {
       box.appendChild(el("div", { class: "empty", text: "まだメッセージがありません" }));
     }
@@ -1129,7 +1172,8 @@ function renderThread(agent) {
     ]));
   }
   if (state.running && state.running[agent]) {
-    box.appendChild(el("div", { class: "typing", text: NAMES[agent] + " が応答中" }));
+    const act = (state.activity || {})["thread:" + agent];
+    box.appendChild(act ? activityEl(act) : el("div", { class: "typing", text: NAMES[agent] + " が応答中" }));
   }
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
