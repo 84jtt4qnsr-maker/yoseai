@@ -194,7 +194,55 @@
   .msg[data-author="user"] .who { color: var(--user); }
   .msg[data-author="claude"] .who { color: var(--claude); }
   .msg[data-author="codex"] .who { color: var(--codex); }
-  .msg .body { white-space: pre-wrap; word-break: break-word; }
+  .msg .body { word-break: break-word; overflow-x: auto; }
+  .msg .body.raw { white-space: pre-wrap; }
+  .msg .body p { margin: 0.35em 0; }
+  .msg .body h1, .msg .body h2, .msg .body h3, .msg .body h4 {
+    margin: 0.6em 0 0.3em;
+    font-size: 1.05em;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 2px;
+  }
+  .msg .body h1 { font-size: 1.15em; }
+  .msg .body h2 { font-size: 1.1em; }
+  .msg .body ul, .msg .body ol { margin: 0.35em 0; padding-left: 1.5em; }
+  .msg .body li { margin: 0.15em 0; }
+  .msg .body code {
+    font-family: ui-monospace, "SF Mono", monospace;
+    font-size: 0.92em;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 0 4px;
+  }
+  .msg .body pre {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+    overflow-x: auto;
+    margin: 0.4em 0;
+  }
+  .msg .body pre code { background: none; border: none; padding: 0; }
+  .msg .body blockquote {
+    margin: 0.4em 0;
+    padding: 2px 10px;
+    border-left: 3px solid var(--dim);
+    color: var(--dim);
+  }
+  .msg .body table {
+    border-collapse: collapse;
+    margin: 0.4em 0;
+    font-size: 0.95em;
+  }
+  .msg .body th, .msg .body td {
+    border: 1px solid var(--line);
+    padding: 3px 9px;
+    text-align: left;
+  }
+  .msg .body th { background: var(--panel-2); }
+  .msg .body a { color: var(--codex); }
+  .msg .body hr { border: none; border-top: 1px solid var(--line); margin: 0.6em 0; }
   .msg .actions { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
   .empty { color: var(--dim); font-size: 12.5px; text-align: center; margin-top: 24px; }
 
@@ -412,6 +460,117 @@ function fmtTime(ts) {
   return new Date(ts).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
 }
 
+// ---- 軽量 Markdown レンダラー（HTML はすべてエスケープ＝無害化した上で装飾のみ付与） ----
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function inlineMd(raw) {
+  let s = escapeHtml(raw);
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[^*\w])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
+  s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s;
+}
+
+function renderMarkdown(src) {
+  const lines = src.split("\n");
+  const out = [];
+  let para = [];
+  const flushPara = () => {
+    if (para.length) out.push("<p>" + para.map(inlineMd).join("<br>") + "</p>");
+    para = [];
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    // フェンス付きコードブロック
+    const fence = line.match(/^\s*```/);
+    if (fence) {
+      flushPara();
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) buf.push(lines[i++]);
+      i++; // 閉じフェンス
+      out.push("<pre><code>" + escapeHtml(buf.join("\n")) + "</code></pre>");
+      continue;
+    }
+    // 見出し
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) {
+      flushPara();
+      const level = Math.min(h[1].length, 4);
+      out.push(`<h${level}>` + inlineMd(h[2]) + `</h${level}>`);
+      i++;
+      continue;
+    }
+    // 水平線
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      flushPara();
+      out.push("<hr>");
+      i++;
+      continue;
+    }
+    // 引用
+    if (/^\s*>\s?/.test(line)) {
+      flushPara();
+      const buf = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^\s*>\s?/, ""));
+      out.push("<blockquote>" + buf.map(inlineMd).join("<br>") + "</blockquote>");
+      continue;
+    }
+    // 表（ヘッダ行 + 区切り行）
+    if (line.includes("|") && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(lines[i + 1])) {
+      flushPara();
+      const cells = (l) => l.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split("|").map((c) => inlineMd(c.trim()));
+      const head = cells(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes("|")) rows.push(cells(lines[i++]));
+      out.push(
+        "<table><thead><tr>" + head.map((c) => "<th>" + c + "</th>").join("") + "</tr></thead><tbody>" +
+        rows.map((r) => "<tr>" + r.map((c) => "<td>" + c + "</td>").join("") + "</tr>").join("") +
+        "</tbody></table>"
+      );
+      continue;
+    }
+    // リスト（箇条書き／番号。ネストは1段のみ対応）
+    const isUl = (l) => /^\s*[-*+]\s+/.test(l);
+    const isOl = (l) => /^\s*\d+[.)]\s+/.test(l);
+    if (isUl(line) || isOl(line)) {
+      flushPara();
+      const ordered = isOl(line);
+      const tag = ordered ? "ol" : "ul";
+      const items = [];
+      while (i < lines.length && (isUl(lines[i]) || isOl(lines[i]))) {
+        let item = lines[i].replace(/^\s*([-*+]|\d+[.)])\s+/, "");
+        i++;
+        // 継続行（インデントされた通常行）を取り込む
+        while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !isUl(lines[i]) && !isOl(lines[i])) {
+          item += "\n" + lines[i++].trim();
+        }
+        items.push("<li>" + item.split("\n").map(inlineMd).join("<br>") + "</li>");
+      }
+      out.push(`<${tag}>` + items.join("") + `</${tag}>`);
+      continue;
+    }
+    // 空行 = 段落区切り
+    if (!line.trim()) {
+      flushPara();
+      i++;
+      continue;
+    }
+    para.push(line);
+    i++;
+  }
+  flushPara();
+  return out.join("\n");
+}
+
+const rawView = new Set(); // 「生表示」に切り替えたメッセージ id（クライアント側のみ）
+
 function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -496,6 +655,7 @@ function renderThread(agent) {
     if (m.qa) meta.appendChild(el("span", { text: "（質疑）" }));
     if (m.external) meta.appendChild(el("span", { text: "（外部セッションから同期）" }));
 
+    const isRaw = rawView.has(m.id);
     const actions = el("div", { class: "actions" }, [
       el("button", { class: "small", text: "タスク化", onclick: () => openTaskDialog(agent, m) }),
       el("button", {
@@ -504,11 +664,23 @@ function renderThread(agent) {
         onclick: () => relay(agent, m),
       }),
       el("button", { class: "small", text: "コピー", onclick: () => copy(m.text) }),
+      el("button", {
+        class: "small",
+        text: isRaw ? "MD表示" : "生表示",
+        onclick: () => {
+          rawView.has(m.id) ? rawView.delete(m.id) : rawView.add(m.id);
+          renderThread(agent);
+        },
+      }),
     ]);
+
+    const body = el("div", { class: "body" + (isRaw ? " raw" : "") });
+    if (isRaw) body.textContent = m.text;
+    else body.innerHTML = renderMarkdown(m.text);
 
     box.appendChild(el("div", { class: "msg" + (m.external ? " external" : ""), "data-author": m.author }, [
       meta,
-      el("div", { class: "body", text: m.text }),
+      body,
       actions,
     ]));
   }
