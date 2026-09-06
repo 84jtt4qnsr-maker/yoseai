@@ -392,6 +392,10 @@
     font-size: 12.5px;
     border-radius: 6px;
   }
+  #pool-create-row { display: flex; gap: 4px; align-items: center; margin: 2px 0 4px; }
+  #pool-create-row[hidden] { display: none; }
+  #pool-create-row input { flex: 1; min-width: 0; padding: 3px 8px; font-size: 12px; border-radius: 6px; }
+  button.small.danger { color: var(--danger); border-color: #ff7b7b55; }
   #pool-cwd {
     font-size: 10.5px;
     color: var(--dim);
@@ -628,6 +632,11 @@
         <input id="pool-search" placeholder="🔍 ファイル検索" />
         <button class="small" id="pool-newdir" title="新規フォルダ">📁+</button>
         <button class="small" id="pool-newfile" title="新規ファイル">📄+</button>
+      </div>
+      <div id="pool-create-row" hidden>
+        <input id="pool-create-name" />
+        <button id="pool-create-ok" class="small">作成</button>
+        <button id="pool-create-cancel" class="small">✕</button>
       </div>
       <div id="pool-cwd" title="クリックでルートに戻る"></div>
       <div id="pool-list"></div>
@@ -1178,7 +1187,7 @@ function renderPoolDetail(box, p) {
     actions.appendChild(el("button", {
       class: "small",
       text: "削除",
-      onclick: () => { if (confirm("「" + p.title + "」をプールから削除しますか？")) api("/api/pool/" + p.id, "DELETE"); },
+      onclick: (e) => armedDelete(e.target, () => api("/api/pool/" + p.id, "DELETE").then(() => toast(".trash へ退避しました"))),
     }));
     kids.push(actions);
     for (const k of kids) box.appendChild(k);
@@ -1333,7 +1342,7 @@ function renderTasks(agent) {
         text: "プールへ",
         onclick: () => openPoolDialog(t.agent, t.result, null, t.title),
       }));
-    actions.appendChild(el("button", { class: "small", text: "削除", onclick: () => delTask(t) }));
+    actions.appendChild(el("button", { class: "small", text: "削除", onclick: (e) => armedDelete(e.target, () => delTask(t)) }));
 
     const kids = [
       el("div", { class: "t-head" }, [
@@ -1375,7 +1384,6 @@ async function patchTask(id, status) {
 }
 
 async function delTask(t) {
-  if (!confirm("タスク「" + t.title + "」を削除しますか？")) return;
   await api("/api/tasks/" + t.id, "DELETE");
 }
 
@@ -1476,18 +1484,62 @@ function togglePool(collapse) {
 $("#pool-toggle").addEventListener("click", () => togglePool());
 $("#pool-search").addEventListener("input", () => renderPool());
 $("#pool-cwd").addEventListener("click", () => { poolCurrentDir = ""; renderPool(); });
-$("#pool-newdir").addEventListener("click", () => {
-  const name = prompt("新規フォルダ名（作成先: pool/" + (poolCurrentDir ? poolCurrentDir + "/" : "") + "）");
-  if (!name || !name.trim()) return;
-  api("/api/pool/mkdir", "POST", { dir: poolCurrentDir, name: name.trim() })
-    .then((r) => { poolCurrentDir = r.dir; toast("フォルダを作成しました: " + r.dir); });
+// prompt()/confirm() はアプリ内ブラウザ等で無効化されることがあるため、インライン UI で作成する
+let poolCreateMode = null; // "dir" | "file"
+function openPoolCreate(mode) {
+  poolCreateMode = mode;
+  const row = $("#pool-create-row");
+  const input = $("#pool-create-name");
+  row.hidden = false;
+  input.placeholder = (mode === "dir" ? "📁 新規フォルダ名" : "📄 新規ファイル名（例: notes.md）") +
+    " → pool/" + (poolCurrentDir ? poolCurrentDir + "/" : "");
+  input.value = "";
+  input.focus();
+}
+function closePoolCreate() {
+  poolCreateMode = null;
+  $("#pool-create-row").hidden = true;
+}
+async function submitPoolCreate() {
+  const name = $("#pool-create-name").value.trim();
+  if (!name || !poolCreateMode) return;
+  if (poolCreateMode === "dir") {
+    const r = await api("/api/pool/mkdir", "POST", { dir: poolCurrentDir, name });
+    poolCurrentDir = r.dir;
+    toast("フォルダを作成しました: " + r.dir);
+  } else {
+    const item = await api("/api/pool/newfile", "POST", { dir: poolCurrentDir, name });
+    poolSelectedId = item.id;
+    toast("ファイルを作成しました: " + item.file);
+  }
+  closePoolCreate();
+  renderPool();
+}
+$("#pool-newdir").addEventListener("click", () => openPoolCreate("dir"));
+$("#pool-newfile").addEventListener("click", () => openPoolCreate("file"));
+$("#pool-create-ok").addEventListener("click", submitPoolCreate);
+$("#pool-create-cancel").addEventListener("click", closePoolCreate);
+$("#pool-create-name").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") submitPoolCreate();
+  if (e.key === "Escape") closePoolCreate();
 });
-$("#pool-newfile").addEventListener("click", () => {
-  const name = prompt("新規ファイル名（作成先: pool/" + (poolCurrentDir ? poolCurrentDir + "/" : "") + "）", "untitled.md");
-  if (!name || !name.trim()) return;
-  api("/api/pool/newfile", "POST", { dir: poolCurrentDir, name: name.trim() })
-    .then((item) => { poolSelectedId = item.id; toast("ファイルを作成しました: " + item.file); });
-});
+
+// confirm() の代替: 1度目のクリックで「本当に削除？」に変わり、2.5秒以内の再クリックで実行
+function armedDelete(btn, action) {
+  if (btn.dataset.armed) {
+    action();
+    return;
+  }
+  btn.dataset.armed = "1";
+  const orig = btn.textContent;
+  btn.textContent = "本当に削除？";
+  btn.classList.add("danger");
+  setTimeout(() => {
+    btn.dataset.armed = "";
+    btn.textContent = orig;
+    btn.classList.remove("danger");
+  }, 2500);
+}
 
 let resultTask = null;
 function openResultDialog(t) {
