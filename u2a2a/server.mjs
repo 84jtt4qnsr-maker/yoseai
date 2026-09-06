@@ -737,7 +737,10 @@ async function handleApi(req, res, url) {
     const file = poolFilePath(decodeURIComponent(parts[3]));
     if (!file || !fs.existsSync(file)) return json(res, 404, { error: "file not found" });
     const ext = path.extname(file).toLowerCase();
-    const mime = IMAGE_MIME[ext] || (isTextPoolFile(file) ? "text/plain; charset=utf-8" : "application/octet-stream");
+    const mime =
+      ext === ".html" || ext === ".htm"
+        ? "text/html; charset=utf-8" // HTML 成果物（ゲーム等）はそのまま実行できる形で配信
+        : IMAGE_MIME[ext] || (isTextPoolFile(file) ? "text/plain; charset=utf-8" : "application/octet-stream");
     res.writeHead(200, { "Content-Type": mime, "Cache-Control": "no-store" });
     fs.createReadStream(file).pipe(res);
     return;

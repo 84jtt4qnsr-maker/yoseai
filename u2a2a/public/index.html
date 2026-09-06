@@ -874,6 +874,17 @@ function poolPreviewEl(p) {
     body.appendChild(el("img", { src: url + "?v=" + (p.mtime || 0), alt: p.title }));
     return body;
   }
+  if (extOf(p.file) === "html" || extOf(p.file) === "htm") {
+    // HTML は iframe でその場実行（ゲーム・デモ対応）。
+    // allow-same-origin がないと localStorage 等で成果物側が停止するため付与
+    // （ローカル単一ユーザーのツールで、プール内容は自分のエージェント由来という前提）
+    body.appendChild(el("iframe", {
+      src: url + "?v=" + (p.mtime || 0),
+      sandbox: "allow-scripts allow-same-origin allow-pointer-lock",
+      style: "width:100%;height:420px;border:1px solid var(--line);border-radius:8px;background:#0e1116;",
+    }));
+    return body;
+  }
   if (!isTextExt(p.file) || (p.size || 0) > 300_000) {
     body.appendChild(el("div", { class: "empty", text: "プレビューなし — リンクから開いてください" }));
     return body;
