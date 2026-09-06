@@ -317,7 +317,7 @@ function buildPrompt(topic, agent, msgs, isFirst) {
 }
 
 // 質疑モード: エージェントの応答完了を待って相手スレッドへ中継する（トピック単位）
-function qaHop(topic, agent, replyText) {
+function qaHop(topic, agent, replyText, sourceMsgId) {
   const r = topic.relay;
   if (!r.active) return;
   // 終了宣言は相手が一度でも発言した後（=中継が1回以上済み）のみ有効。
@@ -340,6 +340,7 @@ function qaHop(topic, agent, replyText) {
     author: agent,
     text: replyText,
     relayedFrom: agent,
+    sourceId: sourceMsgId || null, // 原文メッセージへの参照（UI が対応線を描く）
     qa: true,
     ts: Date.now(),
   });
@@ -910,9 +911,10 @@ async function agentLoop(topicId, agent) {
         if (model) a.model = model;
         ta.lastSeenTs = msgs[msgs.length - 1].ts;
         a.lastError = "";
-        state.messages.push({ id: id(), topicId, thread: agent, author: agent, text, auto: true, ts: Date.now() });
+        const replyMsg = { id: id(), topicId, thread: agent, author: agent, text, auto: true, ts: Date.now() };
+        state.messages.push(replyMsg);
         markTranscriptSynced(topic, agent); // 自分の応答分は外部同期の対象外にする
-        qaHop(topic, agent, text);
+        qaHop(topic, agent, text, replyMsg.id);
       } catch (e) {
         topic.relay.active = false; // エラーで質疑が空回りしないよう停止
         a.lastError = String(e.message || e);
@@ -974,6 +976,7 @@ async function handleApi(req, res, url) {
       author,
       text,
       relayedFrom: typeof body.relayedFrom === "string" ? body.relayedFrom : null,
+      sourceId: typeof body.sourceId === "string" ? body.sourceId : null,
       ts: Date.now(),
     }));
     state.messages.push(...created);

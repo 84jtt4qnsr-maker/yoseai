@@ -161,7 +161,29 @@
     gap: 0;
     min-height: 0;
     min-width: 0;
+    position: relative;
   }
+  /* 転送ペア（原文⇄折りたたみ）をつなぐ対応線 */
+  #link-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 4;
+    overflow: visible;
+  }
+  #link-layer path {
+    stroke: rgba(123, 216, 143, 0.55);
+    stroke-width: 1.5;
+    fill: none;
+    stroke-dasharray: 7 5;
+    stroke-linecap: round;
+    animation: relay-flow 0.8s linear infinite;
+  }
+  /* 破線が送り元 → 受け取り側へ流れる（パスは常に送り元始点で描かれる） */
+  @keyframes relay-flow {
+    to { stroke-dashoffset: -12; }
+  }
+  #link-layer circle { fill: rgba(123, 216, 143, 0.7); }
   .thread-col {
     display: flex;
     flex-direction: column;
@@ -659,6 +681,7 @@
 
 <div id="content">
 <main>
+  <svg id="link-layer"></svg>
   <!-- Claude Code 側スレッド -->
   <section class="thread-col" data-agent="claude">
     <div class="thread-head"><span class="role-dot"></span>Claude Code 側スレッド<input class="model-chip" id="model-claude" list="models-claude" title="使用モデルを指定（空欄=CLI既定）。プレースホルダは直近の実使用モデル" /><datalist id="models-claude"><option value="opus"></option><option value="sonnet"></option><option value="haiku"></option></datalist><span class="count" id="count-claude"></span><span class="agent-status" id="status-claude"></span>
@@ -936,6 +959,74 @@ function activityEl(a) {
   return box;
 }
 
+// ---- 転送ペアの対応線 ----
+// 原文（送信元スレッド）と折りたたみ表示（受信側）を薄緑の線でつなぎ、
+// 左右スレッドのスクロール差をひと目で分かるようにする
+let linkRaf = 0;
+
+function scheduleLinks() {
+  cancelAnimationFrame(linkRaf);
+  linkRaf = requestAnimationFrame(updateRelayLinks);
+}
+
+function updateRelayLinks() {
+  const svg = $("#link-layer");
+  const mainEl = document.querySelector("main");
+  if (!svg || !mainEl) return;
+  const mr = mainEl.getBoundingClientRect();
+  svg.setAttribute("viewBox", "0 0 " + mr.width + " " + mr.height);
+  const t = currentTopic();
+  if (!t) {
+    svg.replaceChildren();
+    return;
+  }
+  const parts = [];
+  for (const m of state.messages) {
+    if (m.topicId !== t.id || !m.relayedFrom) continue;
+    const tgt = document.querySelector('.msg[data-mid="' + m.id + '"]');
+    if (!tgt) continue;
+    let srcMsg = m.sourceId ? state.messages.find((o) => o.id === m.sourceId) : null;
+    if (!srcMsg) {
+      // 旧データ用フォールバック: 同一トピック・送信元スレッド・同著者・同文の直前メッセージ
+      srcMsg = state.messages.find(
+        (o) => o.topicId === t.id && o.thread === m.relayedFrom && o.author === m.author && o.text === m.text && o.ts <= m.ts
+      );
+    }
+    const src = srcMsg && document.querySelector('.msg[data-mid="' + srcMsg.id + '"]');
+    if (!src) continue;
+    // 各メッセージの中心Yを、所属スレッドの表示範囲内にクランプ
+    // （画面外へスクロールした分は端に張り付き、線の傾きがズレ量を示す）
+    const anchor = (el2) => {
+      const cr = el2.closest(".messages").getBoundingClientRect();
+      const r = el2.getBoundingClientRect();
+      return {
+        r,
+        y: Math.min(Math.max(r.top + r.height / 2, cr.top + 6), cr.bottom - 6),
+        visible: r.bottom > cr.top && r.top < cr.bottom, // 可読領域に一部でも見えているか
+      };
+    };
+    const s = anchor(src);
+    const g = anchor(tgt);
+    if (!s.visible && !g.visible) continue; // 両方とも画面外のペアは描かない
+    const leftFirst = s.r.left < g.r.left;
+    const x1 = (leftFirst ? s.r.right : s.r.left) - mr.left;
+    const x2 = (leftFirst ? g.r.left : g.r.right) - mr.left;
+    const y1 = s.y - mr.top;
+    const y2 = g.y - mr.top;
+    const dx = (x2 - x1) / 2;
+    parts.push(
+      `<path d="M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}" />` +
+      `<circle cx="${x1}" cy="${y1}" r="2" /><circle cx="${x2}" cy="${y2}" r="2" />`
+    );
+  }
+  svg.innerHTML = parts.join("");
+}
+
+for (const boxId of ["messages-claude", "messages-codex"]) {
+  document.getElementById(boxId).addEventListener("scroll", scheduleLinks, { passive: true });
+}
+window.addEventListener("resize", scheduleLinks);
+
 // 経過時間だけ毎秒更新（全再描画はしない）
 setInterval(() => {
   for (const e2 of document.querySelectorAll(".elapsed[data-started]")) {
@@ -1077,6 +1168,7 @@ function render() {
   }
   renderQaBar();
   renderPool();
+  scheduleLinks();
 }
 
 // 現在トピックでこのエージェントが実行中か
@@ -1653,7 +1745,7 @@ function renderThread(agent) {
       }
     }
 
-    box.appendChild(el("div", { class: "msg" + (m.external ? " external" : ""), "data-author": m.author }, [
+    box.appendChild(el("div", { class: "msg" + (m.external ? " external" : ""), "data-author": m.author, "data-mid": m.id }, [
       meta,
       body,
       actions,
@@ -1747,6 +1839,7 @@ async function relay(fromAgent, m) {
     author,
     text: m.text,
     relayedFrom: fromAgent,
+    sourceId: m.id,
     topicId: m.topicId || (currentTopic() || {}).id,
   });
   toast(NAMES[OTHER[fromAgent]] + " スレッドへ転送しました");
