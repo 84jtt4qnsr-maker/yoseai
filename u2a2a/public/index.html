@@ -27,8 +27,12 @@
     display: flex;
     flex-direction: column;
   }
+  * { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+  *::-webkit-scrollbar-track { background: transparent; }
   header {
-    padding: 10px 18px;
+    padding: 6px 18px;
     border-bottom: 1px solid var(--line);
     display: flex;
     align-items: baseline;
@@ -41,7 +45,7 @@
   #user-band {
     border-bottom: 1px solid var(--line);
     background: var(--panel);
-    padding: 10px 18px;
+    padding: 8px 18px;
     display: flex;
     gap: 10px;
     align-items: flex-end;
@@ -49,7 +53,7 @@
   #user-band .role-dot { background: var(--user); }
   #user-band textarea {
     flex: 1;
-    min-height: 44px;
+    min-height: 38px;
     max-height: 140px;
     resize: vertical;
   }
@@ -93,13 +97,20 @@
   button.small { padding: 2px 8px; font-size: 11.5px; color: var(--dim); border-radius: 6px; }
   button.small:hover { color: var(--text); }
 
-  /* スレッド 2 列（Canvas 中段） */
-  main {
+  /* 左=会話系（スレッド2列） / 右=共有タスクプール */
+  #content {
     flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    min-height: 0;
+  }
+  body.pool-collapsed #content { grid-template-columns: 1fr auto; }
+  main {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 0;
     min-height: 0;
+    min-width: 0;
   }
   .thread-col {
     display: flex;
@@ -145,10 +156,11 @@
     border-radius: 999px;
     padding: 2px 10px;
     margin-left: 10px;
-    width: 120px;
+    width: 92px;
+    transition: width 0.15s;
   }
   .model-chip::placeholder { color: var(--dim); }
-  .model-chip:focus { outline: 1px solid var(--dim); }
+  .model-chip:focus { outline: 1px solid var(--dim); width: 180px; }
   .agent-status[data-s="running"] { color: var(--codex); }
   .agent-status[data-s="error"] { color: var(--danger); cursor: help; }
   .typing {
@@ -165,10 +177,10 @@
   .messages {
     flex: 1;
     overflow-y: auto;
-    padding: 12px 16px;
+    padding: 10px 14px;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 8px;
     min-height: 120px;
   }
   .msg {
@@ -176,7 +188,8 @@
     border: 1px solid var(--line);
     border-left: 3px solid var(--dim);
     border-radius: 8px;
-    padding: 8px 12px;
+    padding: 6px 11px;
+    position: relative;
   }
   .msg[data-author="user"] { border-left-color: var(--user); }
   .msg[data-author="claude"] { border-left-color: var(--claude); }
@@ -194,20 +207,20 @@
   .msg[data-author="user"] .who { color: var(--user); }
   .msg[data-author="claude"] .who { color: var(--claude); }
   .msg[data-author="codex"] .who { color: var(--codex); }
-  .msg .body { word-break: break-word; overflow-x: auto; }
-  .msg .body.raw { white-space: pre-wrap; }
-  .msg .body p { margin: 0.35em 0; }
-  .msg .body h1, .msg .body h2, .msg .body h3, .msg .body h4 {
+  .mdview { word-break: break-word; overflow-x: auto; }
+  .mdview.raw { white-space: pre-wrap; }
+  .mdview p { margin: 0.35em 0; }
+  .mdview h1, .mdview h2, .mdview h3, .mdview h4 {
     margin: 0.6em 0 0.3em;
     font-size: 1.05em;
     border-bottom: 1px solid var(--line);
     padding-bottom: 2px;
   }
-  .msg .body h1 { font-size: 1.15em; }
-  .msg .body h2 { font-size: 1.1em; }
-  .msg .body ul, .msg .body ol { margin: 0.35em 0; padding-left: 1.5em; }
-  .msg .body li { margin: 0.15em 0; }
-  .msg .body code {
+  .mdview h1 { font-size: 1.15em; }
+  .mdview h2 { font-size: 1.1em; }
+  .mdview ul, .mdview ol { margin: 0.35em 0; padding-left: 1.5em; }
+  .mdview li { margin: 0.15em 0; }
+  .mdview code {
     font-family: ui-monospace, "SF Mono", monospace;
     font-size: 0.92em;
     background: var(--panel-2);
@@ -215,7 +228,7 @@
     border-radius: 4px;
     padding: 0 4px;
   }
-  .msg .body pre {
+  .mdview pre {
     background: var(--panel-2);
     border: 1px solid var(--line);
     border-radius: 8px;
@@ -223,54 +236,73 @@
     overflow-x: auto;
     margin: 0.4em 0;
   }
-  .msg .body pre code { background: none; border: none; padding: 0; }
-  .msg .body blockquote {
+  .mdview pre code { background: none; border: none; padding: 0; }
+  .mdview blockquote {
     margin: 0.4em 0;
     padding: 2px 10px;
     border-left: 3px solid var(--dim);
     color: var(--dim);
   }
-  .msg .body table {
+  .mdview table {
     border-collapse: collapse;
     margin: 0.4em 0;
     font-size: 0.95em;
   }
-  .msg .body th, .msg .body td {
+  .mdview th, .mdview td {
     border: 1px solid var(--line);
     padding: 3px 9px;
     text-align: left;
   }
-  .msg .body th { background: var(--panel-2); }
-  .msg .body a { color: var(--codex); }
-  .msg .body hr { border: none; border-top: 1px solid var(--line); margin: 0.6em 0; }
-  .msg .actions { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .mdview th { background: var(--panel-2); }
+  .mdview a { color: var(--codex); }
+  .mdview hr { border: none; border-top: 1px solid var(--line); margin: 0.6em 0; }
+  /* メッセージのアクションはホバー時のみ右上にオーバーレイ表示（縦の圧迫を防ぐ） */
+  .msg .actions {
+    display: none;
+    position: absolute;
+    top: 4px;
+    right: 6px;
+    gap: 4px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 3px 5px;
+    z-index: 2;
+  }
+  .msg:hover .actions, .msg:focus-within .actions { display: flex; }
   .empty { color: var(--dim); font-size: 12.5px; text-align: center; margin-top: 24px; }
 
   /* エージェント返答入力 */
   .agent-input {
     border-top: 1px solid var(--line);
-    padding: 10px 16px;
+    padding: 7px 14px;
     display: flex;
     gap: 8px;
     align-items: flex-end;
     background: var(--panel);
   }
-  .agent-input textarea { flex: 1; min-height: 38px; max-height: 120px; resize: vertical; }
+  .agent-input textarea { flex: 1; min-height: 32px; max-height: 120px; resize: vertical; }
 
-  /* タスクキュー（Canvas 下段） */
+  /* タスクキュー（Canvas 下段）: 折りたたみ式 */
   .task-zone {
     border-top: 1px solid var(--line);
-    padding: 8px 16px 12px;
-    max-height: 34vh;
+    padding: 4px 16px 8px;
+    max-height: 30vh;
     overflow-y: auto;
+    flex: none;
   }
   .task-zone h2 {
     font-size: 12px;
     color: var(--dim);
     font-weight: 600;
     letter-spacing: 0.06em;
-    margin: 4px 0 8px;
+    margin: 4px 0 6px;
+    cursor: pointer;
+    user-select: none;
   }
+  .task-zone h2:hover { color: var(--text); }
   .task {
     background: var(--panel);
     border: 1px solid var(--line);
@@ -296,39 +328,98 @@
   .status[data-s="returned"] { color: var(--claude); border-color: #ffab5e55; }
   .status[data-s="done"]     { color: var(--user); border-color: #7bd88f55; }
 
-  /* 共有タスクプール */
+  /* 共有タスクプール（右半分・縦フル） */
   #pool-zone {
-    border-top: 2px solid var(--line);
+    border-left: 2px solid var(--line);
     background: var(--panel);
-    flex: none;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
   }
+  body.pool-collapsed #pool-zone .sub { display: none; }
   #pool-head {
-    padding: 8px 18px;
+    padding: 6px 14px;
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
     font-weight: 600;
     letter-spacing: 0.03em;
+    flex-wrap: wrap;
+    row-gap: 4px;
+    flex: none;
   }
   #pool-head .sub { color: var(--dim); font-weight: 400; font-size: 12px; }
   #pool-head button { margin-left: auto; }
-  #pool-items[hidden] { display: none; }
-  #pool-items {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
-    gap: 10px;
-    padding: 0 18px 14px;
-    max-height: 40vh;
+  /* ファイルビューワー: 左リスト + 右詳細 */
+  #pool-body {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+  #pool-list-wrap {
+    width: 270px;
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--line);
+    padding: 4px 6px 0;
+    min-height: 0;
+  }
+  #pool-list { flex: 1; overflow-y: auto; padding-bottom: 10px; }
+  body.pool-collapsed #pool-list-wrap { border-right: none; }
+  body.pool-collapsed #pool-detail { display: none; }
+  #pool-search {
+    width: 100%;
+    padding: 4px 10px;
+    font-size: 12.5px;
+    border-radius: 6px;
+    margin-bottom: 4px;
+  }
+  .pf-row {
+    display: flex;
+    gap: 7px;
+    align-items: center;
+    padding: 4px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12.5px;
+    user-select: none;
+  }
+  .pf-row:hover { background: var(--panel-2); }
+  .pf-row.sel { background: var(--panel-2); outline: 1px solid var(--line); }
+  .pf-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--dim); }
+  .pf-dot[data-s="submitted"] { background: #d8c56f; }
+  .pf-dot[data-s="reviewing"] { background: var(--codex); }
+  .pf-dot[data-s="approved"] { background: var(--user); }
+  .pf-dot[data-s="rejected"] { background: var(--danger); }
+  .pf-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: ui-monospace, "SF Mono", monospace;
+    font-size: 12px;
+  }
+  .pf-size { color: var(--dim); font-size: 10.5px; flex: none; }
+  #pool-detail {
+    flex: 1;
+    min-width: 0;
     overflow-y: auto;
+    padding: 10px 14px 14px;
   }
-  .pool-item {
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    padding: 10px 12px;
+  #pool-detail .p-body { max-height: none; }
+  /* 狭い画面では従来の上下配置に戻す */
+  @media (max-width: 1100px) {
+    #content { display: flex; flex-direction: column; }
+    main { flex: 1; }
+    #pool-zone { border-left: none; border-top: 2px solid var(--line); flex: none; max-height: 40vh; }
+    #pool-list-wrap { width: 210px; }
+    #pool-detail .p-body { max-height: 180px; }
   }
-  .pool-item .p-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .pool-item .p-title { font-weight: 600; flex: 1; min-width: 120px; word-break: break-word; }
+  .p-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .p-title { font-weight: 600; flex: 1; min-width: 120px; word-break: break-word; }
   .origin {
     font-size: 11px;
     border-radius: 999px;
@@ -344,12 +435,29 @@
   .status[data-s="reviewing"] { color: var(--codex); border-color: #6fd7ff55; }
   .status[data-s="approved"] { color: var(--user); border-color: #7bd88f55; }
   .status[data-s="rejected"] { color: var(--danger); border-color: #ff7b7b55; }
-  .pool-item .p-body {
+  .p-file {
+    margin-top: 5px;
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    font-size: 12px;
+    font-family: ui-monospace, "SF Mono", monospace;
+  }
+  .p-file a { color: var(--codex); text-decoration: none; word-break: break-all; }
+  .p-file a:hover { text-decoration: underline; }
+  .p-file .p-size { color: var(--dim); flex: none; }
+  .p-body {
     margin-top: 6px;
-    max-height: 220px;
     overflow-y: auto;
     word-break: break-word;
+    font-size: 13px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 12px;
   }
+  .p-body:empty { display: none; }
+  .p-body img { max-width: 100%; max-height: 340px; border-radius: 6px; }
   .review {
     margin-top: 8px;
     border: 1px solid var(--line);
@@ -363,8 +471,12 @@
     align-items: center;
     font-size: 12px;
     color: var(--dim);
-    margin-bottom: 3px;
+    cursor: pointer;
+    user-select: none;
   }
+  .review .r-head:hover .reviewer { text-decoration: underline; }
+  .review .r-head .chev { flex: none; }
+  .review .r-body { margin-top: 4px; }
   .review .r-head .reviewer { font-weight: 600; }
   .review .r-head .reviewer[data-o="claude"] { color: var(--claude); }
   .review .r-head .reviewer[data-o="codex"] { color: var(--codex); }
@@ -437,6 +549,7 @@
   <button id="qa-stop" class="small">質疑を停止</button>
 </div>
 
+<div id="content">
 <main>
   <!-- Claude Code 側スレッド -->
   <section class="thread-col" data-agent="claude">
@@ -449,7 +562,7 @@
       <button data-agent-send="claude">Claude として追加</button>
     </div>
     <div class="task-zone">
-      <h2>CLAUDE CODE タスクキュー — Claude Code アプリ内で作業</h2>
+      <h2 id="tasks-head-claude"></h2>
       <div id="tasks-claude"></div>
     </div>
   </section>
@@ -465,7 +578,7 @@
       <button data-agent-send="codex">Codex として追加</button>
     </div>
     <div class="task-zone">
-      <h2>CODEX タスクキュー — Codex アプリ内で作業</h2>
+      <h2 id="tasks-head-codex"></h2>
       <div id="tasks-codex"></div>
     </div>
   </section>
@@ -475,13 +588,19 @@
 <section id="pool-zone">
   <div id="pool-head">
     共有タスクプール
-    <span class="sub">成果物の持ち込みと相互レビュー ／ 持ち込むと相手エージェントが自動レビュー</span>
     <span class="sub" id="pool-count"></span>
     <button id="pool-add">＋ 持ち込み</button>
     <button id="pool-toggle" class="small">折りたたむ</button>
   </div>
-  <div id="pool-items"></div>
+  <div id="pool-body">
+    <div id="pool-list-wrap">
+      <input id="pool-search" placeholder="🔍 ファイル検索" />
+      <div id="pool-list"></div>
+    </div>
+    <div id="pool-detail"></div>
+  </div>
 </section>
+</div>
 
 <!-- プール持ち込みダイアログ -->
 <dialog id="pool-dialog">
@@ -499,8 +618,12 @@
     <input id="pool-title" />
   </div>
   <div class="field">
-    <label>成果物（Markdown 可）</label>
+    <label>成果物テキスト（Markdown 可。`u2a2a/pool/` に .md として保存されます）</label>
     <textarea id="pool-body"></textarea>
+  </div>
+  <div class="field">
+    <label>またはファイルを添付（テキスト欄より優先）</label>
+    <input type="file" id="pool-file" />
   </div>
   <div class="field">
     <label><input type="checkbox" id="pool-autoreview" checked /> 登録と同時に相手エージェントが自動レビュー（ユーザー持ち込みは両者）</label>
@@ -718,34 +841,148 @@ function render() {
   renderPool();
 }
 
+const TEXT_EXTS_UI = ["md", "txt", "log", "json", "js", "mjs", "ts", "tsx", "jsx", "py", "rs", "html", "css", "csv", "yaml", "yml", "toml", "sh", "diff", "patch"];
+const IMAGE_EXTS_UI = ["png", "jpg", "jpeg", "gif", "svg", "webp"];
+const extOf = (name) => (name.split(".").pop() || "").toLowerCase();
+const isTextExt = (name) => TEXT_EXTS_UI.includes(extOf(name));
+const isImageExt = (name) => IMAGE_EXTS_UI.includes(extOf(name));
+
+function fmtSize(n) {
+  if (n == null) return "";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+// ファイルプレビューのキャッシュ（file+mtime をキーに再取得を抑制）
+const poolPreview = {};
+// 展開中のレビュー id（既定は折りたたみ・判定チップのみ表示）
+const openReviews = new Set();
+
+function poolPreviewEl(p) {
+  const body = el("div", { class: "p-body mdview" });
+  if (p.body) {
+    body.innerHTML = renderMarkdown(p.body); // 旧形式
+    return body;
+  }
+  if (!p.file || p.missing) {
+    body.appendChild(el("div", { class: "empty", text: p.missing ? "ファイルが見つかりません" : "" }));
+    return body;
+  }
+  const url = "/api/pool/file/" + encodeURIComponent(p.file);
+  if (isImageExt(p.file)) {
+    body.appendChild(el("img", { src: url + "?v=" + (p.mtime || 0), alt: p.title }));
+    return body;
+  }
+  if (!isTextExt(p.file) || (p.size || 0) > 300_000) {
+    body.appendChild(el("div", { class: "empty", text: "プレビューなし — リンクから開いてください" }));
+    return body;
+  }
+  const key = p.file + ":" + (p.mtime || 0);
+  const cached = poolPreview[key];
+  if (cached && cached.text != null) {
+    if (extOf(p.file) === "md") body.innerHTML = renderMarkdown(cached.text);
+    else body.innerHTML = "<pre><code>" + escapeHtml(cached.text) + "</code></pre>";
+    return body;
+  }
+  body.appendChild(el("div", { class: "empty", text: "読み込み中…" }));
+  if (!cached) {
+    poolPreview[key] = { pending: true };
+    fetch(url).then((r) => r.text()).then((text) => {
+      poolPreview[key] = { text };
+      renderPool();
+    }).catch(() => { poolPreview[key] = { text: "（読み込み失敗）" }; });
+  }
+  return body;
+}
+
+let poolSelectedId = null;
+
 function renderPool() {
-  const box = $("#pool-items");
-  const items = state.pool || [];
-  $("#pool-count").textContent = items.length ? items.length + " 件" : "";
-  box.replaceChildren();
-  if (!items.length) {
-    box.appendChild(el("div", { class: "empty", text: "まだ成果物がありません — スレッドの「プールへ」やタスク結果から持ち込めます" }));
+  const listBox = $("#pool-list");
+  const detailBox = $("#pool-detail");
+  const all = [...(state.pool || [])].reverse(); // 新しい順
+  const q = $("#pool-search").value.trim().toLowerCase();
+  const items = q
+    ? all.filter((p) => (p.title + " " + (p.file || "") + " " + NAMES[p.origin]).toLowerCase().includes(q))
+    : all;
+  $("#pool-count").textContent = all.length ? (q ? items.length + "/" + all.length : all.length) + " 件" : "";
+
+  // ファイルリスト
+  listBox.replaceChildren();
+  if (!all.length) {
+    listBox.appendChild(el("div", { class: "empty", text: "成果物なし — u2a2a/pool/ に置くか「＋持ち込み」" }));
+  } else if (!items.length) {
+    listBox.appendChild(el("div", { class: "empty", text: "検索に一致なし" }));
+  }
+  if (!items.some((p) => p.id === poolSelectedId)) poolSelectedId = items.length ? items[0].id : null;
+  for (const p of items) {
+    const pending = (state.reviewPending || {})[p.id] || [];
+    listBox.appendChild(el("div", {
+      class: "pf-row" + (p.id === poolSelectedId ? " sel" : ""),
+      onclick: () => {
+        poolSelectedId = p.id;
+        if (document.body.classList.contains("pool-collapsed")) togglePool(false);
+        renderPool();
+      },
+    }, [
+      el("span", { class: "pf-dot", "data-s": p.status, title: POOL_STATUS_LABEL[p.status] || p.status }),
+      el("span", { class: "pf-name", text: (p.file || p.title) + (pending.length ? " …" : ""), title: p.title }),
+      el("span", { class: "pf-size", text: fmtSize(p.size) }),
+    ]));
+  }
+
+  // 詳細
+  detailBox.replaceChildren();
+  const sel = items.find((p) => p.id === poolSelectedId);
+  if (!sel) {
+    detailBox.appendChild(el("div", { class: "empty", text: "ファイルを選択してください" }));
     return;
   }
-  for (const p of [...items].reverse()) {
+  renderPoolDetail(detailBox, sel);
+}
+
+function renderPoolDetail(box, p) {
+  {
     const pending = (state.reviewPending || {})[p.id] || [];
     const head = el("div", { class: "p-head" }, [
       el("span", { class: "status", "data-s": p.status, text: POOL_STATUS_LABEL[p.status] || p.status }),
       el("span", { class: "origin", "data-o": p.origin, text: "持ち込み: " + NAMES[p.origin] }),
       el("span", { class: "p-title", text: p.title }),
     ]);
-    const body = el("div", { class: "p-body" });
-    body.innerHTML = renderMarkdown(p.body);
+    if (p.via === "folder") head.appendChild(el("span", { class: "origin", text: "フォルダ投入" }));
+    if (p.via === "upload") head.appendChild(el("span", { class: "origin", text: "アップロード" }));
 
-    const kids = [head, body];
+    const kids = [head];
+    if (p.file) {
+      const fileUrl = "/api/pool/file/" + encodeURIComponent(p.file);
+      const fileRow = el("div", { class: "p-file" }, [
+        el("a", { href: fileUrl, target: "_blank", rel: "noopener", text: "📄 u2a2a/pool/" + p.file }),
+        el("span", { class: "p-size", text: fmtSize(p.size) + (p.missing ? "（ファイルが見つかりません）" : "") }),
+      ]);
+      kids.push(fileRow);
+    }
+    kids.push(poolPreviewEl(p));
     for (const r of p.reviews || []) {
-      const rHead = el("div", { class: "r-head" }, [
+      const rOpen = openReviews.has(r.id);
+      const rHead = el("div", {
+        class: "r-head",
+        onclick: () => {
+          rOpen ? openReviews.delete(r.id) : openReviews.add(r.id);
+          renderPool();
+        },
+      }, [
+        el("span", { class: "chev", text: rOpen ? "▾" : "▸" }),
         el("span", { class: "reviewer", "data-o": r.reviewer, text: "🔎 " + NAMES[r.reviewer] + " のレビュー" }),
       ]);
       if (r.verdict) rHead.appendChild(el("span", { class: "verdict", "data-v": r.verdict, text: "【判定】" + r.verdict }));
-      const rBody = el("div", { class: "r-body" });
-      rBody.innerHTML = renderMarkdown(r.text);
-      kids.push(el("div", { class: "review" }, [rHead, rBody]));
+      const reviewKids = [rHead];
+      if (rOpen) {
+        const rBody = el("div", { class: "r-body mdview" });
+        rBody.innerHTML = renderMarkdown(r.text);
+        reviewKids.push(rBody);
+      }
+      kids.push(el("div", { class: "review" }, reviewKids));
     }
     for (const r of pending) {
       kids.push(el("div", { class: "typing", text: NAMES[r] + " がレビュー中" }));
@@ -765,14 +1002,25 @@ function renderPool() {
       actions.appendChild(el("button", { class: "small", text: "承認", onclick: () => api("/api/pool/" + p.id, "PATCH", { status: "approved" }) }));
     if (p.status !== "rejected")
       actions.appendChild(el("button", { class: "small", text: "差し戻し", onclick: () => api("/api/pool/" + p.id, "PATCH", { status: "rejected" }) }));
-    actions.appendChild(el("button", { class: "small", text: "コピー", onclick: () => copy(p.body) }));
+    actions.appendChild(el("button", {
+      class: "small",
+      text: "コピー",
+      onclick: async () => {
+        if (p.body) return copy(p.body);
+        if (p.file && isTextExt(p.file)) {
+          const r = await fetch("/api/pool/file/" + encodeURIComponent(p.file));
+          return copy(await r.text());
+        }
+        copy("u2a2a/pool/" + (p.file || ""));
+      },
+    }));
     actions.appendChild(el("button", {
       class: "small",
       text: "削除",
       onclick: () => { if (confirm("「" + p.title + "」をプールから削除しますか？")) api("/api/pool/" + p.id, "DELETE"); },
     }));
     kids.push(actions);
-    box.appendChild(el("div", { class: "pool-item" }, kids));
+    for (const k of kids) box.appendChild(k);
   }
 }
 
@@ -859,7 +1107,7 @@ function renderThread(agent) {
       }),
     ]);
 
-    const body = el("div", { class: "body" + (isRaw ? " raw" : "") });
+    const body = el("div", { class: "mdview" + (isRaw ? " raw" : "") });
     if (isRaw) body.textContent = m.text;
     else body.innerHTML = renderMarkdown(m.text);
 
@@ -883,10 +1131,26 @@ function taskPrompt(t) {
   ].join("");
 }
 
+// タスクキューの開閉。null = 自動（未完了タスクがあれば開く）
+const taskZoneOpen = { claude: null, codex: null };
+
 function renderTasks(agent) {
   const box = $("#tasks-" + agent);
+  const head = $("#tasks-head-" + agent);
   box.replaceChildren();
   const tasks = state.tasks.filter((t) => t.agent === agent);
+  const active = tasks.filter((t) => t.status !== "done").length;
+  const open = taskZoneOpen[agent] != null ? taskZoneOpen[agent] : active > 0;
+  head.textContent =
+    (open ? "▾ " : "▸ ") + agent.toUpperCase() + " タスクキュー" +
+    (tasks.length ? `（${active} 件${tasks.length - active ? " / 完了 " + (tasks.length - active) : ""}）` : "（なし）") +
+    " — " + NAMES[agent] + " アプリ内で作業";
+  head.onclick = () => {
+    taskZoneOpen[agent] = !open;
+    renderTasks(agent);
+  };
+  box.hidden = !open;
+  if (!open) return;
   if (!tasks.length) {
     box.appendChild(el("div", { class: "empty", text: "タスクなし" }));
     return;
@@ -1009,22 +1273,43 @@ $("#pool-cancel").addEventListener("click", () => $("#pool-dialog").close());
 $("#pool-create").addEventListener("click", async () => {
   const title = $("#pool-title").value.trim();
   const body = $("#pool-body").value.trim();
-  if (!title || !body) return toast("タイトルと成果物を入力してください");
-  await api("/api/pool", "POST", {
-    origin: $("#pool-origin").value,
-    title,
-    body,
-    fromMessageId: poolSourceMessageId,
-    autoReview: $("#pool-autoreview").checked,
-  });
+  const file = $("#pool-file").files[0];
+  if (file) {
+    // ファイル添付はアップロードとして登録
+    const buf = await file.arrayBuffer();
+    let bin = "";
+    const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    await api("/api/pool/upload", "POST", {
+      origin: $("#pool-origin").value,
+      title: title || file.name,
+      filename: file.name,
+      dataBase64: btoa(bin),
+      autoReview: $("#pool-autoreview").checked,
+    });
+  } else {
+    if (!title || !body) return toast("タイトルと成果物を入力してください");
+    await api("/api/pool", "POST", {
+      origin: $("#pool-origin").value,
+      title,
+      body,
+      fromMessageId: poolSourceMessageId,
+      autoReview: $("#pool-autoreview").checked,
+    });
+  }
   $("#pool-dialog").close();
+  $("#pool-file").value = "";
   toast("プールへ登録しました");
 });
-$("#pool-toggle").addEventListener("click", () => {
-  const items = $("#pool-items");
-  items.hidden = !items.hidden;
-  $("#pool-toggle").textContent = items.hidden ? "展開する" : "折りたたむ";
-});
+function togglePool(collapse) {
+  const collapsed = collapse != null ? collapse : !document.body.classList.contains("pool-collapsed");
+  document.body.classList.toggle("pool-collapsed", collapsed);
+  $("#pool-toggle").textContent = collapsed ? "展開する" : "折りたたむ";
+}
+$("#pool-toggle").addEventListener("click", () => togglePool());
+$("#pool-search").addEventListener("input", () => renderPool());
 
 let resultTask = null;
 function openResultDialog(t) {

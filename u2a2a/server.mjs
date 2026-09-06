@@ -16,6 +16,10 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = path.join(__dirname, "data");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const REPO_ROOT = path.resolve(__dirname, "..");
+// 共有タスクプールの実体はリポジトリ内のフォルダ（DAS）。
+// エージェント CLI（cwd=リポジトリ・読み取り可）からパスでそのまま読める。
+const POOL_DIR = path.join(__dirname, "pool");
+const POOL_TRASH = path.join(POOL_DIR, ".trash");
 const PORT = Number(process.env.U2A2A_PORT || 4742);
 
 const AGENTS = ["claude", "codex"];
@@ -116,12 +120,12 @@ function json(res, status, body) {
   res.end(data);
 }
 
-function readBody(req) {
+function readBody(req, limit = 1_000_000) {
   return new Promise((resolve, reject) => {
     let buf = "";
     req.on("data", (c) => {
       buf += c;
-      if (buf.length > 1_000_000) reject(new Error("body too large"));
+      if (buf.length > limit) reject(new Error("body too large"));
     });
     req.on("end", () => {
       try {
@@ -286,21 +290,140 @@ async function callCodex(prompt, sessionId, modelOverride) {
 
 const POOL_STATUSES = ["submitted", "reviewing", "approved", "rejected"];
 
+const TEXT_EXTS = new Set([".md", ".txt", ".log", ".json", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".html", ".css", ".csv", ".yaml", ".yml", ".toml", ".sh", ".diff", ".patch"]);
+const IMAGE_MIME = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".svg": "image/svg+xml", ".webp": "image/webp" };
+
+function poolFilePath(name) {
+  const resolved = path.join(POOL_DIR, path.basename(name));
+  return resolved.startsWith(POOL_DIR) ? resolved : null;
+}
+
+// タイトル/ファイル名から安全な一意のプール内ファイル名を作る
+function uniquePoolName(base) {
+  const ext = path.extname(base) || ".md";
+  let stem = path.basename(base, path.extname(base)).replace(/[^\w\-぀-ヿ一-鿿]+/g, "_").slice(0, 60) || "item";
+  let name = stem + ext;
+  let n = 2;
+  while (fs.existsSync(path.join(POOL_DIR, name))) name = `${stem}-${n++}${ext}`;
+  return name;
+}
+
+function statPoolFile(name) {
+  try {
+    const st = fs.statSync(path.join(POOL_DIR, name));
+    return { size: st.size, mtime: st.mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+function isTextPoolFile(name) {
+  return TEXT_EXTS.has(path.extname(name).toLowerCase());
+}
+
+// レビュー用にファイル内容を読む（テキストのみ・先頭8000文字）
+function readPoolTextForReview(item) {
+  if (!item.file) return item.body || null; // 旧形式フォールバック
+  if (!isTextPoolFile(item.file)) return null;
+  try {
+    const full = fs.readFileSync(path.join(POOL_DIR, item.file), "utf8");
+    if (full.includes("\0")) return null;
+    return full.length > 8000 ? full.slice(0, 8000) + `\n…（先頭8000文字のみ。全文は u2a2a/pool/${item.file} を参照）` : full;
+  } catch {
+    return null;
+  }
+}
+
+// 旧形式（body 内蔵）のアイテムをファイル実体へ移行する
+function migratePoolItems() {
+  for (const item of state.pool) {
+    if (item.file || typeof item.body !== "string") continue;
+    try {
+      const name = uniquePoolName(item.title + ".md");
+      fs.writeFileSync(path.join(POOL_DIR, name), item.body);
+      item.file = name;
+      const st = statPoolFile(name);
+      if (st) Object.assign(item, st);
+      delete item.body;
+    } catch {
+      // 移行できなければ body のまま動かす
+    }
+  }
+}
+
+// フォルダ監視: pool/ に直接置かれたファイル（エージェントの書き込みや Finder 投入）を自動登録
+function scanPoolDir() {
+  let changed = false;
+  let names;
+  try {
+    names = fs.readdirSync(POOL_DIR);
+  } catch {
+    return false;
+  }
+  const known = new Set(state.pool.map((p) => p.file).filter(Boolean));
+  for (const name of names) {
+    if (name.startsWith(".")) continue;
+    const st = statPoolFile(name);
+    if (!st || !fs.statSync(path.join(POOL_DIR, name)).isFile()) continue;
+    if (!known.has(name)) {
+      state.pool.push({
+        id: id(),
+        title: name,
+        file: name,
+        origin: "user",
+        via: "folder",
+        status: "submitted",
+        reviews: [],
+        ...st,
+        ts: Date.now(),
+      });
+      changed = true;
+    }
+  }
+  // 既存アイテムのサイズ/更新時刻を追従（外部編集の反映）、消えたファイルに印
+  for (const item of state.pool) {
+    if (!item.file) continue;
+    const st = statPoolFile(item.file);
+    if (!st) {
+      if (!item.missing) { item.missing = true; changed = true; }
+    } else if (item.missing || st.mtime !== item.mtime || st.size !== item.size) {
+      item.missing = false;
+      Object.assign(item, st);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+setInterval(() => {
+  try {
+    if (scanPoolDir()) touch();
+  } catch {
+    // 次回スキャンに持ち越し
+  }
+}, 20_000);
+
 function verdictFrom(text) {
   const m = text.match(/【判定】\s*(承認|条件付き承認|差し戻し)/);
   return m ? m[1] : "";
 }
 
 function buildReviewPrompt(item, reviewer) {
+  const rel = item.file ? `u2a2a/pool/${item.file}` : null;
+  const text = readPoolTextForReview(item);
+  const contentPart =
+    text != null
+      ? `--- 成果物「${item.title}」（持ち込み: ${NAMES[item.origin]}${rel ? `／ファイル: ${rel}` : ""}） ---\n${text}`
+      : `成果物「${item.title}」（持ち込み: ${NAMES[item.origin]}）はリポジトリ内のファイル ${rel} にあります。` +
+        `内容を読み取ってレビューしてください（読み取れない形式ならその旨を書いてください）。`;
   return (
-    `あなたは「U2A2Aオーケストレーション」の共有タスクプールのレビュアー（${NAMES[reviewer]}）です。` +
+    `あなたは「U2A2Aオーケストレーション」の共有タスクプール（u2a2a/pool/ = アプリ専用の成果物置き場）のレビュアー（${NAMES[reviewer]}）です。` +
     `以下の成果物を、Kometa リポジトリ（閲覧のみ可）の実態と照らして、忖度なく具体的にレビューしてください。\n` +
     `- 問題点・リスク・改善案を挙げる\n` +
-    `- 既存の実装や他タスクとの重複、不要な作業の兆候があれば指摘する\n` +
+    `- 既存の実装や他タスク・プール内の他成果物との重複、不要な作業の兆候があれば指摘する\n` +
     `- 良い点は簡潔に認める\n` +
     `- 最後に必ず1行、次の形式で判定を書く: 【判定】承認 / 条件付き承認 / 差し戻し\n\n` +
-    `--- 成果物「${item.title}」（持ち込み: ${NAMES[item.origin]}） ---\n` +
-    item.body
+    contentPart
   );
 }
 
@@ -553,21 +676,24 @@ async function handleApi(req, res, url) {
     return json(res, 201, created);
   }
 
-  // 共有タスクプール: 持ち込み（作成と同時に相手エージェントが自動レビュー）
+  // 共有タスクプール: テキスト持ち込み（pool/ に .md として保存。相手エージェントが自動レビュー）
   if (req.method === "POST" && url.pathname === "/api/pool") {
     const body = await readBody(req);
     const origin = AUTHORS.includes(body.origin) ? body.origin : null;
     const title = typeof body.title === "string" ? body.title.trim() : "";
     const text = typeof body.body === "string" ? body.body.trim() : "";
     if (!origin || !title || !text) return json(res, 400, { error: "origin / title / body は必須です" });
+    const name = uniquePoolName(title + ".md");
+    fs.writeFileSync(path.join(POOL_DIR, name), text);
     const item = {
       id: id(),
       title,
-      body: text,
+      file: name,
       origin,
       status: "submitted",
       reviews: [],
       fromMessageId: typeof body.fromMessageId === "string" ? body.fromMessageId : null,
+      ...statPoolFile(name),
       ts: Date.now(),
     };
     state.pool.push(item);
@@ -576,6 +702,45 @@ async function handleApi(req, res, url) {
     const reviewers = origin === "user" ? AGENTS : [OTHER[origin]];
     if (body.autoReview !== false) for (const r of reviewers) runReview(item.id, r);
     return json(res, 201, item);
+  }
+
+  // ファイルアップロード（base64）
+  if (req.method === "POST" && url.pathname === "/api/pool/upload") {
+    const body = await readBody(req, 16_000_000);
+    const origin = AUTHORS.includes(body.origin) ? body.origin : "user";
+    const rawName = typeof body.filename === "string" && body.filename.trim() ? body.filename.trim() : "file";
+    if (typeof body.dataBase64 !== "string") return json(res, 400, { error: "dataBase64 は必須です" });
+    const data = Buffer.from(body.dataBase64, "base64");
+    const name = uniquePoolName(rawName);
+    fs.writeFileSync(path.join(POOL_DIR, name), data);
+    const item = {
+      id: id(),
+      title: typeof body.title === "string" && body.title.trim() ? body.title.trim() : rawName,
+      file: name,
+      origin,
+      via: "upload",
+      status: "submitted",
+      reviews: [],
+      ...statPoolFile(name),
+      ts: Date.now(),
+    };
+    state.pool.push(item);
+    touch();
+    if (body.autoReview === true) {
+      for (const r of origin === "user" ? AGENTS : [OTHER[origin]]) runReview(item.id, r);
+    }
+    return json(res, 201, item);
+  }
+
+  // プールファイルの取得（プレビュー・ダウンロード用）
+  if (req.method === "GET" && parts[0] === "api" && parts[1] === "pool" && parts[2] === "file" && parts[3]) {
+    const file = poolFilePath(decodeURIComponent(parts[3]));
+    if (!file || !fs.existsSync(file)) return json(res, 404, { error: "file not found" });
+    const ext = path.extname(file).toLowerCase();
+    const mime = IMAGE_MIME[ext] || (isTextPoolFile(file) ? "text/plain; charset=utf-8" : "application/octet-stream");
+    res.writeHead(200, { "Content-Type": mime, "Cache-Control": "no-store" });
+    fs.createReadStream(file).pipe(res);
+    return;
   }
 
   if (parts[0] === "api" && parts[1] === "pool" && parts[2]) {
@@ -598,6 +763,14 @@ async function handleApi(req, res, url) {
     }
 
     if (req.method === "DELETE" && parts.length === 3) {
+      // 実ファイルは消さず .trash へ退避（誤削除からの復元用）
+      if (item.file) {
+        try {
+          fs.renameSync(path.join(POOL_DIR, item.file), path.join(POOL_TRASH, Date.now() + "-" + item.file));
+        } catch {
+          // ファイルが既にない場合はそのまま
+        }
+      }
       state.pool = state.pool.filter((p) => p.id !== item.id);
       touch();
       return json(res, 200, { ok: true });
@@ -740,6 +913,11 @@ const server = http.createServer(async (req, res) => {
     return json(res, 500, { error: String(e.message || e) });
   }
 });
+
+fs.mkdirSync(POOL_TRASH, { recursive: true });
+migratePoolItems();
+scanPoolDir();
+saveState();
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`U2A2A Orchestration: http://127.0.0.1:${PORT}`);
