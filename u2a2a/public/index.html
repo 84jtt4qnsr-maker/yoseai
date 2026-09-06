@@ -41,6 +41,56 @@
   header h1 { font-size: 16px; margin: 0; letter-spacing: 0.04em; }
   header .sub { color: var(--dim); font-size: 12px; }
 
+  /* トピックタブバー */
+  #topic-bar {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    padding: 5px 14px 0;
+    background: var(--panel);
+    overflow-x: auto;
+    flex: none;
+  }
+  .topic-tab {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    padding: 4px 12px;
+    border: 1px solid var(--line);
+    border-bottom: none;
+    border-radius: 8px 8px 0 0;
+    font-size: 12.5px;
+    color: var(--dim);
+    cursor: pointer;
+    white-space: nowrap;
+    background: var(--bg);
+    user-select: none;
+  }
+  .topic-tab.active { color: var(--text); background: var(--panel-2); font-weight: 600; }
+  .topic-tab .t-btn {
+    border: none;
+    background: none;
+    color: var(--dim);
+    cursor: pointer;
+    padding: 0 2px;
+    font-size: 11px;
+  }
+  .topic-tab .t-btn:hover { color: var(--text); }
+  .topic-tab input {
+    padding: 0 4px;
+    font-size: 12px;
+    width: 110px;
+    border-radius: 4px;
+  }
+  #topic-add {
+    border: 1px dashed var(--line);
+    background: none;
+    border-radius: 8px 8px 0 0;
+    padding: 4px 10px;
+    font-size: 12.5px;
+    color: var(--dim);
+  }
+
   /* ユーザー帯（Canvas 上段・緑） */
   #user-band {
     border-bottom: 1px solid var(--line);
@@ -576,6 +626,9 @@
   <span class="sub">ユーザー ⇄ Claude Code ⇄ Codex ／ やり取りから生まれたタスクを各アプリで作業し、結果を再入力する</span>
 </header>
 
+<!-- トピック（スレッド）タブ -->
+<div id="topic-bar"></div>
+
 <!-- ユーザー側（閲覧・回答・質問） -->
 <div id="user-band">
   <span class="role-dot" title="ユーザー"></span>
@@ -739,7 +792,78 @@
 const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
 const OTHER = { claude: "codex", codex: "claude" };
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
-let state = { messages: [], tasks: [], pool: [], agents: {}, running: {}, relay: {}, reviewPending: {}, fixPending: {}, activity: {} };
+let state = { messages: [], tasks: [], pool: [], topics: [], agents: {}, running: {}, reviewPending: {}, fixPending: {}, activity: {} };
+
+// ---- トピック（スレッド）----
+let currentTopicId = localStorage.getItem("u2a2a-topic") || null;
+let renamingTopicId = null;
+
+function currentTopic() {
+  return (state.topics || []).find((t) => t.id === currentTopicId) || (state.topics || [])[0] || null;
+}
+
+function ensureTopic() {
+  const t = currentTopic();
+  if (t && t.id !== currentTopicId) {
+    currentTopicId = t.id;
+    try { localStorage.setItem("u2a2a-topic", t.id); } catch {}
+  }
+  return t;
+}
+
+function switchTopic(id) {
+  currentTopicId = id;
+  renamingTopicId = null;
+  try { localStorage.setItem("u2a2a-topic", id); } catch {}
+  render();
+}
+
+function renderTopicBar() {
+  const bar = $("#topic-bar");
+  bar.replaceChildren();
+  const topics = state.topics || [];
+  for (const t of topics) {
+    const active = t.id === (currentTopic() || {}).id;
+    const tab = el("div", { class: "topic-tab" + (active ? " active" : ""), onclick: () => { if (!active) switchTopic(t.id); } });
+    if (renamingTopicId === t.id) {
+      const input = el("input", { value: t.title });
+      const commit = () => {
+        renamingTopicId = null;
+        const v = input.value.trim();
+        if (v && v !== t.title) api("/api/topics/" + t.id, "PATCH", { title: v });
+        else render();
+      };
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") commit();
+        if (e.key === "Escape") { renamingTopicId = null; render(); }
+      });
+      input.addEventListener("blur", commit);
+      tab.appendChild(input);
+      bar.appendChild(tab);
+      setTimeout(() => input.focus(), 0);
+      continue;
+    }
+    const count = (state.messages || []).filter((m) => m.topicId === t.id).length;
+    tab.appendChild(el("span", { text: t.title + (count ? "（" + count + "）" : "") }));
+    if (active) {
+      tab.appendChild(el("button", {
+        class: "t-btn", text: "✏", title: "名前を変更",
+        onclick: (e) => { e.stopPropagation(); renamingTopicId = t.id; renderTopicBar(); },
+      }));
+      if (topics.length > 1) {
+        tab.appendChild(el("button", {
+          class: "t-btn", text: "✕", title: "スレッドを削除（メッセージも消えます）",
+          onclick: (e) => { e.stopPropagation(); armedDelete(e.target, () => api("/api/topics/" + t.id, "DELETE").then(() => { currentTopicId = null; })); },
+        }));
+      }
+    }
+    bar.appendChild(tab);
+  }
+  bar.appendChild(el("button", {
+    id: "topic-add", text: "＋ 新規スレッド",
+    onclick: () => api("/api/topics", "POST", {}).then((t) => { switchTopic(t.id); renamingTopicId = t.id; render(); }),
+  }));
+}
 const POOL_STATUS_LABEL = { submitted: "持ち込み", reviewing: "レビュー", approved: "承認", rejected: "差し戻し" };
 
 const $ = (s) => document.querySelector(s);
@@ -920,6 +1044,8 @@ function el(tag, attrs = {}, children = []) {
 
 // ---- render ----
 function render() {
+  ensureTopic();
+  renderTopicBar();
   for (const agent of ["claude", "codex"]) {
     renderThread(agent);
     renderTasks(agent);
@@ -927,6 +1053,17 @@ function render() {
   }
   renderQaBar();
   renderPool();
+}
+
+// 現在トピックでこのエージェントが実行中か
+function isRunning(agent) {
+  const t = currentTopic();
+  return t && (state.running || {})[t.id + ":" + agent];
+}
+
+function threadActivity(agent) {
+  const t = currentTopic();
+  return t ? (state.activity || {})["thread:" + t.id + ":" + agent] : null;
 }
 
 const TEXT_EXTS_UI = ["md", "txt", "log", "json", "js", "mjs", "ts", "tsx", "jsx", "py", "rs", "html", "css", "csv", "yaml", "yml", "toml", "sh", "diff", "patch"];
@@ -1288,7 +1425,7 @@ function renderPoolDetail(box, p) {
 }
 
 function renderQaBar() {
-  const r = state.relay || {};
+  const r = (currentTopic() || {}).relay || {};
   const bar = $("#qa-bar");
   bar.hidden = !r.active;
   if (r.active) {
@@ -1310,7 +1447,7 @@ function renderAgentStatus(agent) {
   if (a.model && ![...dl.options].some((o) => o.value === a.model)) {
     dl.appendChild(el("option", { value: a.model }));
   }
-  if (state.running && state.running[agent]) {
+  if (isRunning(agent)) {
     status.dataset.s = "running";
     status.textContent = "応答中…";
     status.title = "";
@@ -1328,12 +1465,13 @@ function renderAgentStatus(agent) {
 function renderThread(agent) {
   const box = $("#messages-" + agent);
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
-  const msgs = state.messages.filter((m) => m.thread === agent);
+  const topic = currentTopic();
+  const msgs = state.messages.filter((m) => m.thread === agent && topic && m.topicId === topic.id);
   $("#count-" + agent).textContent = msgs.length ? msgs.length + " 件" : "";
   box.replaceChildren();
   if (!msgs.length) {
-    if (state.running && state.running[agent]) {
-      const act = (state.activity || {})["thread:" + agent];
+    if (isRunning(agent)) {
+      const act = threadActivity(agent);
       box.appendChild(act ? activityEl(act) : el("div", { class: "typing", text: NAMES[agent] + " が応答中" }));
     } else {
       box.appendChild(el("div", { class: "empty", text: "まだメッセージがありません" }));
@@ -1381,8 +1519,8 @@ function renderThread(agent) {
       actions,
     ]));
   }
-  if (state.running && state.running[agent]) {
-    const act = (state.activity || {})["thread:" + agent];
+  if (isRunning(agent)) {
+    const act = threadActivity(agent);
     box.appendChild(act ? activityEl(act) : el("div", { class: "typing", text: NAMES[agent] + " が応答中" }));
   }
   if (atBottom) box.scrollTop = box.scrollHeight;
@@ -1403,7 +1541,8 @@ function renderTasks(agent) {
   const box = $("#tasks-" + agent);
   const head = $("#tasks-head-" + agent);
   box.replaceChildren();
-  const tasks = state.tasks.filter((t) => t.agent === agent);
+  const topic = currentTopic();
+  const tasks = state.tasks.filter((t) => t.agent === agent && topic && (t.topicId === topic.id || !t.topicId));
   const active = tasks.filter((t) => t.status !== "done").length;
   const open = taskZoneOpen[agent] != null ? taskZoneOpen[agent] : active > 0;
   head.textContent =
@@ -1468,6 +1607,7 @@ async function relay(fromAgent, m) {
     author,
     text: m.text,
     relayedFrom: fromAgent,
+    topicId: m.topicId || (currentTopic() || {}).id,
   });
   toast(NAMES[OTHER[fromAgent]] + " スレッドへ転送しました");
 }
@@ -1484,9 +1624,10 @@ function sendUser() {
   const text = $("#user-text").value.trim();
   if (!text) return;
   const target = $("#user-target").value;
+  const topicId = (currentTopic() || {}).id;
   const req = target.startsWith("qa-")
-    ? api("/api/qa/start", "POST", { first: target.slice(3), text, hops: Number($("#qa-hops").value) || 6 })
-    : api("/api/messages", "POST", { thread: target, author: "user", text });
+    ? api("/api/qa/start", "POST", { first: target.slice(3), text, hops: Number($("#qa-hops").value) || 6, topicId })
+    : api("/api/messages", "POST", { thread: target, author: "user", text, topicId });
   req.then(() => { $("#user-text").value = ""; });
 }
 
@@ -1494,7 +1635,7 @@ function sendAgent(agent) {
   const input = $("#input-" + agent);
   const text = input.value.trim();
   if (!text) return;
-  api("/api/messages", "POST", { thread: agent, author: agent, text })
+  api("/api/messages", "POST", { thread: agent, author: agent, text, topicId: (currentTopic() || {}).id })
     .then(() => { input.value = ""; });
 }
 
@@ -1517,6 +1658,7 @@ $("#task-create").addEventListener("click", async () => {
     title,
     detail: $("#task-detail").value.trim(),
     fromMessageId: dialogSourceMessage ? dialogSourceMessage.id : null,
+    topicId: (currentTopic() || {}).id,
   });
   $("#task-dialog").close();
   toast("タスクをキューに追加しました");
@@ -1667,7 +1809,7 @@ $("#user-send").addEventListener("click", sendUser);
 $("#user-target").addEventListener("change", () => {
   $("#qa-hops").hidden = !$("#user-target").value.startsWith("qa-");
 });
-$("#qa-stop").addEventListener("click", () => api("/api/qa/stop", "POST", {}));
+$("#qa-stop").addEventListener("click", () => api("/api/qa/stop", "POST", { topicId: (currentTopic() || {}).id }));
 $("#user-text").addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") sendUser();
 });

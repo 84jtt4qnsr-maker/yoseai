@@ -28,20 +28,28 @@ const TASK_STATUSES = ["queued", "working", "returned", "done"];
 const AGENT_TIMEOUT_MS = 15 * 60 * 1000; // 大きな成果物のレビューは5分では足りない
 const MAX_BACKLOG = 10;
 
+// エージェントのグローバル設定（トピック横断）
 function defaultAgent() {
-  return {
-    auto: true,
-    sessionId: null,
-    lastSeenTs: Date.now(),
-    lastError: "",
-    model: "",
-    modelOverride: "",
-    transcriptOffset: null,
-  };
+  return { auto: true, lastError: "", model: "", modelOverride: "" };
+}
+
+// トピック内のエージェント別セッション状態
+function topicAgent() {
+  return { sessionId: null, lastSeenTs: Date.now(), transcriptOffset: null };
 }
 
 function defaultRelay() {
   return { active: false, remaining: 0, hopsDone: 0 };
+}
+
+function defaultTopic(title) {
+  return {
+    id: crypto.randomBytes(8).toString("hex"),
+    title,
+    ts: Date.now(),
+    relay: defaultRelay(),
+    agents: { claude: topicAgent(), codex: topicAgent() },
+  };
 }
 
 function emptyState() {
@@ -49,8 +57,8 @@ function emptyState() {
     messages: [],
     tasks: [],
     pool: [],
+    topics: [defaultTopic("メイン")],
     agents: { claude: defaultAgent(), codex: defaultAgent() },
-    relay: defaultRelay(),
   };
 }
 
@@ -60,9 +68,31 @@ function loadState() {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed.messages) && Array.isArray(parsed.tasks)) {
       parsed.agents = parsed.agents || {};
-      for (const a of AGENTS) parsed.agents[a] = { ...defaultAgent(), ...parsed.agents[a] };
-      parsed.relay = defaultRelay(); // 再起動後にリレーが勝手に再開しないよう常に解除
       if (!Array.isArray(parsed.pool)) parsed.pool = [];
+      // 旧形式（単一スレッド）→ トピック制へ移行
+      if (!Array.isArray(parsed.topics) || !parsed.topics.length) {
+        const main = defaultTopic("メイン");
+        for (const a of AGENTS) {
+          const old = parsed.agents[a] || {};
+          main.agents[a] = {
+            sessionId: old.sessionId || null,
+            lastSeenTs: old.lastSeenTs || Date.now(),
+            transcriptOffset: old.transcriptOffset ?? null,
+          };
+        }
+        parsed.topics = [main];
+        for (const m of parsed.messages) m.topicId = m.topicId || main.id;
+        for (const t of parsed.tasks) t.topicId = t.topicId || main.id;
+      }
+      for (const a of AGENTS) {
+        const old = parsed.agents[a] || {};
+        parsed.agents[a] = { ...defaultAgent(), auto: old.auto !== false, lastError: "", model: old.model || "", modelOverride: old.modelOverride || "" };
+      }
+      for (const t of parsed.topics) {
+        t.relay = defaultRelay(); // 再起動後にリレーが勝手に再開しないよう常に解除
+        for (const a of AGENTS) t.agents[a] = { ...topicAgent(), ...t.agents[a] };
+      }
+      delete parsed.relay;
       return parsed;
     }
   } catch {
@@ -74,9 +104,11 @@ function loadState() {
 let state = loadState();
 let saveTimer = null;
 
-// 実行中フラグは永続化しない（クラッシュ後に張り付くのを防ぐ）
-const running = { claude: false, codex: false };
-const needsRun = { claude: false, codex: false };
+// 実行中フラグは永続化しない（クラッシュ後に張り付くのを防ぐ）。キー: "<topicId>:<agent>"
+const running = {};
+const needsRun = {};
+const runKey = (topicId, agent) => topicId + ":" + agent;
+const findTopic = (topicId) => state.topics.find((t) => t.id === topicId);
 
 function saveState() {
   clearTimeout(saveTimer);
@@ -211,27 +243,28 @@ function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = nul
   });
 }
 
-function buildPrompt(agent, msgs, isFirst) {
+function buildPrompt(topic, agent, msgs, isFirst) {
   const other = agent === "claude" ? "codex" : "claude";
   const lines = msgs.map((m) => `[${NAMES[m.author]}] ${m.text}`).join("\n\n");
   const preamble = isFirst
     ? `あなたは「U2A2Aオーケストレーション」アプリの ${NAMES[agent]} 側スレッドの担当エージェントです。` +
+      `このスレッドのトピックは「${topic.title}」です。` +
       `参加者はユーザー・${NAMES[agent]}（あなた）・${NAMES[other]} の三者です。` +
       `作業ディレクトリは Kometa リポジトリ（閲覧のみ、変更は不可）。` +
       `新着メッセージに ${NAMES[agent]} として日本語で簡潔に返答してください。` +
       `実装作業が必要な場合は作業内容を提案し、タスク化はユーザーに委ねてください。\n\n--- 新着メッセージ ---\n`
     : "--- 新着メッセージ ---\n";
-  const qaNote = state.relay.active
+  const qaNote = topic.relay.active
     ? `\n\n（現在 ${NAMES[other]} との質疑応答モードです。議論が浅いうちは結論に飛びつかず、質問・反論・検討を返してください。` +
       `${QA_END_MARK} は、相手の見解を少なくとも一度聞いた上で合意・結論に達した場合のみ、応答の末尾に書いてください。` +
-      `相手がまだ発言していない段階での終了宣言は無効です。残り自動中継 ${state.relay.remaining} 手）`
+      `相手がまだ発言していない段階での終了宣言は無効です。残り自動中継 ${topic.relay.remaining} 手）`
     : "";
   return preamble + lines + qaNote;
 }
 
-// 質疑モード: エージェントの応答完了を待って相手スレッドへ中継する
-function qaHop(agent, replyText) {
-  const r = state.relay;
+// 質疑モード: エージェントの応答完了を待って相手スレッドへ中継する（トピック単位）
+function qaHop(topic, agent, replyText) {
+  const r = topic.relay;
   if (!r.active) return;
   // 終了宣言は相手が一度でも発言した後（=中継が1回以上済み）のみ有効。
   // 先手が初手で終了宣言しても、相手に見せるまではリレーを続ける。
@@ -247,6 +280,7 @@ function qaHop(agent, replyText) {
   r.hopsDone++;
   const other = OTHER[agent];
   state.messages.push({
+    topicId: topic.id,
     id: id(),
     thread: other,
     author: agent,
@@ -256,7 +290,7 @@ function qaHop(agent, replyText) {
     ts: Date.now(),
   });
   if (r.remaining <= 0) r.active = false; // 最終手: 相手は応答するがそれ以上は中継しない
-  if (state.agents[other].auto) agentLoop(other);
+  if (state.agents[other].auto) agentLoop(topic.id, other);
 }
 
 // stream-json イベント → 実況用の1行テキスト
@@ -658,10 +692,10 @@ async function runFix(itemId, agent) {
   }
 }
 
-function unseenFor(agent) {
-  const a = state.agents[agent];
+function unseenFor(topic, agent) {
+  const ta = topic.agents[agent];
   return state.messages
-    .filter((m) => m.thread === agent && m.author !== agent && !m.external && m.ts > a.lastSeenTs)
+    .filter((m) => m.topicId === topic.id && m.thread === agent && m.author !== agent && !m.external && m.ts > ta.lastSeenTs)
     .slice(-MAX_BACKLOG);
 }
 
@@ -728,22 +762,22 @@ function extractExternalMessages(agent, chunk) {
 }
 
 // 応答完了直後に呼び、自分の発言分まで読み取り位置を進める
-function markTranscriptSynced(agent) {
-  const a = state.agents[agent];
-  const file = transcriptPath(agent, a.sessionId);
+function markTranscriptSynced(topic, agent) {
+  const ta = topic.agents[agent];
+  const file = transcriptPath(agent, ta.sessionId);
   if (file) {
     try {
-      a.transcriptOffset = fs.statSync(file).size;
+      ta.transcriptOffset = fs.statSync(file).size;
     } catch {
-      a.transcriptOffset = null;
+      ta.transcriptOffset = null;
     }
   } else {
-    a.transcriptOffset = null;
+    ta.transcriptOffset = null;
   }
 }
 
-function syncExternal(agent) {
-  const a = state.agents[agent];
+function syncExternal(topic, agent) {
+  const a = topic.agents[agent];
   const file = transcriptPath(agent, a.sessionId);
   if (!file) return false;
   let size;
@@ -767,77 +801,83 @@ function syncExternal(agent) {
   a.transcriptOffset += Buffer.byteLength(chunk.slice(0, lastNl + 1), "utf8");
   let added = false;
   for (const m of extractExternalMessages(agent, chunk.slice(0, lastNl + 1))) {
-    state.messages.push({ id: id(), thread: agent, author: m.author, text: m.text, external: true, ts: Date.now() });
+    state.messages.push({ id: id(), topicId: topic.id, thread: agent, author: m.author, text: m.text, external: true, ts: Date.now() });
     added = true;
   }
   return added;
 }
 
-// 外部での続きを受動的にも読めるよう定期チェック
+// 外部での続きを受動的にも読めるよう定期チェック（全トピック）
 setInterval(() => {
   let changed = false;
-  for (const agent of AGENTS) {
-    if (running[agent]) continue; // 自分の応答書き込み中は増分を読まない
-    try {
-      if (syncExternal(agent)) changed = true;
-    } catch {
-      // 同期失敗は次回に持ち越し
+  for (const topic of state.topics) {
+    for (const agent of AGENTS) {
+      if (running[runKey(topic.id, agent)]) continue; // 自分の応答書き込み中は増分を読まない
+      try {
+        if (syncExternal(topic, agent)) changed = true;
+      } catch {
+        // 同期失敗は次回に持ち越し
+      }
     }
   }
   if (changed) touch();
 }, 30_000);
 
-async function agentLoop(agent) {
-  if (running[agent]) {
-    needsRun[agent] = true;
+async function agentLoop(topicId, agent) {
+  const key = runKey(topicId, agent);
+  if (running[key]) {
+    needsRun[key] = true;
     return;
   }
-  running[agent] = true;
+  running[key] = true;
   broadcast();
   try {
     while (true) {
-      needsRun[agent] = false;
+      needsRun[key] = false;
+      const topic = findTopic(topicId);
+      if (!topic) break;
       const a = state.agents[agent];
+      const ta = topic.agents[agent];
       try {
-        if (syncExternal(agent)) touch(); // 外部での続きを取り込んでから応答する
+        if (syncExternal(topic, agent)) touch(); // 外部での続きを取り込んでから応答する
       } catch {
         // 同期失敗しても応答は続行
       }
-      const msgs = unseenFor(agent);
+      const msgs = unseenFor(topic, agent);
       if (!a.auto || !msgs.length) break;
-      const prompt = buildPrompt(agent, msgs, !a.sessionId);
-      const actKey = "thread:" + agent;
+      const prompt = buildPrompt(topic, agent, msgs, !ta.sessionId);
+      const actKey = "thread:" + topicId + ":" + agent;
       actStart(actKey, NAMES[agent] + " 応答");
       try {
         const call = agent === "claude" ? callClaude : callCodex;
-        const { text, sessionId, model } = await call(prompt, a.sessionId, a.modelOverride, (s) => actStep(actKey, s));
-        a.sessionId = sessionId;
+        const { text, sessionId, model } = await call(prompt, ta.sessionId, a.modelOverride, (s) => actStep(actKey, s));
+        ta.sessionId = sessionId;
         if (model) a.model = model;
-        a.lastSeenTs = msgs[msgs.length - 1].ts;
+        ta.lastSeenTs = msgs[msgs.length - 1].ts;
         a.lastError = "";
-        state.messages.push({ id: id(), thread: agent, author: agent, text, auto: true, ts: Date.now() });
-        markTranscriptSynced(agent); // 自分の応答分は外部同期の対象外にする
-        qaHop(agent, text);
+        state.messages.push({ id: id(), topicId, thread: agent, author: agent, text, auto: true, ts: Date.now() });
+        markTranscriptSynced(topic, agent); // 自分の応答分は外部同期の対象外にする
+        qaHop(topic, agent, text);
       } catch (e) {
-        state.relay.active = false; // エラーで質疑が空回りしないよう停止
+        topic.relay.active = false; // エラーで質疑が空回りしないよう停止
         a.lastError = String(e.message || e);
-        a.lastSeenTs = msgs[msgs.length - 1].ts; // 同じメッセージで無限リトライしない
+        ta.lastSeenTs = msgs[msgs.length - 1].ts; // 同じメッセージで無限リトライしない
       } finally {
         actEnd(actKey);
       }
       touch();
-      if (!needsRun[agent]) break;
+      if (!needsRun[key]) break;
     }
   } finally {
-    running[agent] = false;
+    running[key] = false;
     touch();
   }
 }
 
 function maybeTrigger(messages) {
-  for (const agent of AGENTS) {
-    if (!state.agents[agent].auto) continue;
-    if (messages.some((m) => m.thread === agent && m.author !== agent)) agentLoop(agent);
+  for (const m of messages) {
+    if (!AGENTS.includes(m.thread) || m.author === m.thread) continue;
+    if (state.agents[m.thread].auto && findTopic(m.topicId)) agentLoop(m.topicId, m.thread);
   }
 }
 
@@ -866,12 +906,15 @@ async function handleApi(req, res, url) {
     const author = AUTHORS.includes(body.author) ? body.author : null;
     const thread = AGENTS.includes(body.thread) ? body.thread : null;
     const text = typeof body.text === "string" ? body.text.trim() : "";
+    const topic = findTopic(body.topicId) || state.topics[0];
     if (!author || !text) return json(res, 400, { error: "author と text は必須です" });
+    if (!topic) return json(res, 400, { error: "トピックがありません" });
     // user は thread:"both" で両スレッドに同報できる
     const threads = thread ? [thread] : body.thread === "both" && author === "user" ? AGENTS : null;
     if (!threads) return json(res, 400, { error: "thread は claude / codex / both(userのみ)" });
     const created = threads.map((t) => ({
       id: id(),
+      topicId: topic.id,
       thread: t,
       author,
       text,
@@ -882,6 +925,34 @@ async function handleApi(req, res, url) {
     touch();
     maybeTrigger(created);
     return json(res, 201, created);
+  }
+
+  // ---- トピック（スレッド）管理 ----
+  if (req.method === "POST" && url.pathname === "/api/topics") {
+    const body = await readBody(req);
+    const title = typeof body.title === "string" && body.title.trim() ? body.title.trim().slice(0, 60) : "新しいスレッド";
+    const topic = defaultTopic(title);
+    state.topics.push(topic);
+    touch();
+    return json(res, 201, topic);
+  }
+
+  if (parts[0] === "api" && parts[1] === "topics" && parts[2]) {
+    const topic = findTopic(parts[2]);
+    if (!topic) return json(res, 404, { error: "topic not found" });
+    if (req.method === "PATCH") {
+      const body = await readBody(req);
+      if (typeof body.title === "string" && body.title.trim()) topic.title = body.title.trim().slice(0, 60);
+      touch();
+      return json(res, 200, topic);
+    }
+    if (req.method === "DELETE") {
+      if (state.topics.length <= 1) return json(res, 400, { error: "最後のトピックは削除できません" });
+      state.topics = state.topics.filter((t) => t.id !== topic.id);
+      state.messages = state.messages.filter((m) => m.topicId !== topic.id);
+      touch();
+      return json(res, 200, { ok: true });
+    }
   }
 
   // コピー / 移動（Finder 風ブラウザ用）。src はプール内相対パス（ファイルまたはフォルダ）
@@ -1103,18 +1174,22 @@ async function handleApi(req, res, url) {
     if (!first || !text) return json(res, 400, { error: "first と text は必須です" });
     if (!state.agents.claude.auto || !state.agents.codex.auto)
       return json(res, 400, { error: "質疑モードには両スレッドの自動応答をONにしてください" });
-    state.relay = { active: true, remaining: hops, hopsDone: 0 };
-    const msg = { id: id(), thread: first, author: "user", text, qa: true, ts: Date.now() };
+    const qaTopic = findTopic(body.topicId) || state.topics[0];
+    if (!qaTopic) return json(res, 400, { error: "トピックがありません" });
+    qaTopic.relay = { active: true, remaining: hops, hopsDone: 0 };
+    const msg = { id: id(), topicId: qaTopic.id, thread: first, author: "user", text, qa: true, ts: Date.now() };
     state.messages.push(msg);
     touch();
-    agentLoop(first);
-    return json(res, 201, { relay: state.relay });
+    agentLoop(qaTopic.id, first);
+    return json(res, 201, { relay: qaTopic.relay });
   }
 
   if (req.method === "POST" && url.pathname === "/api/qa/stop") {
-    state.relay = defaultRelay();
+    const body = await readBody(req);
+    const qaTopic = findTopic(body.topicId) || state.topics[0];
+    if (qaTopic) qaTopic.relay = defaultRelay();
     touch();
-    return json(res, 200, { relay: state.relay });
+    return json(res, 200, { relay: qaTopic ? qaTopic.relay : defaultRelay() });
   }
 
   if (req.method === "PATCH" && parts[0] === "api" && parts[1] === "agents" && AGENTS.includes(parts[2])) {
@@ -1122,14 +1197,13 @@ async function handleApi(req, res, url) {
     const a = state.agents[parts[2]];
     if (typeof body.auto === "boolean") {
       a.auto = body.auto;
-      if (body.auto) a.lastSeenTs = Date.now(); // ON にした時点から先の新着のみ拾う
+      if (body.auto) for (const t of state.topics) t.agents[parts[2]].lastSeenTs = Date.now(); // ON にした時点から先の新着のみ拾う
       a.lastError = "";
     }
     if (typeof body.model === "string") {
       a.modelOverride = body.model.trim();
       a.lastError = "";
     }
-    if (body.resetSession) a.sessionId = null;
     touch();
     return json(res, 200, a);
   }
@@ -1142,6 +1216,7 @@ async function handleApi(req, res, url) {
     const task = {
       id: id(),
       agent,
+      topicId: (findTopic(body.topicId) || state.topics[0] || {}).id || null,
       title,
       detail: typeof body.detail === "string" ? body.detail.trim() : "",
       status: "queued",
@@ -1174,6 +1249,7 @@ async function handleApi(req, res, url) {
       task.result = text;
       state.messages.push({
         id: id(),
+        topicId: task.topicId || (state.topics[0] || {}).id,
         thread: task.agent,
         author: task.agent,
         text,
