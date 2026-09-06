@@ -44,6 +44,7 @@ function emptyState() {
   return {
     messages: [],
     tasks: [],
+    pool: [],
     agents: { claude: defaultAgent(), codex: defaultAgent() },
     relay: defaultRelay(),
   };
@@ -57,6 +58,7 @@ function loadState() {
       parsed.agents = parsed.agents || {};
       for (const a of AGENTS) parsed.agents[a] = { ...defaultAgent(), ...parsed.agents[a] };
       parsed.relay = defaultRelay(); // 再起動後にリレーが勝手に再開しないよう常に解除
+      if (!Array.isArray(parsed.pool)) parsed.pool = [];
       return parsed;
     }
   } catch {
@@ -85,8 +87,11 @@ function saveState() {
 // ---- SSE ----
 const sseClients = new Set();
 
+// itemId -> 実行中レビュアー名の配列（永続化しない）
+const reviewPending = {};
+
 function publicState() {
-  return { ...state, running };
+  return { ...state, running, reviewPending };
 }
 
 function broadcast() {
@@ -273,6 +278,57 @@ async function callCodex(prompt, sessionId, modelOverride) {
   }
   if (code !== 0 && !text) throw new Error((err || out || "codex CLI エラー").trim().slice(0, 500));
   return { text: text || "(空の応答)", sessionId: newSessionId, model: codexModelFromRollout(newSessionId) };
+}
+
+// ---- 共有タスクプール: 相互レビュー ----
+// レビューはスレッドとは独立した使い捨てセッションで実行する
+// （スレッド文脈を汚さず、進行中の会話と並列でも衝突しない）
+
+const POOL_STATUSES = ["submitted", "reviewing", "approved", "rejected"];
+
+function verdictFrom(text) {
+  const m = text.match(/【判定】\s*(承認|条件付き承認|差し戻し)/);
+  return m ? m[1] : "";
+}
+
+function buildReviewPrompt(item, reviewer) {
+  return (
+    `あなたは「U2A2Aオーケストレーション」の共有タスクプールのレビュアー（${NAMES[reviewer]}）です。` +
+    `以下の成果物を、Kometa リポジトリ（閲覧のみ可）の実態と照らして、忖度なく具体的にレビューしてください。\n` +
+    `- 問題点・リスク・改善案を挙げる\n` +
+    `- 既存の実装や他タスクとの重複、不要な作業の兆候があれば指摘する\n` +
+    `- 良い点は簡潔に認める\n` +
+    `- 最後に必ず1行、次の形式で判定を書く: 【判定】承認 / 条件付き承認 / 差し戻し\n\n` +
+    `--- 成果物「${item.title}」（持ち込み: ${NAMES[item.origin]}） ---\n` +
+    item.body
+  );
+}
+
+async function runReview(itemId, reviewer) {
+  const item = state.pool.find((p) => p.id === itemId);
+  if (!item) return;
+  if ((reviewPending[itemId] || []).includes(reviewer)) return; // 同一レビュアーの多重起動防止
+  (reviewPending[itemId] ||= []).push(reviewer);
+  if (item.status === "submitted") item.status = "reviewing";
+  touch();
+  try {
+    const call = reviewer === "claude" ? callClaude : callCodex;
+    const { text } = await call(buildReviewPrompt(item, reviewer), null, state.agents[reviewer].modelOverride);
+    item.reviews.push({ id: id(), reviewer, text, verdict: verdictFrom(text), ts: Date.now() });
+  } catch (e) {
+    item.reviews.push({
+      id: id(),
+      reviewer,
+      text: "（レビュー失敗: " + String(e.message || e).slice(0, 300) + "）",
+      verdict: "",
+      error: true,
+      ts: Date.now(),
+    });
+  } finally {
+    reviewPending[itemId] = (reviewPending[itemId] || []).filter((r) => r !== reviewer);
+    if (!reviewPending[itemId].length) delete reviewPending[itemId];
+    touch();
+  }
 }
 
 function unseenFor(agent) {
@@ -495,6 +551,57 @@ async function handleApi(req, res, url) {
     touch();
     maybeTrigger(created);
     return json(res, 201, created);
+  }
+
+  // 共有タスクプール: 持ち込み（作成と同時に相手エージェントが自動レビュー）
+  if (req.method === "POST" && url.pathname === "/api/pool") {
+    const body = await readBody(req);
+    const origin = AUTHORS.includes(body.origin) ? body.origin : null;
+    const title = typeof body.title === "string" ? body.title.trim() : "";
+    const text = typeof body.body === "string" ? body.body.trim() : "";
+    if (!origin || !title || !text) return json(res, 400, { error: "origin / title / body は必須です" });
+    const item = {
+      id: id(),
+      title,
+      body: text,
+      origin,
+      status: "submitted",
+      reviews: [],
+      fromMessageId: typeof body.fromMessageId === "string" ? body.fromMessageId : null,
+      ts: Date.now(),
+    };
+    state.pool.push(item);
+    touch();
+    // 持ち込み元でない側が自動レビュー（ユーザー持ち込みは両エージェント）
+    const reviewers = origin === "user" ? AGENTS : [OTHER[origin]];
+    if (body.autoReview !== false) for (const r of reviewers) runReview(item.id, r);
+    return json(res, 201, item);
+  }
+
+  if (parts[0] === "api" && parts[1] === "pool" && parts[2]) {
+    const item = state.pool.find((p) => p.id === parts[2]);
+    if (!item) return json(res, 404, { error: "pool item not found" });
+
+    if (req.method === "POST" && parts[3] === "review") {
+      const body = await readBody(req);
+      const reviewer = AGENTS.includes(body.reviewer) ? body.reviewer : null;
+      if (!reviewer) return json(res, 400, { error: "reviewer は claude / codex" });
+      runReview(item.id, reviewer);
+      return json(res, 202, { ok: true });
+    }
+
+    if (req.method === "PATCH" && parts.length === 3) {
+      const body = await readBody(req);
+      if (body.status && POOL_STATUSES.includes(body.status)) item.status = body.status;
+      touch();
+      return json(res, 200, item);
+    }
+
+    if (req.method === "DELETE" && parts.length === 3) {
+      state.pool = state.pool.filter((p) => p.id !== item.id);
+      touch();
+      return json(res, 200, { ok: true });
+    }
   }
 
   // 質疑モード開始: 先手エージェントへ発言し、以後は応答完了ごとに相手へ自動中継

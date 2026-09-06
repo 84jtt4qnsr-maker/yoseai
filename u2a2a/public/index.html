@@ -296,6 +296,90 @@
   .status[data-s="returned"] { color: var(--claude); border-color: #ffab5e55; }
   .status[data-s="done"]     { color: var(--user); border-color: #7bd88f55; }
 
+  /* 共有タスクプール */
+  #pool-zone {
+    border-top: 2px solid var(--line);
+    background: var(--panel);
+    flex: none;
+  }
+  #pool-head {
+    padding: 8px 18px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+  }
+  #pool-head .sub { color: var(--dim); font-weight: 400; font-size: 12px; }
+  #pool-head button { margin-left: auto; }
+  #pool-items[hidden] { display: none; }
+  #pool-items {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+    gap: 10px;
+    padding: 0 18px 14px;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+  .pool-item {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+  }
+  .pool-item .p-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .pool-item .p-title { font-weight: 600; flex: 1; min-width: 120px; word-break: break-word; }
+  .origin {
+    font-size: 11px;
+    border-radius: 999px;
+    padding: 1px 9px;
+    border: 1px solid var(--line);
+    color: var(--dim);
+    flex: none;
+  }
+  .origin[data-o="user"] { color: var(--user); border-color: #7bd88f55; }
+  .origin[data-o="claude"] { color: var(--claude); border-color: #ffab5e55; }
+  .origin[data-o="codex"] { color: var(--codex); border-color: #6fd7ff55; }
+  .status[data-s="submitted"] { color: #d8c56f; border-color: #d8c56f55; }
+  .status[data-s="reviewing"] { color: var(--codex); border-color: #6fd7ff55; }
+  .status[data-s="approved"] { color: var(--user); border-color: #7bd88f55; }
+  .status[data-s="rejected"] { color: var(--danger); border-color: #ff7b7b55; }
+  .pool-item .p-body {
+    margin-top: 6px;
+    max-height: 220px;
+    overflow-y: auto;
+    word-break: break-word;
+  }
+  .review {
+    margin-top: 8px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 10px;
+    background: var(--panel);
+  }
+  .review .r-head {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    font-size: 12px;
+    color: var(--dim);
+    margin-bottom: 3px;
+  }
+  .review .r-head .reviewer { font-weight: 600; }
+  .review .r-head .reviewer[data-o="claude"] { color: var(--claude); }
+  .review .r-head .reviewer[data-o="codex"] { color: var(--codex); }
+  .verdict {
+    font-size: 11px;
+    border-radius: 999px;
+    padding: 1px 9px;
+    border: 1px solid var(--line);
+    flex: none;
+  }
+  .verdict[data-v="承認"] { color: var(--user); border-color: #7bd88f55; }
+  .verdict[data-v="条件付き承認"] { color: #d8c56f; border-color: #d8c56f55; }
+  .verdict[data-v="差し戻し"] { color: var(--danger); border-color: #ff7b7b55; }
+  .review .r-body { max-height: 200px; overflow-y: auto; word-break: break-word; font-size: 13px; }
+
   dialog {
     background: var(--panel);
     color: var(--text);
@@ -387,6 +471,46 @@
   </section>
 </main>
 
+<!-- 共有タスクプール -->
+<section id="pool-zone">
+  <div id="pool-head">
+    共有タスクプール
+    <span class="sub">成果物の持ち込みと相互レビュー ／ 持ち込むと相手エージェントが自動レビュー</span>
+    <span class="sub" id="pool-count"></span>
+    <button id="pool-add">＋ 持ち込み</button>
+    <button id="pool-toggle" class="small">折りたたむ</button>
+  </div>
+  <div id="pool-items"></div>
+</section>
+
+<!-- プール持ち込みダイアログ -->
+<dialog id="pool-dialog">
+  <h3>共有タスクプールへ持ち込み</h3>
+  <div class="field">
+    <label>持ち込み元</label>
+    <select id="pool-origin">
+      <option value="user">ユーザー</option>
+      <option value="claude">Claude Code</option>
+      <option value="codex">Codex</option>
+    </select>
+  </div>
+  <div class="field">
+    <label>タイトル</label>
+    <input id="pool-title" />
+  </div>
+  <div class="field">
+    <label>成果物（Markdown 可）</label>
+    <textarea id="pool-body"></textarea>
+  </div>
+  <div class="field">
+    <label><input type="checkbox" id="pool-autoreview" checked /> 登録と同時に相手エージェントが自動レビュー（ユーザー持ち込みは両者）</label>
+  </div>
+  <div class="buttons">
+    <button id="pool-cancel">キャンセル</button>
+    <button id="pool-create">プールへ登録</button>
+  </div>
+</dialog>
+
 <!-- タスク化ダイアログ -->
 <dialog id="task-dialog">
   <h3>タスク化</h3>
@@ -430,7 +554,8 @@
 const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
 const OTHER = { claude: "codex", codex: "claude" };
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
-let state = { messages: [], tasks: [], agents: {}, running: {}, relay: {} };
+let state = { messages: [], tasks: [], pool: [], agents: {}, running: {}, relay: {}, reviewPending: {} };
+const POOL_STATUS_LABEL = { submitted: "持ち込み", reviewing: "レビュー", approved: "承認", rejected: "差し戻し" };
 
 const $ = (s) => document.querySelector(s);
 
@@ -590,6 +715,65 @@ function render() {
     renderAgentStatus(agent);
   }
   renderQaBar();
+  renderPool();
+}
+
+function renderPool() {
+  const box = $("#pool-items");
+  const items = state.pool || [];
+  $("#pool-count").textContent = items.length ? items.length + " 件" : "";
+  box.replaceChildren();
+  if (!items.length) {
+    box.appendChild(el("div", { class: "empty", text: "まだ成果物がありません — スレッドの「プールへ」やタスク結果から持ち込めます" }));
+    return;
+  }
+  for (const p of [...items].reverse()) {
+    const pending = (state.reviewPending || {})[p.id] || [];
+    const head = el("div", { class: "p-head" }, [
+      el("span", { class: "status", "data-s": p.status, text: POOL_STATUS_LABEL[p.status] || p.status }),
+      el("span", { class: "origin", "data-o": p.origin, text: "持ち込み: " + NAMES[p.origin] }),
+      el("span", { class: "p-title", text: p.title }),
+    ]);
+    const body = el("div", { class: "p-body" });
+    body.innerHTML = renderMarkdown(p.body);
+
+    const kids = [head, body];
+    for (const r of p.reviews || []) {
+      const rHead = el("div", { class: "r-head" }, [
+        el("span", { class: "reviewer", "data-o": r.reviewer, text: "🔎 " + NAMES[r.reviewer] + " のレビュー" }),
+      ]);
+      if (r.verdict) rHead.appendChild(el("span", { class: "verdict", "data-v": r.verdict, text: "【判定】" + r.verdict }));
+      const rBody = el("div", { class: "r-body" });
+      rBody.innerHTML = renderMarkdown(r.text);
+      kids.push(el("div", { class: "review" }, [rHead, rBody]));
+    }
+    for (const r of pending) {
+      kids.push(el("div", { class: "typing", text: NAMES[r] + " がレビュー中" }));
+    }
+
+    const actions = el("div", { class: "actions" });
+    for (const agent of ["claude", "codex"]) {
+      if (!pending.includes(agent)) {
+        actions.appendChild(el("button", {
+          class: "small",
+          text: NAMES[agent] + " にレビュー依頼",
+          onclick: () => api("/api/pool/" + p.id + "/review", "POST", { reviewer: agent }),
+        }));
+      }
+    }
+    if (p.status !== "approved")
+      actions.appendChild(el("button", { class: "small", text: "承認", onclick: () => api("/api/pool/" + p.id, "PATCH", { status: "approved" }) }));
+    if (p.status !== "rejected")
+      actions.appendChild(el("button", { class: "small", text: "差し戻し", onclick: () => api("/api/pool/" + p.id, "PATCH", { status: "rejected" }) }));
+    actions.appendChild(el("button", { class: "small", text: "コピー", onclick: () => copy(p.body) }));
+    actions.appendChild(el("button", {
+      class: "small",
+      text: "削除",
+      onclick: () => { if (confirm("「" + p.title + "」をプールから削除しますか？")) api("/api/pool/" + p.id, "DELETE"); },
+    }));
+    kids.push(actions);
+    box.appendChild(el("div", { class: "pool-item" }, kids));
+  }
 }
 
 function renderQaBar() {
@@ -664,6 +848,7 @@ function renderThread(agent) {
         onclick: () => relay(agent, m),
       }),
       el("button", { class: "small", text: "コピー", onclick: () => copy(m.text) }),
+      el("button", { class: "small", text: "プールへ", onclick: () => openPoolDialog(m.author, m.text, m.id) }),
       el("button", {
         class: "small",
         text: isRaw ? "MD表示" : "生表示",
@@ -715,6 +900,12 @@ function renderTasks(agent) {
       actions.appendChild(el("button", { class: "small", text: "結果を入力", onclick: () => openResultDialog(t) }));
     if (t.status === "returned")
       actions.appendChild(el("button", { class: "small", text: "完了にする", onclick: () => patchTask(t.id, "done") }));
+    if (t.result)
+      actions.appendChild(el("button", {
+        class: "small",
+        text: "プールへ",
+        onclick: () => openPoolDialog(t.agent, t.result, null, t.title),
+      }));
     actions.appendChild(el("button", { class: "small", text: "削除", onclick: () => delTask(t) }));
 
     const kids = [
@@ -801,6 +992,38 @@ $("#task-create").addEventListener("click", async () => {
   });
   $("#task-dialog").close();
   toast("タスクをキューに追加しました");
+});
+
+let poolSourceMessageId = null;
+function openPoolDialog(origin, text, fromMessageId, title) {
+  poolSourceMessageId = fromMessageId || null;
+  $("#pool-origin").value = origin || "user";
+  const firstLine = (title || (text || "").split("\n")[0] || "").trim();
+  $("#pool-title").value = firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
+  $("#pool-body").value = text || "";
+  $("#pool-autoreview").checked = true;
+  $("#pool-dialog").showModal();
+}
+$("#pool-add").addEventListener("click", () => openPoolDialog("user", "", null));
+$("#pool-cancel").addEventListener("click", () => $("#pool-dialog").close());
+$("#pool-create").addEventListener("click", async () => {
+  const title = $("#pool-title").value.trim();
+  const body = $("#pool-body").value.trim();
+  if (!title || !body) return toast("タイトルと成果物を入力してください");
+  await api("/api/pool", "POST", {
+    origin: $("#pool-origin").value,
+    title,
+    body,
+    fromMessageId: poolSourceMessageId,
+    autoReview: $("#pool-autoreview").checked,
+  });
+  $("#pool-dialog").close();
+  toast("プールへ登録しました");
+});
+$("#pool-toggle").addEventListener("click", () => {
+  const items = $("#pool-items");
+  items.hidden = !items.hidden;
+  $("#pool-toggle").textContent = items.hidden ? "展開する" : "折りたたむ";
 });
 
 let resultTask = null;
