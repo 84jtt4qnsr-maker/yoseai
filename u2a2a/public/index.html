@@ -351,6 +351,35 @@
   }
   .mdview th { background: var(--panel-2); }
   .mdview a { color: var(--codex); }
+  .mdview img { max-width: 100%; max-height: 260px; border-radius: 6px; display: block; margin: 4px 0; }
+  .cb-bar {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    font-size: 11px;
+    color: var(--dim);
+    margin: 6px 0 2px;
+  }
+  .cb-svg {
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 6px;
+    max-width: 100%;
+    max-height: 280px;
+    display: block;
+    margin: 6px 0 0;
+  }
+  .msg-media { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+  .msg-media img { max-width: 100%; max-height: 240px; border-radius: 6px; border: 1px solid var(--line); }
+  .msg-media a {
+    color: var(--codex);
+    font-size: 12px;
+    font-family: ui-monospace, "SF Mono", monospace;
+    text-decoration: none;
+    word-break: break-all;
+  }
+  .msg-media a:hover { text-decoration: underline; }
   .mdview hr { border: none; border-top: 1px solid var(--line); margin: 0.6em 0; }
   /* メッセージのアクションはホバー時のみ右上にオーバーレイ表示（縦の圧迫を防ぐ） */
   .msg .actions {
@@ -672,6 +701,8 @@
     <option value="qa-codex">🗨 質疑（Codex先手）</option>
   </select>
   <input id="qa-hops" type="number" min="1" max="20" value="6" title="自動中継の上限手数" hidden />
+  <button id="user-attach" title="ファイルを添付（プールの attachments/ に保存されます）">📎</button>
+  <input id="attach-input" type="file" multiple hidden />
   <button id="user-send">送信</button>
 </div>
 <div id="qa-bar" hidden>
@@ -767,6 +798,10 @@
   <div class="field">
     <label>成果物テキスト（Markdown 可。`u2a2a/pool/` に .md として保存されます）</label>
     <textarea id="pool-body"></textarea>
+  </div>
+  <div class="field">
+    <label>保存ファイル名（任意。拡張子込みで指定 — 空欄なら タイトル.md）</label>
+    <input id="pool-filename" placeholder="例: diagram.svg" />
   </div>
   <div class="field">
     <label>またはファイルを添付（テキスト欄より優先）</label>
@@ -1041,6 +1076,14 @@ function escapeHtml(s) {
 
 function inlineMd(raw) {
   let s = escapeHtml(raw);
+  // 画像: ![alt](http(s)://… | u2a2a/pool/… | /api/pool/file/…)
+  s = s.replace(
+    /!\[([^\]]*)\]\((?:(https?:[^)\s]+)|(?:\/api\/pool\/file\/|u2a2a\/pool\/)([^)\s]+))\)/g,
+    (_, alt, abs, rel) => {
+      const src = abs || "/api/pool/file/" + rel;
+      return '<img src="' + src + '" alt="' + alt + '" loading="lazy">';
+    }
+  );
   s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
   s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^*\w])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
@@ -1049,7 +1092,11 @@ function inlineMd(raw) {
   return s;
 }
 
-function renderMarkdown(src) {
+// コードブロックの実体ストア（保存・コピー用。event delegation から参照）
+const cbStore = {};
+let cbSeq = 0;
+
+function renderMarkdown(src, ctx) {
   const lines = src.split("\n");
   const out = [];
   let para = [];
@@ -1060,15 +1107,30 @@ function renderMarkdown(src) {
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    // フェンス付きコードブロック
-    const fence = line.match(/^\s*```/);
+    // フェンス付きコードブロック（SVG はインライン描画＋プール保存ボタン付き）
+    const fence = line.match(/^\s*```([\w+-]*)/);
     if (fence) {
       flushPara();
       const buf = [];
       i++;
       while (i < lines.length && !/^\s*```/.test(lines[i])) buf.push(lines[i++]);
       i++; // 閉じフェンス
-      out.push("<pre><code>" + escapeHtml(buf.join("\n")) + "</code></pre>");
+      const code = buf.join("\n");
+      const lang = (fence[1] || "").toLowerCase();
+      const cid = "cb" + ++cbSeq;
+      cbStore[cid] = { code, lang, author: (ctx || {}).author || "user" };
+      const isSvg = lang === "svg" || code.trimStart().startsWith("<svg");
+      let html = "";
+      if (isSvg) {
+        // <img> + data URI 描画なのでスクリプトは実行されない
+        html += '<img class="cb-svg" alt="SVG" src="data:image/svg+xml;charset=utf-8,' + encodeURIComponent(code) + '">';
+      }
+      html +=
+        '<div class="cb-bar"><span>' + (lang || "code") + "</span>" +
+        '<button class="small cb-save" data-cid="' + cid + '">プールへ保存</button>' +
+        '<button class="small cb-copy" data-cid="' + cid + '">コピー</button></div>' +
+        "<pre><code>" + escapeHtml(code) + "</code></pre>";
+      out.push(html);
       continue;
     }
     // 見出し
@@ -1732,7 +1794,7 @@ function renderThread(agent) {
     } else {
       body = el("div", { class: "mdview" + (isRaw ? " raw" : "") });
       if (isRaw) body.textContent = m.text;
-      else body.innerHTML = renderMarkdown(m.text);
+      else body.innerHTML = renderMarkdown(m.text, { author: m.author });
       if (m.relayedFrom) {
         meta.appendChild(el("span", {
           class: "relay-fold",
@@ -1745,11 +1807,23 @@ function renderThread(agent) {
       }
     }
 
-    box.appendChild(el("div", { class: "msg" + (m.external ? " external" : ""), "data-author": m.author, "data-mid": m.id }, [
-      meta,
-      body,
-      actions,
-    ]));
+    const kids = [meta, body];
+    // 本文中の pool パスを検出し、画像はインライン・その他はリンクで自動プレビュー
+    if (!(m.relayedFrom && !expandedRelays.has(m.id))) {
+      const paths = [...new Set(m.text.match(/u2a2a\/pool\/[^\s)"'`」()）]+/g) || [])].slice(0, 4);
+      const mediaKids = [];
+      for (const full of paths) {
+        const rel = full.slice("u2a2a/pool/".length);
+        // Markdown 記法で既に本文中に埋め込まれているものは重複させない
+        if (new RegExp("\\]\\([^)]*" + rel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\)").test(m.text)) continue;
+        const url = "/api/pool/file/" + encodeURI(rel);
+        if (isImageExt(rel)) mediaKids.push(el("img", { src: url, alt: rel, loading: "lazy" }));
+        else mediaKids.push(el("a", { href: url, target: "_blank", rel: "noopener", text: "📄 " + full }));
+      }
+      if (mediaKids.length) kids.push(el("div", { class: "msg-media" }, mediaKids));
+    }
+    kids.push(actions);
+    box.appendChild(el("div", { class: "msg" + (m.external ? " external" : ""), "data-author": m.author, "data-mid": m.id }, kids));
   }
   if (isRunning(agent)) {
     const act = threadActivity(agent);
@@ -1904,9 +1978,24 @@ function openPoolDialog(origin, text, fromMessageId, title) {
   const firstLine = (title || (text || "").split("\n")[0] || "").trim();
   $("#pool-title").value = firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
   $("#pool-body").value = text || "";
+  $("#pool-filename").value = "";
   $("#pool-autoreview").checked = true;
   $("#pool-dialog").showModal();
 }
+
+// コードブロックの「プールへ保存」「コピー」（event delegation）
+const CB_EXT = { svg: "svg", html: "html", htm: "html", javascript: "js", js: "js", mjs: "mjs", ts: "ts", python: "py", py: "py", json: "json", css: "css", markdown: "md", md: "md", diff: "diff", patch: "patch", sh: "sh", bash: "sh", yaml: "yaml", yml: "yml" };
+document.addEventListener("click", (e) => {
+  const cid = e.target && e.target.dataset ? e.target.dataset.cid : null;
+  if (!cid || !cbStore[cid]) return;
+  const { code, lang, author } = cbStore[cid];
+  if (e.target.classList.contains("cb-copy")) copy(code);
+  if (e.target.classList.contains("cb-save")) {
+    const ext = CB_EXT[lang] || (code.trimStart().startsWith("<svg") ? "svg" : "txt");
+    openPoolDialog(author, code, null, "生成物");
+    $("#pool-filename").value = "artifact." + ext;
+  }
+});
 $("#pool-add").addEventListener("click", () => openPoolDialog("user", "", null));
 $("#pool-cancel").addEventListener("click", () => $("#pool-dialog").close());
 $("#pool-create").addEventListener("click", async () => {
@@ -1936,6 +2025,7 @@ $("#pool-create").addEventListener("click", async () => {
       title,
       body,
       dir: poolCurrentDir,
+      filename: $("#pool-filename").value.trim() || undefined,
       fromMessageId: poolSourceMessageId,
       autoReview: $("#pool-autoreview").checked,
     });
@@ -2035,6 +2125,33 @@ $("#result-save").addEventListener("click", async () => {
   await api("/api/tasks/" + resultTask.id + "/result", "POST", { text });
   $("#result-dialog").close();
   toast("結果をスレッドへ戻しました");
+});
+
+// ---- 添付: プールの attachments/ に保存し、メッセージに参照を挿入 ----
+async function fileToBase64(f) {
+  const bytes = new Uint8Array(await f.arrayBuffer());
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+$("#user-attach").addEventListener("click", () => $("#attach-input").click());
+$("#attach-input").addEventListener("change", async (e) => {
+  for (const f of e.target.files || []) {
+    const item = await api("/api/pool/upload", "POST", {
+      origin: "user",
+      filename: f.name,
+      dataBase64: await fileToBase64(f),
+      dir: "attachments",
+      autoReview: false,
+    });
+    const refPath = "u2a2a/pool/" + item.file;
+    const ta = $("#user-text");
+    ta.value += (ta.value && !ta.value.endsWith("\n") ? "\n" : "") +
+      (isImageExt(item.file) ? "![" + f.name + "](" + refPath + ")" : refPath);
+    toast("添付しました: " + item.file);
+  }
+  e.target.value = "";
 });
 
 // ---- wiring ----

@@ -313,7 +313,11 @@ function buildPrompt(topic, agent, msgs, isFirst) {
       `${QA_END_MARK} は、相手の見解を少なくとも一度聞いた上で合意・結論に達した場合のみ、応答の末尾に書いてください。` +
       `相手がまだ発言していない段階での終了宣言は無効です。残り自動中継 ${topic.relay.remaining} 手）`
     : "";
-  return preamble + lines + qaNote;
+  const artifactNote =
+    agent === "claude"
+      ? `\n\n（成果物ファイルは u2a2a/pool/ 配下にのみ保存できます（他への書き込みは不許可）。保存したら本文にそのパスを書いてください — アプリが画像等をインライン表示します）`
+      : `\n\n（あなたの環境はファイル書き込み不可です。SVG・HTML・コード等の成果物は、本文にフェンス付きコードブロック（\`\`\`svg など言語指定付き）で出力してください。アプリが SVG をインライン描画し、ユーザーがワンクリックでプールに保存できます）`;
+  return preamble + lines + qaNote + artifactNote;
 }
 
 // 質疑モード: エージェントの応答完了を待って相手スレッドへ中継する（トピック単位）
@@ -906,7 +910,9 @@ async function agentLoop(topicId, agent) {
       actStart(actKey, NAMES[agent] + " 応答");
       try {
         const call = agent === "claude" ? callClaude : callCodex;
-        const { text, sessionId, model } = await call(prompt, ta.sessionId, a.modelOverride, (s) => actStep(actKey, s));
+        // claude はプール配下限定でファイル保存を許可（成果物の直接持ち込み用）
+        const opts = agent === "claude" ? { extraArgs: ["--allowedTools", "Write(u2a2a/pool/**)", "Edit(u2a2a/pool/**)"] } : {};
+        const { text, sessionId, model } = await call(prompt, ta.sessionId, a.modelOverride, (s) => actStep(actKey, s), opts);
         ta.sessionId = sessionId;
         if (model) a.model = model;
         ta.lastSeenTs = msgs[msgs.length - 1].ts;
@@ -1122,7 +1128,10 @@ async function handleApi(req, res, url) {
     const text = typeof body.body === "string" ? body.body.trim() : "";
     const dir = typeof body.dir === "string" ? body.dir : "";
     if (!origin || !title || !text) return json(res, 400, { error: "origin / title / body は必須です" });
-    const name = uniquePoolName(title + ".md", dir);
+    // filename 指定があれば拡張子ごと尊重（コードブロック保存用）。なければ .md
+    const fname =
+      typeof body.filename === "string" && body.filename.trim() ? sanitizeSegment(body.filename.trim()) : title + ".md";
+    const name = uniquePoolName(fname, dir);
     const abs = poolFilePath(name);
     if (!abs) return json(res, 400, { error: "不正な保存先です" });
     fs.mkdirSync(path.dirname(abs), { recursive: true });
