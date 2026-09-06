@@ -884,6 +884,51 @@ async function handleApi(req, res, url) {
     return json(res, 201, created);
   }
 
+  // コピー / 移動（Finder 風ブラウザ用）。src はプール内相対パス（ファイルまたはフォルダ）
+  if (req.method === "POST" && (url.pathname === "/api/pool/copy" || url.pathname === "/api/pool/move")) {
+    const isMove = url.pathname.endsWith("/move");
+    const body = await readBody(req);
+    const src = typeof body.src === "string" ? body.src.replace(/\/+$/, "") : "";
+    const destDir = typeof body.destDir === "string" ? body.destDir.replace(/\/+$/, "") : "";
+    const srcAbs = poolFilePath(src);
+    const destDirAbs = destDir ? poolFilePath(destDir) : POOL_DIR;
+    if (!srcAbs || !fs.existsSync(srcAbs)) return json(res, 400, { error: "src が見つかりません" });
+    if (!destDirAbs || !fs.existsSync(destDirAbs) || !fs.statSync(destDirAbs).isDirectory())
+      return json(res, 400, { error: "destDir が不正です" });
+    const isDir = fs.statSync(srcAbs).isDirectory();
+    if (isDir && (destDir === src || destDir.startsWith(src + "/")))
+      return json(res, 400, { error: "フォルダを自分自身の中へは移動/コピーできません" });
+    const srcParent = src.includes("/") ? src.slice(0, src.lastIndexOf("/")) : "";
+    if (isMove && srcParent === destDir) return json(res, 200, { ok: true, dest: src }); // 同じ場所への移動は何もしない
+    // 衝突しない移動/コピー先の名前を決める
+    const base = src.split("/").pop();
+    let destRel = destDir ? destDir + "/" + base : base;
+    if (fs.existsSync(path.join(POOL_DIR, destRel))) {
+      const ext = isDir ? "" : path.extname(base);
+      const stem = isDir ? base : base.slice(0, base.length - ext.length);
+      let n = 2;
+      do {
+        destRel = (destDir ? destDir + "/" : "") + stem + "-" + n++ + ext;
+      } while (fs.existsSync(path.join(POOL_DIR, destRel)));
+    }
+    const destAbs = poolFilePath(destRel);
+    if (!destAbs) return json(res, 400, { error: "移動先パスが不正です" });
+    if (isMove) {
+      fs.renameSync(srcAbs, destAbs);
+      // メタデータ（レビュー・修正履歴つき）をパス書き換えで追従させる
+      for (const p of state.pool) {
+        if (!p.file) continue;
+        if (p.file === src) p.file = destRel;
+        else if (isDir && p.file.startsWith(src + "/")) p.file = destRel + p.file.slice(src.length);
+      }
+    } else {
+      fs.cpSync(srcAbs, destAbs, { recursive: true }); // コピー分は次のスキャンで新規アイテムとして登録される
+    }
+    scanPoolDir();
+    touch();
+    return json(res, 200, { ok: true, dest: destRel });
+  }
+
   // 新規フォルダ作成（Finder 風ブラウザ用）
   if (req.method === "POST" && url.pathname === "/api/pool/mkdir") {
     const body = await readBody(req);

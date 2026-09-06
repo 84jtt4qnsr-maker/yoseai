@@ -392,6 +392,18 @@
     font-size: 12.5px;
     border-radius: 6px;
   }
+  #pool-clip { display: flex; gap: 6px; align-items: center; font-size: 11px; color: var(--dim); padding: 1px 8px 3px; }
+  #pool-clip[hidden] { display: none; }
+  #pool-clip #pool-clip-name {
+    font-family: ui-monospace, monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1;
+  }
+  .pf-row.dragover { background: var(--panel-2); outline: 1px solid var(--user); }
+  #pool-list.dragover { outline: 1px dashed var(--user); outline-offset: -2px; border-radius: 6px; }
   #pool-create-row { display: flex; gap: 4px; align-items: center; margin: 2px 0 4px; }
   #pool-create-row[hidden] { display: none; }
   #pool-create-row input { flex: 1; min-width: 0; padding: 3px 8px; font-size: 12px; border-radius: 6px; }
@@ -632,6 +644,12 @@
         <input id="pool-search" placeholder="🔍 ファイル検索" />
         <button class="small" id="pool-newdir" title="新規フォルダ">📁+</button>
         <button class="small" id="pool-newfile" title="新規ファイル">📄+</button>
+        <button class="small" id="pool-copy" title="選択中のファイル/フォルダをコピー（Cmd+C）">⧉</button>
+      </div>
+      <div id="pool-clip" hidden>
+        <span id="pool-clip-name"></span>
+        <button class="small" id="pool-paste" title="作成先へ複製（Cmd+V）">ペースト</button>
+        <button class="small" id="pool-clip-clear">✕</button>
       </div>
       <div id="pool-create-row" hidden>
         <input id="pool-create-name" />
@@ -980,17 +998,83 @@ function poolPreviewEl(p) {
 let poolSelectedId = null;
 let poolCurrentDir = ""; // 新規作成の対象フォルダ（"" = ルート）
 const closedDirs = new Set(); // 閉じているフォルダ（既定は開）
+let poolFocus = null; // 直近にクリックした {kind:"file"|"dir", path} — コピー対象
+let poolClipboard = null; // {path, isDir}
+
+function renderClipBar() {
+  const bar = $("#pool-clip");
+  bar.hidden = !poolClipboard;
+  if (poolClipboard) $("#pool-clip-name").textContent = "📋 " + poolClipboard.path + (poolClipboard.isDir ? "/" : "");
+}
+
+function poolCopyFocus() {
+  if (!poolFocus) return toast("コピー対象をクリックで選択してください");
+  poolClipboard = { path: poolFocus.path, isDir: poolFocus.kind === "dir" };
+  renderClipBar();
+  toast("コピーしました: " + poolClipboard.path);
+}
+
+async function poolPaste() {
+  if (!poolClipboard) return;
+  const r = await api("/api/pool/copy", "POST", { src: poolClipboard.path, destDir: poolCurrentDir });
+  toast("複製しました: " + r.dest);
+}
+
+async function poolMove(src, destDir) {
+  const r = await api("/api/pool/move", "POST", { src, destDir });
+  if (r.dest !== src) toast("移動しました: " + r.dest);
+}
+
+// ドラッグ＆ドロップ（アプリ内の移動 + OS からのファイルドロップ）
+function wireDropTarget(node, destDirFn) {
+  node.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    node.classList.add("dragover");
+  });
+  node.addEventListener("dragleave", () => node.classList.remove("dragover"));
+  node.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    node.classList.remove("dragover");
+    const destDir = destDirFn();
+    const payload = e.dataTransfer.getData("text/u2a2a");
+    if (payload) {
+      const { src } = JSON.parse(payload);
+      if (src === destDir || destDir.startsWith(src + "/")) return;
+      return poolMove(src, destDir);
+    }
+    // Finder 等からの OS ファイルドロップはアップロードとして受ける
+    for (const f of e.dataTransfer.files || []) {
+      const buf = await f.arrayBuffer();
+      let bin = "";
+      const bytes = new Uint8Array(buf);
+      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      await api("/api/pool/upload", "POST", { origin: "user", filename: f.name, dataBase64: btoa(bin), dir: destDir, autoReview: false });
+      toast("アップロードしました: " + f.name);
+    }
+  });
+}
+
+function wireDragSource(node, relPath) {
+  node.setAttribute("draggable", "true");
+  node.addEventListener("dragstart", (e) => {
+    e.dataTransfer.setData("text/u2a2a", JSON.stringify({ src: relPath }));
+    e.dataTransfer.effectAllowed = "copyMove";
+  });
+}
 
 function fileRowEl(p, depth) {
   const pending = (state.reviewPending || {})[p.id] || [];
   const busy = pending.length || (state.fixPending || {})[p.id];
   const base = (p.file || p.title).split("/").pop();
-  return el("div", {
+  const row = el("div", {
     class: "pf-row" + (p.id === poolSelectedId ? " sel" : ""),
     style: "padding-left:" + (8 + depth * 14) + "px",
     onclick: () => {
       poolSelectedId = p.id;
       poolCurrentDir = (p.file || "").includes("/") ? p.file.slice(0, p.file.lastIndexOf("/")) : "";
+      if (p.file) poolFocus = { kind: "file", path: p.file };
       if (document.body.classList.contains("pool-collapsed")) togglePool(false);
       renderPool();
     },
@@ -999,6 +1083,8 @@ function fileRowEl(p, depth) {
     el("span", { class: "pf-name", text: base + (busy ? " …" : ""), title: p.title }),
     el("span", { class: "pf-size", text: fmtSize(p.size) }),
   ]);
+  if (p.file) wireDragSource(row, p.file);
+  return row;
 }
 
 function renderPool() {
@@ -1010,7 +1096,10 @@ function renderPool() {
     ? all.filter((p) => (p.title + " " + (p.file || "") + " " + NAMES[p.origin]).toLowerCase().includes(q))
     : all;
   $("#pool-count").textContent = all.length ? (q ? items.length + "/" + all.length : all.length) + " 件" : "";
+  // 移動などでフォルダが消えていたら作成先をルートへ戻す
+  if (poolCurrentDir && !(state.poolDirs || []).includes(poolCurrentDir)) poolCurrentDir = "";
   $("#pool-cwd").textContent = "作成先: pool/" + (poolCurrentDir ? poolCurrentDir + "/" : "");
+  renderClipBar();
 
   listBox.replaceChildren();
   if (!items.some((p) => p.id === poolSelectedId)) poolSelectedId = items.length ? items[0].id : null;
@@ -1039,21 +1128,25 @@ function renderPool() {
       for (const d of childDirs(dir)) {
         const open = !closedDirs.has(d);
         const name = d.split("/").pop();
-        listBox.appendChild(el("div", {
+        const folderRow = el("div", {
           class: "pf-row folder" + (poolCurrentDir === d ? " cwd" : ""),
           style: "padding-left:" + (8 + depth * 14) + "px",
-          title: "クリックで作成先に指定 ／ ▸で開閉",
+          title: "クリックで作成先に指定 ／ ドロップで移動先に",
           onclick: () => {
             if (poolCurrentDir === d) {
               closedDirs.has(d) ? closedDirs.delete(d) : closedDirs.add(d);
             }
             poolCurrentDir = d;
+            poolFocus = { kind: "dir", path: d };
             renderPool();
           },
         }, [
           el("span", { class: "chev", text: open ? "▾" : "▸" }),
           el("span", { class: "pf-name", text: "📁 " + name }),
-        ]));
+        ]);
+        wireDragSource(folderRow, d);
+        wireDropTarget(folderRow, () => d);
+        listBox.appendChild(folderRow);
         if (open) renderDir(d, depth + 1);
       }
       for (const p of byDir(dir)) listBox.appendChild(fileRowEl(p, depth));
@@ -1517,6 +1610,18 @@ async function submitPoolCreate() {
 }
 $("#pool-newdir").addEventListener("click", () => openPoolCreate("dir"));
 $("#pool-newfile").addEventListener("click", () => openPoolCreate("file"));
+$("#pool-copy").addEventListener("click", poolCopyFocus);
+$("#pool-paste").addEventListener("click", poolPaste);
+$("#pool-clip-clear").addEventListener("click", () => { poolClipboard = null; renderClipBar(); });
+wireDropTarget($("#pool-list"), () => ""); // リスト背景＝ルートへのドロップ
+document.addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.ctrlKey)) return;
+  const tag = (document.activeElement || {}).tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") return;
+  if ((window.getSelection() || "").toString()) return; // テキスト選択中の Cmd+C は通常コピーに譲る
+  if (e.key === "c") { poolCopyFocus(); e.preventDefault(); }
+  if (e.key === "v" && poolClipboard) { poolPaste(); e.preventDefault(); }
+});
 $("#pool-create-ok").addEventListener("click", submitPoolCreate);
 $("#pool-create-cancel").addEventListener("click", closePoolCreate);
 $("#pool-create-name").addEventListener("keydown", (e) => {
