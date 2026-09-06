@@ -120,7 +120,7 @@ function actEnd(key) {
 }
 
 function publicState() {
-  return { ...state, running, reviewPending, fixPending, activity };
+  return { ...state, running, reviewPending, fixPending, activity, poolDirs };
 }
 
 function broadcast() {
@@ -398,24 +398,35 @@ const POOL_STATUSES = ["submitted", "reviewing", "approved", "rejected"];
 const TEXT_EXTS = new Set([".md", ".txt", ".log", ".json", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".html", ".css", ".csv", ".yaml", ".yml", ".toml", ".sh", ".diff", ".patch"]);
 const IMAGE_MIME = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".svg": "image/svg+xml", ".webp": "image/webp" };
 
+// プール内相対パス（サブフォルダ可）を検証して絶対パスへ。".." や絶対パスは拒否
 function poolFilePath(name) {
-  const resolved = path.join(POOL_DIR, path.basename(name));
-  return resolved.startsWith(POOL_DIR) ? resolved : null;
+  const clean = path.normalize(String(name || "")).replace(/^[/\\]+/, "");
+  if (!clean || clean.split(path.sep).some((s) => s === ".." || s.startsWith("."))) return null;
+  const resolved = path.join(POOL_DIR, clean);
+  return resolved.startsWith(POOL_DIR + path.sep) ? resolved : null;
 }
 
-// タイトル/ファイル名から安全な一意のプール内ファイル名を作る
-function uniquePoolName(base) {
+// フォルダ名・ファイル名の1セグメントを安全化
+function sanitizeSegment(s) {
+  return String(s || "").replace(/[^\w\-.぀-ヿ一-鿿（）()]+/g, "_").replace(/^\.+/, "").slice(0, 80);
+}
+
+// タイトル/ファイル名から安全な一意のプール内相対パスを作る（dir はプール内相対フォルダ）
+function uniquePoolName(base, dir = "") {
   const ext = path.extname(base) || ".md";
-  let stem = path.basename(base, path.extname(base)).replace(/[^\w\-぀-ヿ一-鿿]+/g, "_").slice(0, 60) || "item";
-  let name = stem + ext;
+  const stem = sanitizeSegment(path.basename(base, path.extname(base))).slice(0, 60) || "item";
+  const prefix = dir ? dir.replace(/\/+$/, "") + "/" : "";
+  let name = prefix + stem + ext;
   let n = 2;
-  while (fs.existsSync(path.join(POOL_DIR, name))) name = `${stem}-${n++}${ext}`;
+  while (fs.existsSync(path.join(POOL_DIR, name))) name = `${prefix}${stem}-${n++}${ext}`;
   return name;
 }
 
 function statPoolFile(name) {
   try {
-    const st = fs.statSync(path.join(POOL_DIR, name));
+    const file = poolFilePath(name);
+    if (!file) return null;
+    const st = fs.statSync(file);
     return { size: st.size, mtime: st.mtimeMs };
   } catch {
     return null;
@@ -431,7 +442,7 @@ function readPoolTextForReview(item) {
   if (!item.file) return item.body || null; // 旧形式フォールバック
   if (!isTextPoolFile(item.file)) return null;
   try {
-    const full = fs.readFileSync(path.join(POOL_DIR, item.file), "utf8");
+    const full = fs.readFileSync(poolFilePath(item.file), "utf8");
     if (full.includes("\0")) return null;
     return full.length > 8000 ? full.slice(0, 8000) + `\n…（先頭8000文字のみ。全文は u2a2a/pool/${item.file} を参照）` : full;
   } catch {
@@ -456,20 +467,39 @@ function migratePoolItems() {
   }
 }
 
-// フォルダ監視: pool/ に直接置かれたファイル（エージェントの書き込みや Finder 投入）を自動登録
+// プール内のフォルダ一覧（相対パス）。スキャンごとに更新し、UI のツリー表示に使う
+let poolDirs = [];
+
+// フォルダ監視: pool/ 以下（サブフォルダ含む）のファイルを再帰的に自動登録
 function scanPoolDir() {
   let changed = false;
-  let names;
-  try {
-    names = fs.readdirSync(POOL_DIR);
-  } catch {
-    return false;
+  const files = [];
+  const dirs = [];
+  const walk = (dir, rel) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name.startsWith(".")) continue; // .trash / 隠しファイルは対象外
+      const childRel = rel ? rel + "/" + e.name : e.name;
+      if (e.isDirectory()) {
+        dirs.push(childRel);
+        walk(path.join(dir, e.name), childRel);
+      } else if (e.isFile()) {
+        files.push(childRel);
+      }
+    }
+  };
+  walk(POOL_DIR, "");
+  if (JSON.stringify(dirs) !== JSON.stringify(poolDirs)) {
+    poolDirs = dirs;
+    changed = true;
   }
   const known = new Set(state.pool.map((p) => p.file).filter(Boolean));
-  for (const name of names) {
-    if (name.startsWith(".")) continue;
-    const st = statPoolFile(name);
-    if (!st || !fs.statSync(path.join(POOL_DIR, name)).isFile()) continue;
+  for (const name of files) {
     if (!known.has(name)) {
       state.pool.push({
         id: id(),
@@ -479,7 +509,7 @@ function scanPoolDir() {
         via: "folder",
         status: "submitted",
         reviews: [],
-        ...st,
+        ...statPoolFile(name),
         ts: Date.now(),
       });
       changed = true;
@@ -588,7 +618,7 @@ async function runFix(itemId, agent) {
   actStart(actKey, NAMES[agent] + " 修正");
   // 修正前の版を .trash に世代バックアップ
   try {
-    fs.copyFileSync(path.join(POOL_DIR, item.file), path.join(POOL_TRASH, Date.now() + "-prefix-" + item.file));
+    fs.copyFileSync(poolFilePath(item.file), path.join(POOL_TRASH, Date.now() + "-prefix-" + item.file.replaceAll("/", "__")));
   } catch {
     // バックアップ失敗でも修正は続行
   }
@@ -854,15 +884,62 @@ async function handleApi(req, res, url) {
     return json(res, 201, created);
   }
 
+  // 新規フォルダ作成（Finder 風ブラウザ用）
+  if (req.method === "POST" && url.pathname === "/api/pool/mkdir") {
+    const body = await readBody(req);
+    const parent = typeof body.dir === "string" ? body.dir : "";
+    const seg = sanitizeSegment(body.name);
+    if (!seg) return json(res, 400, { error: "name は必須です" });
+    const rel = parent ? parent.replace(/\/+$/, "") + "/" + seg : seg;
+    const abs = poolFilePath(rel);
+    if (!abs) return json(res, 400, { error: "不正なフォルダ名です" });
+    fs.mkdirSync(abs, { recursive: true });
+    scanPoolDir();
+    touch();
+    return json(res, 201, { dir: rel });
+  }
+
+  // 新規（空）ファイル作成
+  if (req.method === "POST" && url.pathname === "/api/pool/newfile") {
+    const body = await readBody(req);
+    const dir = typeof body.dir === "string" ? body.dir : "";
+    const base = sanitizeSegment(body.name || "untitled.md");
+    if (!base) return json(res, 400, { error: "name は必須です" });
+    const name = uniquePoolName(base, dir);
+    const abs = poolFilePath(name);
+    if (!abs) return json(res, 400, { error: "不正なファイル名です" });
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, "");
+    const item = {
+      id: id(),
+      title: name,
+      file: name,
+      origin: "user",
+      via: "created",
+      status: "submitted",
+      reviews: [],
+      ...statPoolFile(name),
+      ts: Date.now(),
+    };
+    state.pool.push(item);
+    scanPoolDir();
+    touch();
+    return json(res, 201, item);
+  }
+
   // 共有タスクプール: テキスト持ち込み（pool/ に .md として保存。相手エージェントが自動レビュー）
   if (req.method === "POST" && url.pathname === "/api/pool") {
     const body = await readBody(req);
     const origin = AUTHORS.includes(body.origin) ? body.origin : null;
     const title = typeof body.title === "string" ? body.title.trim() : "";
     const text = typeof body.body === "string" ? body.body.trim() : "";
+    const dir = typeof body.dir === "string" ? body.dir : "";
     if (!origin || !title || !text) return json(res, 400, { error: "origin / title / body は必須です" });
-    const name = uniquePoolName(title + ".md");
-    fs.writeFileSync(path.join(POOL_DIR, name), text);
+    const name = uniquePoolName(title + ".md", dir);
+    const abs = poolFilePath(name);
+    if (!abs) return json(res, 400, { error: "不正な保存先です" });
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, text);
     const item = {
       id: id(),
       title,
@@ -889,8 +966,11 @@ async function handleApi(req, res, url) {
     const rawName = typeof body.filename === "string" && body.filename.trim() ? body.filename.trim() : "file";
     if (typeof body.dataBase64 !== "string") return json(res, 400, { error: "dataBase64 は必須です" });
     const data = Buffer.from(body.dataBase64, "base64");
-    const name = uniquePoolName(rawName);
-    fs.writeFileSync(path.join(POOL_DIR, name), data);
+    const name = uniquePoolName(rawName, typeof body.dir === "string" ? body.dir : "");
+    const absUp = poolFilePath(name);
+    if (!absUp) return json(res, 400, { error: "不正な保存先です" });
+    fs.mkdirSync(path.dirname(absUp), { recursive: true });
+    fs.writeFileSync(absUp, data);
     const item = {
       id: id(),
       title: typeof body.title === "string" && body.title.trim() ? body.title.trim() : rawName,
@@ -910,9 +990,9 @@ async function handleApi(req, res, url) {
     return json(res, 201, item);
   }
 
-  // プールファイルの取得（プレビュー・ダウンロード用）
+  // プールファイルの取得（プレビュー・ダウンロード用。サブフォルダのパスにも対応）
   if (req.method === "GET" && parts[0] === "api" && parts[1] === "pool" && parts[2] === "file" && parts[3]) {
-    const file = poolFilePath(decodeURIComponent(parts[3]));
+    const file = poolFilePath(decodeURIComponent(parts.slice(3).join("/")));
     if (!file || !fs.existsSync(file)) return json(res, 404, { error: "file not found" });
     const ext = path.extname(file).toLowerCase();
     const mime =
@@ -958,7 +1038,7 @@ async function handleApi(req, res, url) {
       // 実ファイルは消さず .trash へ退避（誤削除からの復元用）
       if (item.file) {
         try {
-          fs.renameSync(path.join(POOL_DIR, item.file), path.join(POOL_TRASH, Date.now() + "-" + item.file));
+          fs.renameSync(poolFilePath(item.file), path.join(POOL_TRASH, Date.now() + "-" + item.file.replaceAll("/", "__")));
         } catch {
           // ファイルが既にない場合はそのまま
         }

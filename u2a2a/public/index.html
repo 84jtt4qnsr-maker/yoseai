@@ -384,13 +384,28 @@
   #pool-list { flex: 1; overflow-y: auto; padding-bottom: 10px; }
   body.pool-collapsed #pool-list-wrap { border-right: none; }
   body.pool-collapsed #pool-detail { display: none; }
+  #pool-tools { display: flex; gap: 4px; align-items: center; margin-bottom: 2px; }
   #pool-search {
-    width: 100%;
+    flex: 1;
+    min-width: 0;
     padding: 4px 10px;
     font-size: 12.5px;
     border-radius: 6px;
-    margin-bottom: 4px;
   }
+  #pool-cwd {
+    font-size: 10.5px;
+    color: var(--dim);
+    font-family: ui-monospace, monospace;
+    padding: 1px 8px 3px;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #pool-cwd:hover { color: var(--text); }
+  .pf-row.folder .pf-name { font-family: inherit; color: var(--dim); font-weight: 600; }
+  .pf-row.folder.cwd .pf-name { color: var(--user); }
+  .pf-row .chev { flex: none; width: 10px; color: var(--dim); font-size: 10px; }
   .pf-row {
     display: flex;
     gap: 7px;
@@ -609,7 +624,12 @@
   </div>
   <div id="pool-body">
     <div id="pool-list-wrap">
-      <input id="pool-search" placeholder="🔍 ファイル検索" />
+      <div id="pool-tools">
+        <input id="pool-search" placeholder="🔍 ファイル検索" />
+        <button class="small" id="pool-newdir" title="新規フォルダ">📁+</button>
+        <button class="small" id="pool-newfile" title="新規ファイル">📄+</button>
+      </div>
+      <div id="pool-cwd" title="クリックでルートに戻る"></div>
       <div id="pool-list"></div>
     </div>
     <div id="pool-detail"></div>
@@ -949,6 +969,28 @@ function poolPreviewEl(p) {
 }
 
 let poolSelectedId = null;
+let poolCurrentDir = ""; // 新規作成の対象フォルダ（"" = ルート）
+const closedDirs = new Set(); // 閉じているフォルダ（既定は開）
+
+function fileRowEl(p, depth) {
+  const pending = (state.reviewPending || {})[p.id] || [];
+  const busy = pending.length || (state.fixPending || {})[p.id];
+  const base = (p.file || p.title).split("/").pop();
+  return el("div", {
+    class: "pf-row" + (p.id === poolSelectedId ? " sel" : ""),
+    style: "padding-left:" + (8 + depth * 14) + "px",
+    onclick: () => {
+      poolSelectedId = p.id;
+      poolCurrentDir = (p.file || "").includes("/") ? p.file.slice(0, p.file.lastIndexOf("/")) : "";
+      if (document.body.classList.contains("pool-collapsed")) togglePool(false);
+      renderPool();
+    },
+  }, [
+    el("span", { class: "pf-dot", "data-s": p.status, title: POOL_STATUS_LABEL[p.status] || p.status }),
+    el("span", { class: "pf-name", text: base + (busy ? " …" : ""), title: p.title }),
+    el("span", { class: "pf-size", text: fmtSize(p.size) }),
+  ]);
+}
 
 function renderPool() {
   const listBox = $("#pool-list");
@@ -959,29 +1001,58 @@ function renderPool() {
     ? all.filter((p) => (p.title + " " + (p.file || "") + " " + NAMES[p.origin]).toLowerCase().includes(q))
     : all;
   $("#pool-count").textContent = all.length ? (q ? items.length + "/" + all.length : all.length) + " 件" : "";
+  $("#pool-cwd").textContent = "作成先: pool/" + (poolCurrentDir ? poolCurrentDir + "/" : "");
 
-  // ファイルリスト
   listBox.replaceChildren();
-  if (!all.length) {
-    listBox.appendChild(el("div", { class: "empty", text: "成果物なし — u2a2a/pool/ に置くか「＋持ち込み」" }));
-  } else if (!items.length) {
-    listBox.appendChild(el("div", { class: "empty", text: "検索に一致なし" }));
-  }
   if (!items.some((p) => p.id === poolSelectedId)) poolSelectedId = items.length ? items[0].id : null;
-  for (const p of items) {
-    const pending = (state.reviewPending || {})[p.id] || [];
-    listBox.appendChild(el("div", {
-      class: "pf-row" + (p.id === poolSelectedId ? " sel" : ""),
-      onclick: () => {
-        poolSelectedId = p.id;
-        if (document.body.classList.contains("pool-collapsed")) togglePool(false);
-        renderPool();
-      },
-    }, [
-      el("span", { class: "pf-dot", "data-s": p.status, title: POOL_STATUS_LABEL[p.status] || p.status }),
-      el("span", { class: "pf-name", text: (p.file || p.title) + (pending.length ? " …" : ""), title: p.title }),
-      el("span", { class: "pf-size", text: fmtSize(p.size) }),
-    ]));
+
+  if (q) {
+    // 検索中はフラット表示（パス付き）
+    if (!items.length) listBox.appendChild(el("div", { class: "empty", text: "検索に一致なし" }));
+    for (const p of items) {
+      const row = fileRowEl(p, 0);
+      row.querySelector(".pf-name").textContent = p.file || p.title;
+      listBox.appendChild(row);
+    }
+  } else {
+    // Finder 風ツリー（フォルダ＋ファイル）
+    const dirs = state.poolDirs || [];
+    const byDir = (dir) => items.filter((p) => {
+      const f = p.file || "";
+      const parent = f.includes("/") ? f.slice(0, f.lastIndexOf("/")) : "";
+      return parent === dir;
+    });
+    const childDirs = (dir) => dirs.filter((d) => {
+      const parent = d.includes("/") ? d.slice(0, d.lastIndexOf("/")) : "";
+      return parent === dir && d !== dir;
+    });
+    const renderDir = (dir, depth) => {
+      for (const d of childDirs(dir)) {
+        const open = !closedDirs.has(d);
+        const name = d.split("/").pop();
+        listBox.appendChild(el("div", {
+          class: "pf-row folder" + (poolCurrentDir === d ? " cwd" : ""),
+          style: "padding-left:" + (8 + depth * 14) + "px",
+          title: "クリックで作成先に指定 ／ ▸で開閉",
+          onclick: () => {
+            if (poolCurrentDir === d) {
+              closedDirs.has(d) ? closedDirs.delete(d) : closedDirs.add(d);
+            }
+            poolCurrentDir = d;
+            renderPool();
+          },
+        }, [
+          el("span", { class: "chev", text: open ? "▾" : "▸" }),
+          el("span", { class: "pf-name", text: "📁 " + name }),
+        ]));
+        if (open) renderDir(d, depth + 1);
+      }
+      for (const p of byDir(dir)) listBox.appendChild(fileRowEl(p, depth));
+    };
+    renderDir("", 0);
+    if (!items.length && !dirs.length) {
+      listBox.appendChild(el("div", { class: "empty", text: "成果物なし — u2a2a/pool/ に置くか「＋持ち込み」" }));
+    }
   }
 
   // 詳細
@@ -1379,6 +1450,7 @@ $("#pool-create").addEventListener("click", async () => {
       title: title || file.name,
       filename: file.name,
       dataBase64: btoa(bin),
+      dir: poolCurrentDir,
       autoReview: $("#pool-autoreview").checked,
     });
   } else {
@@ -1387,6 +1459,7 @@ $("#pool-create").addEventListener("click", async () => {
       origin: $("#pool-origin").value,
       title,
       body,
+      dir: poolCurrentDir,
       fromMessageId: poolSourceMessageId,
       autoReview: $("#pool-autoreview").checked,
     });
@@ -1402,6 +1475,19 @@ function togglePool(collapse) {
 }
 $("#pool-toggle").addEventListener("click", () => togglePool());
 $("#pool-search").addEventListener("input", () => renderPool());
+$("#pool-cwd").addEventListener("click", () => { poolCurrentDir = ""; renderPool(); });
+$("#pool-newdir").addEventListener("click", () => {
+  const name = prompt("新規フォルダ名（作成先: pool/" + (poolCurrentDir ? poolCurrentDir + "/" : "") + "）");
+  if (!name || !name.trim()) return;
+  api("/api/pool/mkdir", "POST", { dir: poolCurrentDir, name: name.trim() })
+    .then((r) => { poolCurrentDir = r.dir; toast("フォルダを作成しました: " + r.dir); });
+});
+$("#pool-newfile").addEventListener("click", () => {
+  const name = prompt("新規ファイル名（作成先: pool/" + (poolCurrentDir ? poolCurrentDir + "/" : "") + "）", "untitled.md");
+  if (!name || !name.trim()) return;
+  api("/api/pool/newfile", "POST", { dir: poolCurrentDir, name: name.trim() })
+    .then((item) => { poolSelectedId = item.id; toast("ファイルを作成しました: " + item.file); });
+});
 
 let resultTask = null;
 function openResultDialog(t) {
