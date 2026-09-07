@@ -22,6 +22,13 @@ const POOL_DIR = path.join(__dirname, "pool");
 const POOL_TRASH = path.join(POOL_DIR, ".trash");
 // スレッド履歴の自動ミラー置き場（成果物アイテムとしては登録しないシステム領域）
 const POOL_THREADS = path.join(POOL_DIR, "threads");
+// トピック別成果物の保存先（合意: パスは完全 topicId で不変。タイトルは UI が state から表示）
+const topicDirRel = (topicId) => "topics/" + topicId;
+function ensureTopicDir(topicId) {
+  const abs = path.join(POOL_DIR, "topics", topicId);
+  fs.mkdirSync(path.join(abs, ".work"), { recursive: true }); // .work は中間生成物用（ドット除外で一覧に出ない）
+  return abs;
+}
 const PORT = Number(process.env.U2A2A_PORT || 4742);
 
 const AGENTS = ["claude", "codex"];
@@ -119,6 +126,39 @@ function loadState() {
       parsed.usageDay = parsed.usageDay || null;
       parsed.budgetHalt = parsed.budgetHalt || null;
       for (const m of parsed.messages) migrateMeta(m);
+      // schemaVersion 5: 既存プールアイテムへ所属（topicId）と作者（origin）を補完する
+      // （合意事項: 既存ファイルは動かさない。情報の補完のみ）
+      // 帰属訂正は「登録時刻の前後10分以内に、エージェント自身のレーンでパスに言及」した場合のみ
+      // （後からレビュー等で言及しただけのファイルを誤帰属しないため）
+      if (!parsed.schemaVersion || parsed.schemaVersion < 5) {
+        const msgById = new Map(parsed.messages.map((m) => [m.id, m]));
+        for (const item of parsed.pool) {
+          if (item.topicId === undefined) item.topicId = null;
+          // 所属: 由来メッセージ → そのトピック
+          if (!item.topicId && item.fromMessageId) {
+            const src = msgById.get(item.fromMessageId);
+            if (src) item.topicId = src.topicId || null;
+          }
+          // 帰属の再計算（v4 の緩い判定も含めてやり直す）
+          if (item.file && (item.via === "folder" || item.via === "agent")) {
+            const mention = parsed.messages.find(
+              (m) =>
+                (m.author === "claude" || m.author === "codex") &&
+                m.thread === m.author &&
+                m.text.includes("u2a2a/pool/" + item.file) &&
+                Math.abs(m.ts - item.ts) < 10 * 60 * 1000
+            );
+            if (mention) {
+              item.origin = mention.author;
+              item.via = "agent";
+              if (!item.topicId) item.topicId = mention.topicId || null;
+            } else if (item.via === "agent") {
+              item.origin = "user"; // v4 の誤帰属を取り消し
+              item.via = "folder";
+            }
+          }
+        }
+      }
       // schemaVersion 3: 散在フラグ（relayedFrom/qa/external/auto）→ 直交構造 provenance へ移行
       if (!parsed.schemaVersion || parsed.schemaVersion < 3) {
         for (const t of parsed.topics) {
@@ -185,7 +225,7 @@ function persistState() {
   const t0 = Date.now();
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    state.schemaVersion = 3;
+    state.schemaVersion = 5;
     const jsonStr = JSON.stringify(state, null, 2);
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, jsonStr);
@@ -477,6 +517,53 @@ function readBody(req, limit = 1_000_000) {
   });
 }
 
+// ---- 共通ルール（pool/U2A2A_RULES.md）----
+// アプリ専用の CLAUDE.md × AGENTS.md。DAS 内に住むのでユーザーはプールから閲覧・編集でき、
+// エージェントはパスで参照できる。CLI のネイティブ読み込みには依存せず、サーバが全プロンプト経路へ注入する
+const RULES_FILE = path.join(POOL_DIR, "U2A2A_RULES.md");
+const DEFAULT_RULES = `# U2A2A 共通ルール
+
+このファイルは U2A2A オーケストレーションの全エージェント（Claude Code / Codex）に、
+通常応答・レビュー・修正のすべての実行で自動的に読み込まれます。編集すれば次の実行から反映されます。
+
+## 役割（実行種別ごと）
+
+- **通常応答**: 三者の対話。簡潔に。実装作業の提案はするが、大きな作業はタスク化をユーザーに委ねる
+- **レビュー**: 忖度なく具体的に。リポジトリの実態と突き合わせ、行番号や数値の根拠を示す
+- **修正**: レビューの妥当な指摘に対応し、誤った指摘には従わず理由を述べる
+
+## パスの規約
+
+- パスは常に \`u2a2a/pool/\` 起点で書く（本文に書けばアプリがインライン表示する）
+- 成果物はトピック別フォルダ \`u2a2a/pool/topics/<topicId>/\` に保存する
+- 中間生成物・一時ファイルは \`.work/\` サブフォルダへ（一覧に表示されない）
+- 他スレッドの経緯は \`u2a2a/pool/threads/\` のミラーで参照できる
+
+## 成果物の提出
+
+- 保存したら本文にパスを列挙する（何をどこに置いたか）
+- 実行可能なもの（スクリプト等）は再実行方法を一行添える
+`;
+let rulesCache = { mtime: 0, text: "" };
+
+function commonRulesBlock(kind) {
+  try {
+    if (!fs.existsSync(RULES_FILE)) fs.writeFileSync(RULES_FILE, DEFAULT_RULES);
+    const st = fs.statSync(RULES_FILE);
+    if (st.mtimeMs !== rulesCache.mtime) {
+      rulesCache = { mtime: st.mtimeMs, text: fs.readFileSync(RULES_FILE, "utf8").slice(0, 4000) };
+    }
+    return (
+      `\n\n--- U2A2A 共通ルール（u2a2a/pool/U2A2A_RULES.md／実行種別: ${kind}）---\n` +
+      rulesCache.text +
+      `\n--- 共通ルールここまで ---`
+    );
+  } catch (e) {
+    logEvent("cli", "U2A2A_RULES.md の読み込みに失敗: " + (e.message || e), "warn");
+    return "";
+  }
+}
+
 // ---- agent CLI runners ----
 const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
 const OTHER = { claude: "codex", codex: "claude" };
@@ -584,22 +671,23 @@ function buildPrompt(topic, agent, msgs, isFirst) {
       `${QA_END_MARK} は、相手の見解を少なくとも一度聞いた上で合意・結論に達した場合のみ、応答の末尾に書いてください。` +
       `相手がまだ発言していない段階での終了宣言は無効です。残り自動中継 ${topic.relay.remaining} 手）`
     : "";
+  const saveDir = `u2a2a/pool/${topicDirRel(topic.id)}`;
   const artifactNote =
     agent === "claude"
-      ? `\n\n（成果物ファイルは u2a2a/pool/ 配下にのみ保存できます（他への書き込みは不許可）。` +
-        `画像・音声・動画は python3 / ffmpeg を実行して生成できます（PNG/GIF/MP4/WAV 等。保存先は必ず u2a2a/pool/ 配下）。` +
-        `保存したら本文にそのパスを書いてください — アプリが画像・動画・音声をインライン表示します）`
-      : `\n\n（カレントディレクトリ（u2a2a/pool/ = 成果物置き場）にのみファイルを保存できます。` +
-        `python3 / ffmpeg を実行して画像・音声・動画（PNG/GIF/MP4/WAV 等）を生成できます。` +
+      ? `\n\n（成果物ファイルの保存先は ${saveDir}/ です（書き込みは u2a2a/pool/ 配下のみ許可）。` +
+        `中間生成物は ${saveDir}/.work/ へ。画像・音声・動画は python3 / ffmpeg で生成できます。` +
+        `保存したら本文にそのパスを書いてください — アプリがインライン表示します）`
+      : `\n\n（カレントディレクトリ＝ ${saveDir}/ が成果物の保存先です（書き込みはここのみ）。` +
+        `中間生成物は .work/ へ。python3 / ffmpeg で画像・音声・動画を生成できます。` +
         `リポジトリ本体は ${REPO_ROOT} を絶対パスで参照（閲覧のみ）。` +
-        `保存したら本文に u2a2a/pool/〜 のパスを書いてください — アプリがインライン表示します。` +
+        `保存したら本文に ${saveDir}/〜 のパスを書いてください — アプリがインライン表示します。` +
         `短い SVG 等は本文のコードブロックでも構いません）`;
   // キャンセル等で新セッションになった場合、保存済み要約で文脈を再注入する
   const contextNote =
     isFirst && topic.summaryText && state.messages.some((m) => m.topicId === topic.id)
       ? `\n\n--- これまでのスレッドの要約（新しいセッションのための文脈） ---\n${topic.summaryText}\n`
       : "";
-  return preamble + contextNote + lines + qaNote + artifactNote;
+  return preamble + contextNote + lines + qaNote + artifactNote + commonRulesBlock("通常応答");
 }
 
 // 質疑モード: エージェントの応答完了を待って相手スレッドへ中継する（トピック単位）
@@ -867,6 +955,12 @@ function uniquePoolName(base, dir = "") {
   return name;
 }
 
+// パス topics/<id>/… から所属トピックを導出（登録時の初期値。以後 file を動かしても topicId は不変）
+function topicIdFromPath(rel) {
+  const m = /^topics\/([0-9a-f]{16})\//.exec(rel || "");
+  return m && findTopic(m[1]) ? m[1] : null;
+}
+
 function statPoolFile(name) {
   try {
     const file = poolFilePath(name);
@@ -947,12 +1041,18 @@ function scanPoolDir() {
   const known = new Set(state.pool.map((p) => p.file).filter(Boolean));
   for (const name of files) {
     if (!known.has(name)) {
+      const tid = topicIdFromPath(name);
+      // 帰属判定: 該当トピックで実行中（or 直近）の run があれば、その agent の成果物として記録
+      const run = Object.values(runs).find(
+        (r) => (r.kind === "thread" && tid && r.topicId === tid) || (r.kind === "fix" && !tid)
+      );
       state.pool.push({
         id: id(),
         title: name,
         file: name,
-        origin: "user",
-        via: "folder",
+        origin: run ? run.agent : "user",
+        via: run ? "agent" : "folder",
+        topicId: tid,
         status: "submitted",
         reviews: [],
         ...statPoolFile(name),
@@ -1004,7 +1104,8 @@ function buildReviewPrompt(item, reviewer) {
     `- 既存の実装や他タスク・プール内の他成果物との重複、不要な作業の兆候があれば指摘する\n` +
     `- 良い点は簡潔に認める\n` +
     `- 最後に必ず1行、次の形式で判定を書く: 【判定】承認 / 条件付き承認 / 差し戻し\n\n` +
-    contentPart
+    contentPart +
+    commonRulesBlock("レビュー")
   );
 }
 
@@ -1060,7 +1161,8 @@ function buildFixPrompt(item, agent) {
     `- 妥当な指摘には対応する\n` +
     `- 誤っている・過剰な指摘には従わず、応答で理由を述べる\n` +
     `- ファイル保存を済ませてから、応答として「何をどう直したか／直さなかったか」の要約を簡潔に書く\n\n` +
-    (reviews || "（レビューはまだありません。成果物の品質を自己点検して改善してください）")
+    (reviews || "（レビューはまだありません。成果物の品質を自己点検して改善してください）") +
+    commonRulesBlock("修正")
   );
 }
 
@@ -1342,7 +1444,7 @@ async function agentLoop(topicId, agent) {
         const opts =
           agent === "claude"
             ? { extraArgs: ["--allowedTools", "Write(u2a2a/pool/**)", "Edit(u2a2a/pool/**)", "Bash(python3:*)", "Bash(ffmpeg:*)"] }
-            : { writeDir: POOL_DIR, resumeWritable: !!ta.codexPoolCwd };
+            : { writeDir: ensureTopicDir(topicId), resumeWritable: !!ta.codexPoolCwd };
         opts.ctl = run.ctl;
         opts.onSessionId = (sid) => (run.sessionId = sid); // 早期捕捉（キャンセル時に interrupted として保持）
         const { text, sessionId, model, meta } = await call(prompt, ta.sessionId, a.modelOverride, (s) => actStep(actKey, s), opts);
@@ -1773,6 +1875,7 @@ async function handleApi(req, res, url) {
       title: name,
       file: name,
       origin: "user",
+      topicId: topicIdFromPath(name),
       via: "created",
       status: "submitted",
       reviews: [],
@@ -1791,7 +1894,12 @@ async function handleApi(req, res, url) {
     const origin = AUTHORS.includes(body.origin) ? body.origin : null;
     const title = typeof body.title === "string" ? body.title.trim() : "";
     const text = typeof body.body === "string" ? body.body.trim() : "";
-    const dir = typeof body.dir === "string" ? body.dir : "";
+    const bodyTopic = findTopic(body.topicId) || state.topics[0];
+    let dir = typeof body.dir === "string" ? body.dir : "";
+    if (!dir && bodyTopic) {
+      dir = topicDirRel(bodyTopic.id); // 既定はトピック別フォルダ（合意事項）
+      ensureTopicDir(bodyTopic.id);
+    }
     if (!origin || !title || !text) return json(res, 400, { error: "origin / title / body は必須です" });
     // filename 指定があれば拡張子ごと尊重（コードブロック保存用）。なければ .md
     const fname =
@@ -1806,6 +1914,7 @@ async function handleApi(req, res, url) {
       title,
       file: name,
       origin,
+      topicId: topicIdFromPath(name) || (bodyTopic ? bodyTopic.id : null),
       status: "submitted",
       reviews: [],
       fromMessageId: typeof body.fromMessageId === "string" ? body.fromMessageId : null,
@@ -1827,7 +1936,13 @@ async function handleApi(req, res, url) {
     const rawName = typeof body.filename === "string" && body.filename.trim() ? body.filename.trim() : "file";
     if (typeof body.dataBase64 !== "string") return json(res, 400, { error: "dataBase64 は必須です" });
     const data = Buffer.from(body.dataBase64, "base64");
-    const name = uniquePoolName(rawName, typeof body.dir === "string" ? body.dir : "");
+    const upTopic = findTopic(body.topicId) || state.topics[0];
+    let upDir = typeof body.dir === "string" ? body.dir : "";
+    if (!upDir && upTopic) {
+      upDir = topicDirRel(upTopic.id);
+      ensureTopicDir(upTopic.id);
+    }
+    const name = uniquePoolName(rawName, upDir);
     const absUp = poolFilePath(name);
     if (!absUp) return json(res, 400, { error: "不正な保存先です" });
     fs.mkdirSync(path.dirname(absUp), { recursive: true });
@@ -1837,6 +1952,7 @@ async function handleApi(req, res, url) {
       title: typeof body.title === "string" && body.title.trim() ? body.title.trim() : rawName,
       file: name,
       origin,
+      topicId: topicIdFromPath(name) || (upTopic ? upTopic.id : null),
       via: "upload",
       status: "submitted",
       reviews: [],
@@ -2075,5 +2191,5 @@ saveState();
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`U2A2A Orchestration: http://127.0.0.1:${PORT}`);
-  logEvent("system", "サーバー起動（schemaVersion 3）", "info");
+  logEvent("system", "サーバー起動（schemaVersion 5）", "info");
 });

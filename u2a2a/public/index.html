@@ -1622,7 +1622,13 @@ function renderPool() {
     const renderDir = (dir, depth) => {
       for (const d of childDirs(dir)) {
         const open = !closedDirs.has(d);
-        const name = d.split("/").pop();
+        let name = d.split("/").pop();
+        // topics/<id> はトピックタイトルで表示（パスは不変・表示だけ state から）
+        if (d === "topics") name = "topics（トピック別成果物）";
+        else if (/^topics\/[0-9a-f]{16}$/.test(d)) {
+          const tp = (state.topics || []).find((x) => x.id === name);
+          name = tp ? "🧵 " + tp.title : name.slice(0, 8) + "…（削除済みトピック）";
+        }
         const folderRow = el("div", {
           class: "pf-row folder" + (poolCurrentDir === d ? " cwd" : ""),
           "data-dir": d,
