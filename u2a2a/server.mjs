@@ -717,6 +717,12 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "") {
           `[${NAMES[m.author]}] ${m.text}`
         );
       }
+      if (m.test) {
+        return (
+          `【テスト送信 — 明示された生成・操作は行ってよいが、そこから追加調査・実装へは広げないこと】\n` +
+          `[${NAMES[m.author]}] ${m.text}`
+        );
+      }
       return `[${NAMES[m.author]}] ${m.text}`;
     })
     .join("\n\n");
@@ -1322,12 +1328,14 @@ async function summarizeTopic(topicId) {
       `以下は「U2A2Aオーケストレーション」のスレッド「${topic.title}」の会話です。` +
       (topic.summaryText ? `\n\n--- 前回までの要約 ---\n${topic.summaryText}\n` : "") +
       `\n--- 会話（直近・抜粋） ---\n${lines}\n\n--- 指示 ---\n` +
-      `このスレッドの現況要約を日本語・最大10行の箇条書きで書いてください。` +
-      `決定事項・未決の論点・生成された成果物（u2a2a/pool/ パス）を優先。前置きなしで要約本文のみを出力。`;
+      `このスレッドの現況要約を日本語・最大12行で書いてください。` +
+      `必ず「## 合意済み」「## 未決」の2見出しで構造化し、生成された成果物（u2a2a/pool/ パス）は合意済み側に含める。` +
+      `前置きなしで要約本文のみを出力。`;
     const { text } = await callClaude(prompt, null, "haiku");
     topic.summaryText = text.trim();
     topic.summaryAt = msgs.length;
     topic.summaryTs = Date.now();
+    topic.summaryLastMsgId = msgs[msgs.length - 1].id; // 「どこまでを対象にした要約か」を固定
     touch();
   } catch (e) {
     logEvent("summary", `スレッド要約の生成に失敗（${topic.title}）: ` + (e.message || e), "warn");
@@ -1545,6 +1553,15 @@ async function agentLoop(topicId, agent) {
           ts: Date.now(),
         };
         state.messages.push(replyMsg);
+        // 質疑の論点が未定なら、先手の応答冒頭の起案を採用（ユーザーは qa バーで修正可能）
+        if (topic.relay.active && !topic.relay.agenda) {
+          // 「今回決めること: 〜」形式にも「## 今回決めること」見出し＋次行にも対応
+          const am = text.match(/今回決めること[:：]?[ \t]*\n*[-*\s]*([^\n]+)/);
+          if (am) {
+            const clean = am[1].replace(/\*\*/g, "").replace(/^[#\-\s]+/, "").trim();
+            if (clean) topic.relay.agenda = clean.slice(0, 120);
+          }
+        }
         ta.fileSnapshot = curSnapshot; // 変更通知の基準を今回時点へ進める
         markTranscriptSynced(topic, agent); // 自分の応答分は外部同期の対象外にする
         qaHop(topic, agent, text, replyMsg.id);
@@ -1684,6 +1701,7 @@ async function handleApi(req, res, url) {
       author,
       text,
       provenance: { ingress: "ui", delivery: "direct", trigger: "manual", source: null },
+      test: body.test === true || undefined, // テスト送信印（明示された操作のみ・追加調査へ広げない）
       ts: Date.now(),
     }));
     state.messages.push(...created);
@@ -2120,7 +2138,13 @@ async function handleApi(req, res, url) {
       return json(res, 400, { error: "質疑モードには両スレッドの自動応答をONにしてください" });
     const qaTopic = findTopic(body.topicId) || state.topics[0];
     if (!qaTopic) return json(res, 400, { error: "トピックがありません" });
-    qaTopic.relay = { active: true, remaining: hops, hopsDone: 0, startMessageId: null };
+    qaTopic.relay = {
+      active: true,
+      remaining: hops,
+      hopsDone: 0,
+      startMessageId: null,
+      agenda: typeof body.agenda === "string" ? body.agenda.trim().slice(0, 120) : "",
+    };
     qaTopic.qaCount = (qaTopic.qaCount || 0) + 1;
     const msg = {
       id: id(),
@@ -2136,6 +2160,16 @@ async function handleApi(req, res, url) {
     touch();
     agentLoop(qaTopic.id, first);
     return json(res, 201, { relay: qaTopic.relay });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/qa/agenda") {
+    const body = await readBody(req);
+    const t = findTopic(body.topicId) || state.topics[0];
+    if (t && t.relay.active) {
+      t.relay.agenda = typeof body.agenda === "string" ? body.agenda.trim().slice(0, 120) : "";
+      touch();
+    }
+    return json(res, 200, { agenda: t ? t.relay.agenda : "" });
   }
 
   if (req.method === "POST" && url.pathname === "/api/qa/stop") {

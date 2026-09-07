@@ -747,7 +747,9 @@
     <option value="qa-claude">🗨 質疑（Claude先手）</option>
     <option value="qa-codex">🗨 質疑（Codex先手）</option>
   </select>
+  <input id="qa-agenda" placeholder="今回決めること（空欄=先手が起案）" title="質疑の論点。空欄ならリレー開始側のエージェントが起案し、進行中にバーから修正できます" hidden style="width:220px" />
   <input id="qa-hops" type="number" min="1" max="20" value="6" title="自動中継の上限手数" hidden />
+  <label class="auto-ctl" id="test-mark-wrap" title="テスト送信: エージェントは明示された生成・操作は行うが、追加調査・実装へは広げない"><input type="checkbox" id="test-mark" />🧪</label>
   <button id="user-attach" title="ファイルを添付（プールの attachments/ に保存されます）">📎</button>
   <input id="attach-input" type="file" multiple hidden />
   <button id="user-send">送信</button>
@@ -758,6 +760,7 @@
 </div>
 <div id="qa-bar" hidden>
   <span id="qa-status"></span>
+  <input id="qa-agenda-edit" title="今回決めること（編集すると次の中継から反映）" style="width:260px;padding:2px 8px;font-size:12px" />
   <button id="qa-stop" class="small">質疑を停止</button>
 </div>
 
@@ -1921,7 +1924,10 @@ function renderQaBar() {
   const bar = $("#qa-bar");
   bar.hidden = !r.active;
   if (r.active) {
-    $("#qa-status").textContent = "🗨 質疑モード進行中 — 残り自動中継 " + r.remaining + " 手（各応答の完了を待って相手へ中継します）";
+    $("#qa-status").textContent = "🗨 質疑中 — 残り " + r.remaining + " 手";
+    const inp = $("#qa-agenda-edit");
+    inp.placeholder = "今回決めること（先手が起案中…）";
+    if (document.activeElement !== inp) inp.value = r.agenda || "";
   }
 }
 
@@ -2007,6 +2013,7 @@ function renderThread(agent) {
           : "（" + NAMES[pv.source.agent] + "スレッドから転送）",
       }));
     if (m.taskId) meta.appendChild(el("span", { text: "（タスク結果）" }));
+    if (m.test) meta.appendChild(el("span", { text: "（🧪テスト）" }));
     if (pv.trigger === "auto" && !m.cancelled && !m.budget) meta.appendChild(el("span", { text: "（自動応答）" }));
     if (pv.delivery === "qa-relay") meta.appendChild(el("span", { text: "（質疑）" }));
     if (pv.ingress === "cli-sync") meta.appendChild(el("span", { text: "（外部セッションから同期）" }));
@@ -2201,9 +2208,19 @@ function sendUser() {
   const target = $("#user-target").value;
   const topicId = (currentTopic() || {}).id;
   const req = target.startsWith("qa-")
-    ? api("/api/qa/start", "POST", { first: target.slice(3), text, hops: Number($("#qa-hops").value) || 6, topicId })
-    : api("/api/messages", "POST", { thread: target, author: "user", text, topicId });
-  req.then(() => { $("#user-text").value = ""; });
+    ? api("/api/qa/start", "POST", {
+        first: target.slice(3),
+        text,
+        hops: Number($("#qa-hops").value) || 6,
+        agenda: $("#qa-agenda").value,
+        topicId,
+      })
+    : api("/api/messages", "POST", { thread: target, author: "user", text, topicId, test: $("#test-mark").checked });
+  req.then(() => {
+    $("#user-text").value = "";
+    $("#qa-agenda").value = "";
+    $("#test-mark").checked = false;
+  });
 }
 
 function sendAgent(agent) {
@@ -2589,9 +2606,14 @@ document.addEventListener("scroll", closeCtxMenu, true);
 // ---- wiring ----
 $("#user-send").addEventListener("click", sendUser);
 $("#user-target").addEventListener("change", () => {
-  $("#qa-hops").hidden = !$("#user-target").value.startsWith("qa-");
+  const isQa = $("#user-target").value.startsWith("qa-");
+  $("#qa-hops").hidden = !isQa;
+  $("#qa-agenda").hidden = !isQa;
 });
 $("#qa-stop").addEventListener("click", () => api("/api/qa/stop", "POST", { topicId: (currentTopic() || {}).id }));
+$("#qa-agenda-edit").addEventListener("change", (e) =>
+  api("/api/qa/agenda", "POST", { topicId: (currentTopic() || {}).id, agenda: e.target.value })
+    .then(() => toast("論点を更新しました（次の中継から反映）")));
 $("#budget-resume").addEventListener("click", () =>
   api("/api/budgets/resume", "POST", {}).then(() => toast("上限停止を解除し、自動応答を再開しました"))
 );
