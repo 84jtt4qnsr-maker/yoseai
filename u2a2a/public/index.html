@@ -870,7 +870,7 @@
 const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
 const OTHER = { claude: "codex", codex: "claude" };
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
-let state = { messages: [], tasks: [], pool: [], topics: [], agents: {}, running: {}, reviewPending: {}, fixPending: {}, activity: {} };
+let state = { messages: [], tasks: [], pool: [], topics: [], agents: {}, running: {}, reviewPending: {}, fixPending: {}, activity: {}, runs: [] };
 
 // ---- トピック（スレッド）----
 let currentTopicId = localStorage.getItem("u2a2a-topic") || null;
@@ -993,11 +993,21 @@ function fmtElapsed(ms) {
 
 // 実行中 CLI の実況ボックス
 function activityEl(a) {
+  const head = el("div", { class: "a-head" }, [
+    el("span", { class: "a-label", text: "⏳ " + a.label + " 実行中" }),
+    el("span", { class: "elapsed", "data-started": a.startedAt, text: fmtElapsed(Date.now() - a.startedAt) }),
+  ]);
+  const run = a.runId ? (state.runs || []).find((r) => r.runId === a.runId) : null;
+  if (run && run.kind === "thread") {
+    head.appendChild(el("button", {
+      class: "small danger",
+      text: "⏹ 停止",
+      onclick: () => api("/api/runs/" + run.runId + "/cancel", "POST", {})
+        .then(() => toast("停止を要求しました（SIGTERM→3秒でSIGKILL）")),
+    }));
+  }
   const box = el("div", { class: "activity" }, [
-    el("div", { class: "a-head" }, [
-      el("span", { class: "a-label", text: "⏳ " + a.label + " 実行中" }),
-      el("span", { class: "elapsed", "data-started": a.startedAt, text: fmtElapsed(Date.now() - a.startedAt) }),
-    ]),
+    head,
     el("div", { class: "a-step", text: a.step || "" }),
   ]);
   const past = (a.steps || []).slice(0, -1).slice(-3);
@@ -1775,6 +1785,26 @@ function renderAgentStatus(agent) {
   const status = $("#status-" + agent);
   const checkbox = $("#auto-" + agent);
   checkbox.checked = !!a.auto;
+  // キャンセルで中断したセッションがあれば再開ボタンを出す
+  const ta = ((currentTopic() || {}).agents || {})[agent] || {};
+  const resetBtn = $("#reset-" + agent);
+  let resumeBtn = document.getElementById("resume-int-" + agent);
+  if (ta.interruptedSessionId && !resumeBtn) {
+    resumeBtn = el("button", {
+      id: "resume-int-" + agent,
+      class: "small",
+      text: "↩ 中断分を再開",
+      title: "キャンセルで中断した CLI セッションを明示的に再開する",
+      onclick: () => {
+        const t = currentTopic();
+        if (t) api("/api/topics/" + t.id, "PATCH", { resumeInterrupted: agent })
+          .then(() => toast(NAMES[agent] + " の中断セッションを再開設定しました"));
+      },
+    });
+    resetBtn.after(resumeBtn);
+  } else if (!ta.interruptedSessionId && resumeBtn) {
+    resumeBtn.remove();
+  }
   const modelInput = $("#model-" + agent);
   modelInput.placeholder = a.model || "model（既定）";
   // 入力中に SSE 更新で上書きしない
@@ -1825,6 +1855,7 @@ function renderThread(agent) {
     if (m.auto) meta.appendChild(el("span", { text: "（自動応答）" }));
     if (m.qa) meta.appendChild(el("span", { text: "（質疑）" }));
     if (m.external) meta.appendChild(el("span", { text: "（外部セッションから同期）" }));
+    if (m.cancelled) meta.appendChild(el("span", { text: "（キャンセル）" }));
 
     const isRaw = rawView.has(m.id);
     const actions = el("div", { class: "actions" }, [

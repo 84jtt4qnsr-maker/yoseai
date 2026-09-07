@@ -237,11 +237,29 @@ const reviewPending = {};
 // itemId -> 修正中エージェント名（1件につき同時1修正。永続化しない）
 const fixPending = {};
 
+// 共通実行レジストリ（合意事項: thread/review/fix を一元登録。永続化しない）
+// runs[runId] = { runId, kind, agent, topicId?, itemId?, startedAt, ctl, sessionId? }
+const runs = {};
+
+function startRun(kind, agent, ids = {}) {
+  const run = { runId: id(), kind, agent, ...ids, startedAt: Date.now(), ctl: {} };
+  runs[run.runId] = run;
+  return run;
+}
+
+function endRun(runId) {
+  delete runs[runId];
+}
+
+function publicRuns() {
+  return Object.values(runs).map(({ ctl, ...r }) => r);
+}
+
 // 実行中 CLI の進捗実況（永続化しない）。key: "thread:claude" / "review:<itemId>:<reviewer>"
 const activity = {};
 
-function actStart(key, label) {
-  activity[key] = { label, step: "CLI 起動中…", startedAt: Date.now(), steps: [] };
+function actStart(key, label, runId = null) {
+  activity[key] = { label, step: "CLI 起動中…", startedAt: Date.now(), steps: [], runId };
   broadcast();
 }
 
@@ -260,7 +278,8 @@ function actEnd(key) {
 }
 
 function publicState() {
-  return { ...state, running, reviewPending, fixPending, activity, poolDirs };
+  // running / reviewPending / fixPending は互換用の派生値。正は runs レジストリ
+  return { ...state, running, reviewPending, fixPending, activity, poolDirs, runs: publicRuns() };
 }
 
 function broadcast() {
@@ -313,9 +332,34 @@ function spawnEnv() {
   return { ...process.env, PATH: [process.env.PATH, ...extra].filter(Boolean).join(":") };
 }
 
-function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = null, cwd = REPO_ROOT) {
+// プロセスグループごとシグナル送信（ツール実行の子孫プロセスも道連れにする）
+function killTree(child, sig) {
+  try {
+    process.kill(-child.pid, sig);
+  } catch {
+    try {
+      child.kill(sig);
+    } catch {
+      // 既に終了している
+    }
+  }
+}
+
+function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = null, cwd = REPO_ROOT, ctl = null) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd, env: spawnEnv(), stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(cmd, args, { cwd, env: spawnEnv(), stdio: ["pipe", "pipe", "pipe"], detached: true });
+    let closed = false;
+    if (ctl) {
+      // キャンセル: SIGTERM → 3秒猶予 → SIGKILL 昇格
+      ctl.cancel = () => {
+        if (closed || ctl.cancelled) return;
+        ctl.cancelled = true;
+        killTree(child, "SIGTERM");
+        setTimeout(() => {
+          if (!closed) killTree(child, "SIGKILL");
+        }, 3000);
+      };
+    }
     child.stdin.on("error", () => {});
     child.stdin.end(stdinData);
     let out = "", err = "", lineBuf = "";
@@ -335,18 +379,20 @@ function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = nul
       });
     }
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      killTree(child, "SIGKILL");
       err += `\n(タイムアウト: ${timeoutMs / 1000}秒)`;
     }, timeoutMs);
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
     child.on("error", (e) => {
+      closed = true;
       clearTimeout(timer);
-      resolve({ code: -1, out, err: String(e.message || e) });
+      resolve({ code: -1, out, err: String(e.message || e), cancelled: !!(ctl && ctl.cancelled) });
     });
     child.on("close", (code) => {
+      closed = true;
       clearTimeout(timer);
-      resolve({ code, out, err });
+      resolve({ code, out, err, cancelled: !!(ctl && ctl.cancelled) });
     });
   });
 }
@@ -379,7 +425,12 @@ function buildPrompt(topic, agent, msgs, isFirst) {
         `リポジトリ本体は ${REPO_ROOT} を絶対パスで参照（閲覧のみ）。` +
         `保存したら本文に u2a2a/pool/〜 のパスを書いてください — アプリがインライン表示します。` +
         `短い SVG 等は本文のコードブロックでも構いません）`;
-  return preamble + lines + qaNote + artifactNote;
+  // キャンセル等で新セッションになった場合、保存済み要約で文脈を再注入する
+  const contextNote =
+    isFirst && topic.summaryText && state.messages.some((m) => m.topicId === topic.id)
+      ? `\n\n--- これまでのスレッドの要約（新しいセッションのための文脈） ---\n${topic.summaryText}\n`
+      : "";
+  return preamble + contextNote + lines + qaNote + artifactNote;
 }
 
 // 質疑モード: エージェントの応答完了を待って相手スレッドへ中継する（トピック単位）
@@ -450,13 +501,15 @@ async function callClaude(prompt, sessionId, modelOverride, onStep, opts = {}) {
     } catch {
       return;
     }
+    if (ev.type === "system" && ev.subtype === "init" && ev.session_id && opts.onSessionId) opts.onSessionId(ev.session_id);
     if (ev.type === "result") result = ev;
     else if (onStep) {
       const s = claudeStepFrom(ev);
       if (s) onStep(s);
     }
   };
-  const { code, err, out } = await runCli("claude", args, prompt, AGENT_TIMEOUT_MS, onLine, opts.cwd);
+  const { code, err, out, cancelled } = await runCli("claude", args, prompt, AGENT_TIMEOUT_MS, onLine, opts.cwd, opts.ctl);
+  if (cancelled) throw Object.assign(new Error("キャンセルされました"), { cancelled: true });
   if (!result && code !== 0) throw new Error((err || out || "claude CLI エラー").trim().slice(0, 500));
   if (!result) throw new Error("claude: 結果イベントを受信できませんでした");
   if (result.is_error) throw new Error(String(result.result || "claude エラー").slice(0, 500));
@@ -511,6 +564,7 @@ function codexStepFrom(ev) {
 async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
   const t0 = Date.now();
   const usage = { inTok: 0, outTok: 0, cacheTok: 0 };
+  let earlySessionId = sessionId || null;
   const outFile = path.join(os.tmpdir(), `u2a2a-codex-${id()}.txt`);
   const base = ["--json", "-o", outFile, "--skip-git-repo-check"];
   // resume は -s / -C を受け付けない（cwd は元セッションから継承）。sandbox は config 経由で明示する。
@@ -535,12 +589,18 @@ async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
       usage.outTok += ev.usage.output_tokens || 0;
       usage.cacheTok += ev.usage.cached_input_tokens || 0;
     }
+    // thread ID は開始イベントで早期捕捉（キャンセル時も interrupted として保持できる）
+    if (ev.type === "thread.started" && ev.thread_id) {
+      earlySessionId = ev.thread_id;
+      if (opts.onSessionId) opts.onSessionId(ev.thread_id);
+    }
     if (onStep) {
       const s = codexStepFrom(ev);
       if (s) onStep(s);
     }
   };
-  const { code, out, err } = await runCli("codex", args, prompt, AGENT_TIMEOUT_MS, onLine);
+  const { code, out, err, cancelled } = await runCli("codex", args, prompt, AGENT_TIMEOUT_MS, onLine, REPO_ROOT, opts.ctl);
+  if (cancelled) throw Object.assign(new Error("キャンセルされました"), { cancelled: true, sessionId: earlySessionId });
   let text = "";
   try {
     text = fs.readFileSync(outFile, "utf8").trim();
@@ -755,7 +815,8 @@ async function runReview(itemId, reviewer) {
   if (item.status === "submitted") item.status = "reviewing";
   touch();
   const actKey = "review:" + itemId + ":" + reviewer;
-  actStart(actKey, NAMES[reviewer] + " レビュー");
+  const run = startRun("review", reviewer, { itemId });
+  actStart(actKey, NAMES[reviewer] + " レビュー", run.runId);
   try {
     const call = reviewer === "claude" ? callClaude : callCodex;
     const { text, meta } = await call(buildReviewPrompt(item, reviewer), null, state.agents[reviewer].modelOverride, (s) => actStep(actKey, s));
@@ -770,6 +831,7 @@ async function runReview(itemId, reviewer) {
       ts: Date.now(),
     });
   } finally {
+    endRun(run.runId);
     actEnd(actKey);
     reviewPending[itemId] = (reviewPending[itemId] || []).filter((r) => r !== reviewer);
     if (!reviewPending[itemId].length) delete reviewPending[itemId];
@@ -800,7 +862,8 @@ async function runFix(itemId, agent) {
   if (!item || !item.file || fixPending[itemId]) return;
   fixPending[itemId] = agent;
   const actKey = "fix:" + itemId;
-  actStart(actKey, NAMES[agent] + " 修正");
+  const run = startRun("fix", agent, { itemId });
+  actStart(actKey, NAMES[agent] + " 修正", run.runId);
   // 修正前の版を .trash に世代バックアップ
   try {
     fs.copyFileSync(poolFilePath(item.file), path.join(POOL_TRASH, Date.now() + "-prefix-" + item.file.replaceAll("/", "__")));
@@ -837,6 +900,7 @@ async function runFix(itemId, agent) {
       ts: Date.now(),
     });
   } finally {
+    endRun(run.runId);
     actEnd(actKey);
     delete fixPending[itemId];
     touch();
@@ -1040,7 +1104,9 @@ async function agentLoop(topicId, agent) {
       if (!a.auto || !msgs.length) break;
       const prompt = buildPrompt(topic, agent, msgs, !ta.sessionId);
       const actKey = "thread:" + topicId + ":" + agent;
-      actStart(actKey, NAMES[agent] + " 応答");
+      const run = startRun("thread", agent, { topicId });
+      run.sessionId = ta.sessionId || null;
+      actStart(actKey, NAMES[agent] + " 応答", run.runId);
       try {
         const call = agent === "claude" ? callClaude : callCodex;
         // claude はプール配下のファイル保存に加え、メディア生成用に python3 / ffmpeg の実行を許可。
@@ -1050,6 +1116,8 @@ async function agentLoop(topicId, agent) {
           agent === "claude"
             ? { extraArgs: ["--allowedTools", "Write(u2a2a/pool/**)", "Edit(u2a2a/pool/**)", "Bash(python3:*)", "Bash(ffmpeg:*)"] }
             : { writeDir: POOL_DIR, resumeWritable: !!ta.codexPoolCwd };
+        opts.ctl = run.ctl;
+        opts.onSessionId = (sid) => (run.sessionId = sid); // 早期捕捉（キャンセル時に interrupted として保持）
         const { text, sessionId, model, meta } = await call(prompt, ta.sessionId, a.modelOverride, (s) => actStep(actKey, s), opts);
         ta.sessionId = sessionId;
         if (agent === "codex" && !hadSession) ta.codexPoolCwd = true; // 新方式（cwd=pool）で作られた印
@@ -1061,10 +1129,32 @@ async function agentLoop(topicId, agent) {
         markTranscriptSynced(topic, agent); // 自分の応答分は外部同期の対象外にする
         qaHop(topic, agent, text, replyMsg.id);
       } catch (e) {
-        topic.relay.active = false; // エラーで質疑が空回りしないよう停止
-        a.lastError = String(e.message || e);
+        topic.relay.active = false; // エラー/キャンセルで質疑が空回りしないよう停止
         ta.lastSeenTs = msgs[msgs.length - 1].ts; // 同じメッセージで無限リトライしない
+        if (e.cancelled) {
+          // キャンセル: エラーではなく cancelled として記録し、セッションは interrupted 扱いに
+          needsRun[key] = false;
+          const interruptedId = run.sessionId || e.sessionId || ta.sessionId;
+          if (interruptedId) {
+            ta.interruptedSessionId = interruptedId;
+            ta.interruptedPoolCwd = ta.codexPoolCwd;
+          }
+          ta.sessionId = null; // 次回は新セッション（要約を再注入）。明示操作でのみ resume
+          ta.transcriptOffset = null;
+          state.messages.push({
+            id: id(),
+            topicId,
+            thread: agent,
+            author: agent,
+            text: "⏹ 応答をキャンセルしました",
+            cancelled: true,
+            ts: Date.now(),
+          });
+        } else {
+          a.lastError = String(e.message || e);
+        }
       } finally {
+        endRun(run.runId);
         actEnd(actKey);
       }
       touch();
@@ -1130,6 +1220,19 @@ async function handleApi(req, res, url) {
     return json(res, 201, created);
   }
 
+  // 実行のキャンセル（初版は thread 実行のみ。SIGTERM→3秒→SIGKILL・プロセスグループ停止）
+  if (req.method === "POST" && parts[0] === "api" && parts[1] === "runs" && parts[2] && parts[3] === "cancel") {
+    const run = runs[parts[2]];
+    if (!run) return json(res, 404, { error: "run not found（既に終了しています）" });
+    if (run.kind !== "thread") return json(res, 400, { error: "初版でキャンセルできるのはスレッド応答のみです" });
+    const topic = findTopic(run.topicId);
+    if (topic) topic.relay = defaultRelay(); // 質疑リレーも止める
+    needsRun[runKey(run.topicId, run.agent)] = false;
+    if (run.ctl.cancel) run.ctl.cancel();
+    touch();
+    return json(res, 202, { ok: true });
+  }
+
   // ---- トピック（スレッド）管理 ----
   if (req.method === "POST" && url.pathname === "/api/topics") {
     const body = await readBody(req);
@@ -1170,6 +1273,18 @@ async function handleApi(req, res, url) {
         ta.sessionId = null;
         ta.transcriptOffset = null;
         delete ta.codexPoolCwd;
+        delete ta.interruptedSessionId;
+        delete ta.interruptedPoolCwd;
+      }
+      // 中断（キャンセル）したセッションの明示的な再開
+      if (AGENTS.includes(body.resumeInterrupted)) {
+        const ta = topic.agents[body.resumeInterrupted];
+        if (ta.interruptedSessionId) {
+          ta.sessionId = ta.interruptedSessionId;
+          ta.codexPoolCwd = ta.interruptedPoolCwd;
+          delete ta.interruptedSessionId;
+          delete ta.interruptedPoolCwd;
+        }
       }
       touch();
       return json(res, 200, topic);
