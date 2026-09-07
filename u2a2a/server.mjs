@@ -238,6 +238,9 @@ function buildThreadMirror(t, msgs) {
     `qaSessions: ${qaSessions}\n` +
     `claudeSession: ${t.agents.claude.sessionId || "(未開始)"}\n` +
     `codexSession: ${t.agents.codex.sessionId || "(未開始)"}\n` +
+    (t.branchedFrom
+      ? `branchedFrom: ${(findTopic(t.branchedFrom.topicId) || {}).title || t.branchedFrom.topicId}（message ${t.branchedFrom.messageId}）\n`
+      : "") +
     `---\n\n`;
 
   // 📦 成果物索引: このスレッドのメッセージ由来のプールアイテム＋本文で言及されたプールファイル
@@ -1534,6 +1537,35 @@ async function handleApi(req, res, url) {
     if (req.method === "POST" && parts[3] === "summarize") {
       summarizeTopic(topic.id);
       return json(res, 202, { ok: true });
+    }
+
+    // 分岐: 指定メッセージ地点までの履歴を新トピックへコピーする
+    // （合意事項: コピーの provenance は不変。CLI セッションは継承せず新規 topicAgent で開始）
+    if (req.method === "POST" && parts[3] === "branch") {
+      const body = await readBody(req);
+      const at = state.messages.find((m) => m.id === body.messageId && m.topicId === topic.id);
+      if (!at) return json(res, 404, { error: "分岐点のメッセージが見つかりません" });
+      const branched = defaultTopic(topic.title.slice(0, 50) + "＃分岐");
+      branched.branchedFrom = { topicId: topic.id, messageId: at.id };
+      // 分岐元の要約を持ち込む（新セッションの初回応答で文脈として再注入される）
+      branched.summaryText = topic.summaryText || "";
+      branched.summaryTs = topic.summaryTs || null;
+      branched.qaCount = topic.qaCount || 0;
+      const copies = state.messages
+        .filter((m) => m.topicId === topic.id && m.ts <= at.ts)
+        .map((m) => ({
+          ...m,
+          id: id(),
+          topicId: branched.id,
+          copiedFromMessageId: m.id, // provenance.source は上書きしない（複製履歴は別軸）
+        }));
+      branched.summaryAt = copies.length;
+      // 分岐直後に旧履歴へ自動応答が走らないよう、既読位置を分岐時点に合わせる
+      for (const a of AGENTS) branched.agents[a].lastSeenTs = Date.now();
+      state.topics.push(branched);
+      state.messages.push(...copies);
+      touch();
+      return json(res, 201, branched);
     }
     if (req.method === "PATCH") {
       const body = await readBody(req);

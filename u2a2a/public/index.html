@@ -1702,6 +1702,19 @@ function renderTopicDetail(box, t) {
       el("span", { class: "p-size", text: "自動生成ミラー（エージェントもこのパスで参照可）" }),
     ]));
   }
+  if (t.branchedFrom) {
+    const src = (state.topics || []).find((x) => x.id === t.branchedFrom.topicId);
+    box.appendChild(el("div", { class: "p-file" }, [
+      el("a", {
+        href: "#",
+        text: "🌿 分岐元: " + (src ? src.title : "（削除済みトピック）"),
+        onclick: (e) => {
+          e.preventDefault();
+          if (src) switchTopic(src.id);
+        },
+      }),
+    ]));
+  }
   const actions = el("div", { class: "actions" }, [
     el("button", { class: "small", text: active ? "表示中のスレッドです" : "このスレッドを開く", onclick: () => { if (!active) switchTopic(t.id); } }),
     el("button", {
@@ -2451,6 +2464,14 @@ function ctxItems(t) {
       ["コピー", () => copy(m.text)],
       ["引用して入力欄へ", () => quoteToInput(m.text)],
       ["タスク化", () => openTaskDialog(m.thread, m)],
+      ["🌿 ここから分岐", () =>
+        api("/api/topics/" + m.topicId + "/branch", "POST", { messageId: m.id }).then((nt) => {
+          switchTopic(nt.id);
+          renamingTopicId = nt.id;
+          render();
+          toast("この地点までの履歴で分岐しました（セッションは新規・要約を引き継ぎ）");
+        }),
+      ],
     ];
   }
   if (t.type === "poolfile") {
