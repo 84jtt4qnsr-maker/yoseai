@@ -2634,14 +2634,29 @@ for (const agent of ["claude", "codex"]) {
       .then(() => toast(NAMES[agent] + " は次の応答から新しい CLI セッションになります（文脈はリセット）"));
   });
   const modelInput = $("#model-" + agent);
-  const commitModel = () => {
+  const commitModel = (value) => {
+    const v = (value !== undefined ? value : modelInput.value).trim();
     const cur = ((state.agents || {})[agent] || {}).modelOverride || "";
-    if (modelInput.value.trim() === cur) return;
-    api("/api/agents/" + agent, "PATCH", { model: modelInput.value })
-      .then(() => toast(modelInput.value.trim() ? "モデルを " + modelInput.value.trim() + " に設定しました" : "モデルを CLI 既定に戻しました"));
+    if (v === cur) return;
+    api("/api/agents/" + agent, "PATCH", { model: v })
+      .then(() => toast(v ? "モデルを " + v + " に設定しました" : "モデルを CLI 既定に戻しました"));
   };
-  modelInput.addEventListener("change", commitModel);
+  modelInput.addEventListener("change", () => commitModel());
   modelInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { commitModel(); modelInput.blur(); } });
+  // クリックでモデル一覧メニューを表示（datalist は環境によって候補が出ないため）
+  modelInput.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const models = await api("/api/models");
+    const cur = ((state.agents || {})[agent] || {}).modelOverride || "";
+    const mark = (v) => (v === cur ? "✓ " : "　");
+    const items = [[mark("") + "CLI 既定", () => { modelInput.value = ""; commitModel(""); }]];
+    for (const name of models[agent] || []) {
+      items.push([mark(name) + name, () => { modelInput.value = name; commitModel(name); }]);
+    }
+    items.push(["✏ 手入力（このまま入力して Enter）", () => modelInput.focus()]);
+    const r = modelInput.getBoundingClientRect();
+    openCtxMenu(r.left, r.bottom + 4, items);
+  });
 }
 for (const btn of document.querySelectorAll("[data-agent-send]")) {
   const agent = btn.getAttribute("data-agent-send");

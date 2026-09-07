@@ -1411,6 +1411,57 @@ function maybeTrigger(messages) {
   }
 }
 
+// ---- モデル一覧の収集 ----
+// CLI にカタログ取得コマンドがないため、実際に使われた実測値から集める。
+// claude: エイリアス＋アプリ内 meta.model。codex: アプリ内 meta.model＋最近の rollout の payload.model
+let modelsCache = null;
+let modelsCacheTs = 0;
+
+function collectModels() {
+  if (modelsCache && Date.now() - modelsCacheTs < 5 * 60 * 1000) return modelsCache;
+  // エイリアス＋この環境で指定が通ることを検証済みのモデルをベースラインに
+  const claude = new Set(["opus", "sonnet", "haiku", "fable"]);
+  const codex = new Set(["gpt-6-astra"]);
+  const harvest = (meta) => {
+    if (!meta || !meta.model) return;
+    (meta.model.startsWith("claude") ? claude : codex).add(meta.model);
+  };
+  for (const m of state.messages) harvest(m.meta);
+  for (const p of state.pool) {
+    for (const r of p.reviews || []) harvest(r.meta);
+    for (const f of p.fixes || []) harvest(f.meta);
+  }
+  try {
+    const files = fs
+      .globSync(path.join(os.homedir(), ".codex/sessions/**/rollout-*.jsonl"))
+      .map((f) => ({ f, t: fs.statSync(f).mtimeMs }))
+      .sort((a, b) => b.t - a.t)
+      .slice(0, 60);
+    for (const { f } of files) {
+      try {
+        for (const line of fs.readFileSync(f, "utf8").split("\n").slice(0, 5)) {
+          try {
+            const m = JSON.parse(line)?.payload?.model;
+            if (typeof m === "string" && m) {
+              codex.add(m);
+              break;
+            }
+          } catch {
+            // JSON でない行は無視
+          }
+        }
+      } catch {
+        // 読めない rollout はスキップ
+      }
+    }
+  } catch (e) {
+    logEvent("cli", "codex rollout のモデル走査に失敗: " + (e.message || e), "warn");
+  }
+  modelsCache = { claude: [...claude], codex: [...codex].sort() };
+  modelsCacheTs = Date.now();
+  return modelsCache;
+}
+
 // ---- API ----
 async function handleApi(req, res, url) {
   const parts = url.pathname.split("/").filter(Boolean); // ["api", ...]
@@ -1475,6 +1526,11 @@ async function handleApi(req, res, url) {
     events.length = 0;
     touch();
     return json(res, 200, { ok: true });
+  }
+
+  // 選択可能なモデル一覧（実測ベース: アプリ内で使われたモデル＋codex は rollout 走査）
+  if (req.method === "GET" && url.pathname === "/api/models") {
+    return json(res, 200, collectModels());
   }
 
   // ---- 上限設定 ----
