@@ -1246,9 +1246,13 @@ function threadActivity(agent) {
 
 const TEXT_EXTS_UI = ["md", "txt", "log", "json", "js", "mjs", "ts", "tsx", "jsx", "py", "rs", "html", "css", "csv", "yaml", "yml", "toml", "sh", "diff", "patch"];
 const IMAGE_EXTS_UI = ["png", "jpg", "jpeg", "gif", "svg", "webp"];
+const VIDEO_EXTS_UI = ["mp4", "webm", "mov"];
+const AUDIO_EXTS_UI = ["mp3", "wav", "ogg", "m4a"];
 const extOf = (name) => (name.split(".").pop() || "").toLowerCase();
 const isTextExt = (name) => TEXT_EXTS_UI.includes(extOf(name));
 const isImageExt = (name) => IMAGE_EXTS_UI.includes(extOf(name));
+const isVideoExt = (name) => VIDEO_EXTS_UI.includes(extOf(name));
+const isAudioExt = (name) => AUDIO_EXTS_UI.includes(extOf(name));
 
 function fmtSize(n) {
   if (n == null) return "";
@@ -1275,6 +1279,14 @@ function poolPreviewEl(p) {
   const url = "/api/pool/file/" + encodeURIComponent(p.file);
   if (isImageExt(p.file)) {
     body.appendChild(el("img", { src: url + "?v=" + (p.mtime || 0), alt: p.title }));
+    return body;
+  }
+  if (isVideoExt(p.file)) {
+    body.appendChild(el("video", { src: url + "?v=" + (p.mtime || 0), controls: "", style: "width:100%;max-height:360px;border-radius:8px;" }));
+    return body;
+  }
+  if (isAudioExt(p.file)) {
+    body.appendChild(el("audio", { src: url + "?v=" + (p.mtime || 0), controls: "", style: "width:100%;" }));
     return body;
   }
   if (extOf(p.file) === "html" || extOf(p.file) === "htm") {
@@ -1818,6 +1830,8 @@ function renderThread(agent) {
         if (new RegExp("\\]\\([^)]*" + rel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\)").test(m.text)) continue;
         const url = "/api/pool/file/" + encodeURI(rel);
         if (isImageExt(rel)) mediaKids.push(el("img", { src: url, alt: rel, loading: "lazy" }));
+        else if (isVideoExt(rel)) mediaKids.push(el("video", { src: url, controls: "", style: "max-width:100%;max-height:260px;border-radius:6px;" }));
+        else if (isAudioExt(rel)) mediaKids.push(el("audio", { src: url, controls: "", style: "width:100%;" }));
         else mediaKids.push(el("a", { href: url, target: "_blank", rel: "noopener", text: "📄 " + full }));
       }
       if (mediaKids.length) kids.push(el("div", { class: "msg-media" }, mediaKids));
