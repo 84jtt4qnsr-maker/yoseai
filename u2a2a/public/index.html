@@ -1115,14 +1115,15 @@ function updateRelayLinks() {
   }
   const parts = [];
   for (const m of state.messages) {
-    if (m.topicId !== t.id || !m.relayedFrom) continue;
+    const pvm = provOf(m);
+    if (m.topicId !== t.id || !pvm.source) continue;
     const tgt = document.querySelector('.msg[data-mid="' + m.id + '"]');
     if (!tgt) continue;
-    let srcMsg = m.sourceId ? state.messages.find((o) => o.id === m.sourceId) : null;
+    let srcMsg = pvm.source.messageId ? state.messages.find((o) => o.id === pvm.source.messageId) : null;
     if (!srcMsg) {
-      // 旧データ用フォールバック: 同一トピック・送信元スレッド・同著者・同文の直前メッセージ
+      // ID なしの旧中継用フォールバック: 同一トピック・送信元スレッド・同著者・同文の直前メッセージ
       srcMsg = state.messages.find(
-        (o) => o.topicId === t.id && o.thread === m.relayedFrom && o.author === m.author && o.text === m.text && o.ts <= m.ts
+        (o) => o.topicId === t.id && o.thread === pvm.source.agent && o.author === m.author && o.text === m.text && o.ts <= m.ts
       );
     }
     const src = srcMsg && document.querySelector('.msg[data-mid="' + srcMsg.id + '"]');
@@ -1326,6 +1327,9 @@ function renderMarkdown(src, ctx) {
 }
 
 const rawView = new Set(); // 「生表示」に切り替えたメッセージ id（クライアント側のみ）
+// メッセージ由来（provenance）ヘルパー。source があれば転送/中継コピー
+const provOf = (m) => m.provenance || {};
+const isRelayCopy = (m) => !!provOf(m).source;
 const expandedRelays = new Set(); // 展開した転送/中継メッセージの id（既定は折りたたみ）
 
 function el(tag, attrs = {}, children = []) {
@@ -1976,11 +1980,12 @@ function renderThread(agent) {
       el("span", { class: "who", text: NAMES[m.author] }),
       el("span", { text: fmtTime(m.ts) }),
     ]);
-    if (m.relayedFrom) meta.appendChild(el("span", { text: "（" + NAMES[m.relayedFrom] + "スレッドから転送）" }));
+    const pv = provOf(m);
+    if (pv.source) meta.appendChild(el("span", { text: "（" + NAMES[pv.source.agent] + "スレッドから転送）" }));
     if (m.taskId) meta.appendChild(el("span", { text: "（タスク結果）" }));
-    if (m.auto) meta.appendChild(el("span", { text: "（自動応答）" }));
-    if (m.qa) meta.appendChild(el("span", { text: "（質疑）" }));
-    if (m.external) meta.appendChild(el("span", { text: "（外部セッションから同期）" }));
+    if (pv.trigger === "auto" && !m.cancelled && !m.budget) meta.appendChild(el("span", { text: "（自動応答）" }));
+    if (pv.delivery === "qa-relay") meta.appendChild(el("span", { text: "（質疑）" }));
+    if (pv.ingress === "cli-sync") meta.appendChild(el("span", { text: "（外部セッションから同期）" }));
     if (m.cancelled) meta.appendChild(el("span", { text: "（キャンセル）" }));
 
     const isRaw = rawView.has(m.id);
@@ -2013,10 +2018,10 @@ function renderThread(agent) {
 
     // 転送・質疑中継で届いた内容は送信元に原文があるため、受信側では折りたたみ表示
     let body;
-    if (m.relayedFrom && !expandedRelays.has(m.id)) {
+    if (isRelayCopy(m) && !expandedRelays.has(m.id)) {
       body = el("div", {
         class: "relay-collapsed",
-        text: "📨 " + NAMES[m.relayedFrom] + " 側からの送信テキスト（" + m.text.length + " 文字）— クリックで展開",
+        text: "📨 " + NAMES[pv.source.agent] + " 側からの送信テキスト（" + m.text.length + " 文字）— クリックで展開",
         onclick: () => {
           expandedRelays.add(m.id);
           renderThread(agent);
@@ -2026,7 +2031,7 @@ function renderThread(agent) {
       body = el("div", { class: "mdview" + (isRaw ? " raw" : "") });
       if (isRaw) body.textContent = m.text;
       else body.innerHTML = renderMarkdown(m.text, { author: m.author });
-      if (m.relayedFrom) {
+      if (isRelayCopy(m)) {
         meta.appendChild(el("span", {
           class: "relay-fold",
           text: "（折りたたむ）",
@@ -2040,7 +2045,7 @@ function renderThread(agent) {
 
     const kids = [meta, body];
     // 本文中の pool パスを検出し、画像はインライン・その他はリンクで自動プレビュー
-    if (!(m.relayedFrom && !expandedRelays.has(m.id))) {
+    if (!(isRelayCopy(m) && !expandedRelays.has(m.id))) {
       const paths = [...new Set(m.text.match(/u2a2a\/pool\/[^\s)"'`」()）]+/g) || [])].slice(0, 4);
       const mediaKids = [];
       for (const full of paths) {
@@ -2068,9 +2073,9 @@ function renderThread(agent) {
       }
       if (mediaKids.length) kids.push(el("div", { class: "msg-media" }, mediaKids));
     }
-    if (m.meta && !(m.relayedFrom && !expandedRelays.has(m.id))) kids.push(metaEl(m.meta));
+    if (m.meta && !(isRelayCopy(m) && !expandedRelays.has(m.id))) kids.push(metaEl(m.meta));
     kids.push(actions);
-    box.appendChild(el("div", { class: "msg" + (m.external ? " external" : ""), "data-author": m.author, "data-mid": m.id }, kids));
+    box.appendChild(el("div", { class: "msg" + (pv.ingress === "cli-sync" ? " external" : ""), "data-author": m.author, "data-mid": m.id }, kids));
   }
   if (isRunning(agent)) {
     const act = threadActivity(agent);

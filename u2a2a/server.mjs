@@ -119,6 +119,29 @@ function loadState() {
       parsed.usageDay = parsed.usageDay || null;
       parsed.budgetHalt = parsed.budgetHalt || null;
       for (const m of parsed.messages) migrateMeta(m);
+      // schemaVersion 3: 散在フラグ（relayedFrom/qa/external/auto）→ 直交構造 provenance へ移行
+      if (!parsed.schemaVersion || parsed.schemaVersion < 3) {
+        for (const t of parsed.topics) {
+          t.qaCount = parsed.messages.filter((m) => m.topicId === t.id && m.qa && m.author === "user").length;
+        }
+        for (const m of parsed.messages) {
+          if (!m.provenance) {
+            m.provenance = {
+              ingress: m.external ? "cli-sync" : m.auto || m.cancelled || m.budget ? "agent-loop" : "ui",
+              delivery: m.relayedFrom ? (m.qa ? "qa-relay" : "relay") : "direct",
+              trigger: m.auto ? "auto" : "manual",
+              source: m.relayedFrom
+                ? { topicId: m.topicId, messageId: m.sourceId || null, agent: m.relayedFrom }
+                : null,
+            };
+          }
+          delete m.relayedFrom;
+          delete m.sourceId;
+          delete m.qa;
+          delete m.external;
+          delete m.auto;
+        }
+      }
       for (const p of parsed.pool) {
         for (const r of p.reviews || []) migrateMeta(r);
         for (const f of p.fixes || []) migrateMeta(f);
@@ -162,7 +185,7 @@ function persistState() {
   const t0 = Date.now();
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    state.schemaVersion = 2;
+    state.schemaVersion = 3;
     const jsonStr = JSON.stringify(state, null, 2);
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, jsonStr);
@@ -205,7 +228,7 @@ function threadMirrorName(t) {
 
 function buildThreadMirror(t, msgs) {
   const fmtT = (ts) => new Date(ts).toLocaleString("ja-JP");
-  const qaSessions = msgs.filter((m) => m.qa && m.author === "user").length;
+  const qaSessions = t.qaCount || 0;
   const fm =
     `---\n` +
     `topicId: ${t.id}\n` +
@@ -246,14 +269,19 @@ function buildThreadMirror(t, msgs) {
 
   const history = msgs
     .map((m) => {
-      const tags = [m.auto ? "自動応答" : null, m.qa ? "質疑" : null, m.external ? "外部同期" : null]
+      const pv = m.provenance || {};
+      const tags = [
+        pv.trigger === "auto" ? "自動応答" : null,
+        pv.delivery === "qa-relay" ? "質疑" : null,
+        pv.ingress === "cli-sync" ? "外部同期" : null,
+      ]
         .filter(Boolean)
         .join("・");
       const head = `### ${NAMES[m.author]} → ${NAMES[m.thread]} 側（${fmtT(m.ts)}${tags ? "／" + tags : ""}）`;
-      if (m.relayedFrom) {
+      if (pv.source) {
         // 受信側の中継コピーは冒頭のみ（原文は送信元レーンに全文が残る）
         const headLine = m.text.split("\n").find((l) => l.trim()) || "";
-        return `${head}\n\n> ↪ ${NAMES[m.relayedFrom]} 側から中継: ${headLine.slice(0, 100)}${m.text.length > 100 ? "…（全文は中継元を参照）" : ""}\n`;
+        return `${head}\n\n> ↪ ${NAMES[pv.source.agent]} 側から中継: ${headLine.slice(0, 100)}${m.text.length > 100 ? "…（全文は中継元を参照）" : ""}\n`;
       }
       return `${head}\n\n${m.text}\n`;
     })
@@ -368,6 +396,7 @@ function triggerBudgetHalt(topicId, agent, reason) {
     author: agent,
     text: "🚫 上限到達のため自動応答を停止しました: " + reason,
     budget: true,
+    provenance: { ingress: "agent-loop", delivery: "direct", trigger: "auto", source: null },
     ts: Date.now(),
   });
   touch();
@@ -579,9 +608,12 @@ function qaHop(topic, agent, replyText, sourceMsgId) {
     thread: other,
     author: agent,
     text: replyText,
-    relayedFrom: agent,
-    sourceId: sourceMsgId || null, // 原文メッセージへの参照（UI が対応線を描く）
-    qa: true,
+    provenance: {
+      ingress: "agent-loop",
+      delivery: "qa-relay",
+      trigger: "auto",
+      source: { topicId: topic.id, messageId: sourceMsgId || null, agent },
+    },
     ts: Date.now(),
   });
   if (r.remaining <= 0) r.active = false; // 最終手: 相手は応答するがそれ以上は中継しない
@@ -1083,7 +1115,7 @@ async function summarizeTopic(topicId) {
   if (!msgs.length) return;
   summaryPending.add(topicId);
   try {
-    const recent = msgs.filter((m) => !m.relayedFrom).slice(-40);
+    const recent = msgs.filter((m) => !(m.provenance && m.provenance.source)).slice(-40);
     const lines = recent
       .map((m) => `[${NAMES[m.author]}→${NAMES[m.thread]}側] ${m.text.slice(0, 500)}`)
       .join("\n\n");
@@ -1115,7 +1147,7 @@ function checkSummaries() {
 function unseenFor(topic, agent) {
   const ta = topic.agents[agent];
   return state.messages
-    .filter((m) => m.topicId === topic.id && m.thread === agent && m.author !== agent && !m.external && m.ts > ta.lastSeenTs)
+    .filter((m) => m.topicId === topic.id && m.thread === agent && m.author !== agent && !(m.provenance && m.provenance.ingress === "cli-sync") && m.ts > ta.lastSeenTs)
     .slice(-MAX_BACKLOG);
 }
 
@@ -1221,7 +1253,15 @@ function syncExternal(topic, agent) {
   a.transcriptOffset += Buffer.byteLength(chunk.slice(0, lastNl + 1), "utf8");
   let added = false;
   for (const m of extractExternalMessages(agent, chunk.slice(0, lastNl + 1))) {
-    state.messages.push({ id: id(), topicId: topic.id, thread: agent, author: m.author, text: m.text, external: true, ts: Date.now() });
+    state.messages.push({
+      id: id(),
+      topicId: topic.id,
+      thread: agent,
+      author: m.author,
+      text: m.text,
+      provenance: { ingress: "cli-sync", delivery: "direct", trigger: "manual", source: null },
+      ts: Date.now(),
+    });
     added = true;
   }
   return added;
@@ -1293,7 +1333,16 @@ async function agentLoop(topicId, agent) {
         if (model) a.model = model;
         ta.lastSeenTs = msgs[msgs.length - 1].ts;
         a.lastError = "";
-        const replyMsg = { id: id(), topicId, thread: agent, author: agent, text, auto: true, meta, ts: Date.now() };
+        const replyMsg = {
+          id: id(),
+          topicId,
+          thread: agent,
+          author: agent,
+          text,
+          provenance: { ingress: "agent-loop", delivery: "direct", trigger: "auto", source: null },
+          meta,
+          ts: Date.now(),
+        };
         state.messages.push(replyMsg);
         markTranscriptSynced(topic, agent); // 自分の応答分は外部同期の対象外にする
         qaHop(topic, agent, text, replyMsg.id);
@@ -1317,6 +1366,7 @@ async function agentLoop(topicId, agent) {
             author: agent,
             text: "⏹ 応答をキャンセルしました",
             cancelled: true,
+            provenance: { ingress: "agent-loop", delivery: "direct", trigger: "auto", source: null },
             meta: e.meta || null,
             ts: Date.now(),
           });
@@ -1380,7 +1430,7 @@ async function handleApi(req, res, url) {
       thread: t,
       author,
       text,
-      // relayedFrom / sourceId はサーバー内部（qaHop / /api/relay）だけが設定できる
+      provenance: { ingress: "ui", delivery: "direct", trigger: "manual", source: null },
       ts: Date.now(),
     }));
     state.messages.push(...created);
@@ -1440,8 +1490,12 @@ async function handleApi(req, res, url) {
       thread: OTHER[src.thread],
       author: src.author,
       text: src.text,
-      relayedFrom: src.thread,
-      sourceId: src.id,
+      provenance: {
+        ingress: "ui",
+        delivery: "relay",
+        trigger: "manual",
+        source: { topicId: src.topicId, messageId: src.id, agent: src.thread },
+      },
       ts: Date.now(),
     };
     state.messages.push(copy);
@@ -1741,7 +1795,16 @@ async function handleApi(req, res, url) {
     const qaTopic = findTopic(body.topicId) || state.topics[0];
     if (!qaTopic) return json(res, 400, { error: "トピックがありません" });
     qaTopic.relay = { active: true, remaining: hops, hopsDone: 0 };
-    const msg = { id: id(), topicId: qaTopic.id, thread: first, author: "user", text, qa: true, ts: Date.now() };
+    qaTopic.qaCount = (qaTopic.qaCount || 0) + 1;
+    const msg = {
+      id: id(),
+      topicId: qaTopic.id,
+      thread: first,
+      author: "user",
+      text,
+      provenance: { ingress: "ui", delivery: "direct", trigger: "manual", source: null },
+      ts: Date.now(),
+    };
     state.messages.push(msg);
     touch();
     agentLoop(qaTopic.id, first);
@@ -1818,6 +1881,7 @@ async function handleApi(req, res, url) {
         author: task.agent,
         text,
         taskId: task.id,
+        provenance: { ingress: "ui", delivery: "direct", trigger: "manual", source: null },
         ts: Date.now(),
       });
       touch();
@@ -1883,5 +1947,5 @@ saveState();
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`U2A2A Orchestration: http://127.0.0.1:${PORT}`);
-  logEvent("system", "サーバー起動（schemaVersion 2）", "info");
+  logEvent("system", "サーバー起動（schemaVersion 3）", "info");
 });
