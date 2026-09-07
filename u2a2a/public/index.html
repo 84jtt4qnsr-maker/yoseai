@@ -1994,7 +1994,12 @@ function renderThread(agent) {
       el("span", { text: fmtTime(m.ts) }),
     ]);
     const pv = provOf(m);
-    if (pv.source) meta.appendChild(el("span", { text: "（" + NAMES[pv.source.agent] + "スレッドから転送）" }));
+    if (pv.source)
+      meta.appendChild(el("span", {
+        text: pv.delivery === "handoff"
+          ? "（" + NAMES[pv.source.agent] + " から引き継ぎ）"
+          : "（" + NAMES[pv.source.agent] + "スレッドから転送）",
+      }));
     if (m.taskId) meta.appendChild(el("span", { text: "（タスク結果）" }));
     if (pv.trigger === "auto" && !m.cancelled && !m.budget) meta.appendChild(el("span", { text: "（自動応答）" }));
     if (pv.delivery === "qa-relay") meta.appendChild(el("span", { text: "（質疑）" }));
@@ -2034,7 +2039,7 @@ function renderThread(agent) {
     if (isRelayCopy(m) && !expandedRelays.has(m.id)) {
       body = el("div", {
         class: "relay-collapsed",
-        text: "📨 " + NAMES[pv.source.agent] + " 側からの送信テキスト（" + m.text.length + " 文字）— クリックで展開",
+        text: (pv.delivery === "handoff" ? "🤝 " + NAMES[pv.source.agent] + " からの引き継ぎ" : "📨 " + NAMES[pv.source.agent] + " 側からの送信テキスト") + "（" + m.text.length + " 文字）— クリックで展開",
         onclick: () => {
           expandedRelays.add(m.id);
           renderThread(agent);
@@ -2464,6 +2469,10 @@ function ctxItems(t) {
       ["コピー", () => copy(m.text)],
       ["引用して入力欄へ", () => quoteToInput(m.text)],
       ["タスク化", () => openTaskDialog(m.thread, m)],
+      ["🤝 " + NAMES[OTHER[m.thread]] + " へ引き継ぎ", () =>
+        api("/api/handoff", "POST", { messageId: m.id })
+          .then(() => toast(NAMES[OTHER[m.thread]] + " へ引き継ぎました（相手が作業を引き取ります）")),
+      ],
       ["🌿 ここから分岐", () =>
         api("/api/topics/" + m.topicId + "/branch", "POST", { messageId: m.id }).then((nt) => {
           switchTopic(nt.id);

@@ -276,6 +276,7 @@ function buildThreadMirror(t, msgs) {
       const tags = [
         pv.trigger === "auto" ? "自動応答" : null,
         pv.delivery === "qa-relay" ? "質疑" : null,
+        pv.delivery === "handoff" ? "引き継ぎ" : null,
         pv.ingress === "cli-sync" ? "外部同期" : null,
       ]
         .filter(Boolean)
@@ -553,7 +554,21 @@ function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = nul
 
 function buildPrompt(topic, agent, msgs, isFirst) {
   const other = agent === "claude" ? "codex" : "claude";
-  const lines = msgs.map((m) => `[${NAMES[m.author]}] ${m.text}`).join("\n\n");
+  const lines = msgs
+    .map((m) => {
+      const pv = m.provenance || {};
+      // 引き継ぎ: 単なる転送ではなく「ここから先はあなたが進める」という依頼として届ける
+      if (pv.delivery === "handoff" && pv.source) {
+        const mirrorRef = topic.mirrorFile ? `u2a2a/pool/${topic.mirrorFile}` : "スレッド履歴ミラー";
+        return (
+          `【引き継ぎ依頼】以下は ${NAMES[pv.source.agent]} 側スレッドでの作業内容です。` +
+          `ここから先をあなたが引き継いで進めてください（経緯の全文脈は ${mirrorRef} で参照できます）:\n` +
+          `[${NAMES[m.author]}] ${m.text}`
+        );
+      }
+      return `[${NAMES[m.author]}] ${m.text}`;
+    })
+    .join("\n\n");
   const preamble = isFirst
     ? `あなたは「U2A2Aオーケストレーション」アプリの ${NAMES[agent]} 側スレッドの担当エージェントです。` +
       `このスレッドのトピックは「${topic.title}」です。` +
@@ -1496,6 +1511,31 @@ async function handleApi(req, res, url) {
       provenance: {
         ingress: "ui",
         delivery: "relay",
+        trigger: "manual",
+        source: { topicId: src.topicId, messageId: src.id, agent: src.thread },
+      },
+      ts: Date.now(),
+    };
+    state.messages.push(copy);
+    touch();
+    maybeTrigger([copy]);
+    return json(res, 201, copy);
+  }
+
+  // 引き継ぎ: 相手エージェントへ作業のバトンを渡す（受け手には引き継ぎ依頼としてプロンプト整形される）
+  if (req.method === "POST" && url.pathname === "/api/handoff") {
+    const body = await readBody(req);
+    const src = state.messages.find((m) => m.id === body.messageId);
+    if (!src || !AGENTS.includes(src.thread)) return json(res, 404, { error: "元メッセージが見つかりません" });
+    const copy = {
+      id: id(),
+      topicId: src.topicId,
+      thread: OTHER[src.thread],
+      author: src.author,
+      text: src.text,
+      provenance: {
+        ingress: "ui",
+        delivery: "handoff",
         trigger: "manual",
         source: { topicId: src.topicId, messageId: src.id, agent: src.thread },
       },
