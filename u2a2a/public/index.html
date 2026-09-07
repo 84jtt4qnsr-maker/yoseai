@@ -109,6 +109,17 @@
   }
   #qa-hops { width: 64px; }
   #qa-bar[hidden] { display: none; }
+  #budget-bar[hidden] { display: none; }
+  #budget-bar {
+    border-bottom: 1px solid #ff7b7b55;
+    background: #2a1518;
+    color: var(--danger);
+    padding: 6px 18px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 12.5px;
+  }
   #qa-bar {
     border-bottom: 1px solid var(--line);
     background: var(--panel);
@@ -693,6 +704,7 @@
 <header>
   <h1>U2A2A Orchestration</h1>
   <span class="sub">ユーザー ⇄ Claude Code ⇄ Codex ／ やり取りから生まれたタスクを各アプリで作業し、結果を再入力する</span>
+  <button id="budget-btn" class="small" style="margin-left:auto" title="実行の上限設定（コスト・回数・時間）">⚙ 上限</button>
 </header>
 
 <!-- トピック（スレッド）タブ -->
@@ -713,6 +725,10 @@
   <button id="user-attach" title="ファイルを添付（プールの attachments/ に保存されます）">📎</button>
   <input id="attach-input" type="file" multiple hidden />
   <button id="user-send">送信</button>
+</div>
+<div id="budget-bar" hidden>
+  <span id="budget-reason"></span>
+  <button id="budget-resume" class="small">解除して自動応答を再開</button>
 </div>
 <div id="qa-bar" hidden>
   <span id="qa-status"></span>
@@ -790,6 +806,30 @@
   </div>
 </section>
 </div>
+
+<!-- 上限設定ダイアログ -->
+<dialog id="budget-dialog">
+  <h3>実行の上限設定</h3>
+  <div class="field">
+    <label>トピックごとのコスト上限（USD・metered実測。空欄=無効）</label>
+    <input id="budget-usd" type="number" min="0" step="0.5" placeholder="例: 5" />
+  </div>
+  <div class="field">
+    <label>1日の実行回数上限（全エージェント共通。空欄=無効）</label>
+    <input id="budget-count" type="number" min="0" step="1" placeholder="例: 100" />
+  </div>
+  <div class="field">
+    <label>1日の累計実行時間上限（分・走行中も含む。空欄=無効）</label>
+    <input id="budget-minutes" type="number" min="0" step="5" placeholder="例: 120" />
+  </div>
+  <div class="field">
+    <label id="budget-today"></label>
+  </div>
+  <div class="buttons">
+    <button id="budget-cancel">キャンセル</button>
+    <button id="budget-save">保存</button>
+  </div>
+</dialog>
 
 <!-- プール持ち込みダイアログ -->
 <dialog id="pool-dialog">
@@ -1092,9 +1132,12 @@ function fmtTok(n) {
 
 function metaText(meta) {
   if (!meta) return "";
+  const u = meta.usage || meta; // 旧フラット形式フォールバック
   const parts = ["⏱ " + fmtElapsed(meta.durationMs || 0)];
-  parts.push("in " + fmtTok(meta.inTok) + (meta.cacheTok ? "（+cache " + fmtTok(meta.cacheTok) + "）" : "") + " / out " + fmtTok(meta.outTok));
-  if (meta.costUsd != null) parts.push("$" + meta.costUsd.toFixed(4));
+  parts.push("in " + fmtTok(u.inTok) + (u.cacheTok ? "（+cache " + fmtTok(u.cacheTok) + "）" : "") + " / out " + fmtTok(u.outTok));
+  const usd = meta.billing && meta.billing.mode === "metered" ? meta.billing.usd : meta.costUsd;
+  if (usd != null) parts.push("$" + usd.toFixed(4));
+  if (meta.status && meta.status !== "completed") parts.push("⚠ " + meta.status);
   return parts.join("　");
 }
 
@@ -1269,6 +1312,7 @@ function render() {
     renderAgentStatus(agent);
   }
   renderQaBar();
+  renderBudgetBar();
   renderPool();
   scheduleLinks();
 }
@@ -1586,9 +1630,10 @@ function renderTopicDetail(box, t) {
   const tot = msgs.reduce(
     (a, m) => {
       if (m.meta) {
-        a.cost += m.meta.costUsd || 0;
-        a.inTok += m.meta.inTok || 0;
-        a.outTok += m.meta.outTok || 0;
+        const u = m.meta.usage || m.meta;
+        a.cost += (m.meta.billing && m.meta.billing.mode === "metered" ? m.meta.billing.usd : m.meta.costUsd) || 0;
+        a.inTok += u.inTok || 0;
+        a.outTok += u.outTok || 0;
       }
       return a;
     },
@@ -1769,6 +1814,13 @@ function renderPoolDetail(box, p) {
     kids.push(actions);
     for (const k of kids) box.appendChild(k);
   }
+}
+
+function renderBudgetBar() {
+  const bar = $("#budget-bar");
+  const halt = state.budgetHalt;
+  bar.hidden = !halt;
+  if (halt) $("#budget-reason").textContent = "🚫 " + halt.reason + " — 自動応答・質疑リレーを停止しています";
 }
 
 function renderQaBar() {
@@ -2260,6 +2312,37 @@ $("#user-target").addEventListener("change", () => {
   $("#qa-hops").hidden = !$("#user-target").value.startsWith("qa-");
 });
 $("#qa-stop").addEventListener("click", () => api("/api/qa/stop", "POST", { topicId: (currentTopic() || {}).id }));
+$("#budget-resume").addEventListener("click", () =>
+  api("/api/budgets/resume", "POST", {}).then(() => toast("上限停止を解除し、自動応答を再開しました"))
+);
+$("#budget-btn").addEventListener("click", () => {
+  const b = state.budgets || {};
+  $("#budget-usd").value = b.topicUsd ?? "";
+  $("#budget-count").value = b.runCount ?? "";
+  $("#budget-minutes").value = b.runMinutes ?? "";
+  const ud = state.usageDay || { runs: 0, ms: 0 };
+  const t = currentTopic();
+  const cost = t
+    ? (state.messages || []).reduce((a, m) => a + (m.topicId === t.id && m.meta && m.meta.billing && m.meta.billing.mode === "metered" ? m.meta.billing.usd : 0), 0)
+    : 0;
+  $("#budget-today").textContent =
+    "本日: " + (ud.runs || 0) + " 回 / " + Math.round((ud.ms || 0) / 60000) + " 分　｜　現在のトピック累計: $" + cost.toFixed(2);
+  $("#budget-dialog").showModal();
+});
+$("#budget-cancel").addEventListener("click", () => $("#budget-dialog").close());
+$("#budget-save").addEventListener("click", async () => {
+  const num = (id2) => {
+    const v = parseFloat($(id2).value);
+    return isFinite(v) && v > 0 ? v : null;
+  };
+  await api("/api/budgets", "PATCH", {
+    topicUsd: num("#budget-usd"),
+    runCount: num("#budget-count"),
+    runMinutes: num("#budget-minutes"),
+  });
+  $("#budget-dialog").close();
+  toast("上限設定を保存しました");
+});
 $("#user-text").addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") sendUser();
 });

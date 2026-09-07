@@ -54,6 +54,10 @@ function defaultTopic(title) {
   };
 }
 
+function defaultBudgets() {
+  return { topicUsd: null, runCount: null, runMinutes: null };
+}
+
 function emptyState() {
   return {
     messages: [],
@@ -61,6 +65,22 @@ function emptyState() {
     pool: [],
     topics: [defaultTopic("メイン")],
     agents: { claude: defaultAgent(), codex: defaultAgent() },
+    budgets: defaultBudgets(),
+    usageDay: null,
+    budgetHalt: null,
+  };
+}
+
+// 旧フラット形式のメタを合意の正規形 {status, model, durationMs, usage, billing} へ移行
+function migrateMeta(holder) {
+  const o = holder && holder.meta;
+  if (!o || o.usage !== undefined || o.inTok === undefined) return;
+  holder.meta = {
+    status: "completed",
+    model: o.model || "",
+    durationMs: o.durationMs || 0,
+    usage: { inTok: o.inTok || 0, outTok: o.outTok || 0, cacheTok: o.cacheTok || 0 },
+    billing: o.costUsd != null ? { mode: "metered", usd: o.costUsd } : { mode: "unknown" },
   };
 }
 
@@ -95,6 +115,14 @@ function loadState() {
         for (const a of AGENTS) t.agents[a] = { ...topicAgent(), ...t.agents[a] };
       }
       delete parsed.relay;
+      parsed.budgets = { ...defaultBudgets(), ...(parsed.budgets || {}) };
+      parsed.usageDay = parsed.usageDay || null;
+      parsed.budgetHalt = parsed.budgetHalt || null;
+      for (const m of parsed.messages) migrateMeta(m);
+      for (const p of parsed.pool) {
+        for (const r of p.reviews || []) migrateMeta(r);
+        for (const f of p.fixes || []) migrateMeta(f);
+      }
       return parsed;
     }
   } catch {
@@ -248,7 +276,63 @@ function startRun(kind, agent, ids = {}) {
 }
 
 function endRun(runId) {
+  const r = runs[runId];
+  if (r) bumpUsageDay(Date.now() - r.startedAt);
   delete runs[runId];
+}
+
+// ---- 上限管理（合意事項⑦: USD上限＋回数/累計時間上限の二本立て）----
+
+function todayStr() {
+  return new Date().toLocaleDateString("sv-SE"); // YYYY-MM-DD
+}
+
+function bumpUsageDay(ms) {
+  const day = todayStr();
+  if (!state.usageDay || state.usageDay.date !== day) state.usageDay = { date: day, runs: 0, ms: 0 };
+  state.usageDay.runs++;
+  state.usageDay.ms += ms;
+}
+
+function topicCostUsd(topicId) {
+  return state.messages.reduce(
+    (a, m) => a + (m.topicId === topicId && m.meta && m.meta.billing && m.meta.billing.mode === "metered" ? m.meta.billing.usd : 0),
+    0
+  );
+}
+
+// 上限超過なら理由文字列を返す。走行中の経過時間も含めて判定する
+function budgetStatus(topicId) {
+  const b = state.budgets || {};
+  const day = todayStr();
+  const ud = state.usageDay && state.usageDay.date === day ? state.usageDay : { runs: 0, ms: 0 };
+  const inflightMs = Object.values(runs).reduce((a, r) => a + (Date.now() - r.startedAt), 0);
+  if (b.runCount && ud.runs >= b.runCount) return `本日の実行回数上限（${b.runCount}回）に到達`;
+  if (b.runMinutes && ud.ms + inflightMs >= b.runMinutes * 60000)
+    return `本日の累計実行時間上限（${b.runMinutes}分）に到達`;
+  if (b.topicUsd && topicId) {
+    const usd = topicCostUsd(topicId);
+    if (usd >= b.topicUsd) return `このトピックのコスト上限（$${b.topicUsd}）に到達（累計 $${usd.toFixed(2)}）`;
+  }
+  return null;
+}
+
+// 上限到達: 自動実行・全質疑リレーを停止し、理由を記録して UI に明示する
+function triggerBudgetHalt(topicId, agent, reason) {
+  if (state.budgetHalt) return;
+  state.budgetHalt = { reason, ts: Date.now() };
+  for (const a of AGENTS) state.agents[a].auto = false;
+  for (const t of state.topics) t.relay = defaultRelay();
+  state.messages.push({
+    id: id(),
+    topicId,
+    thread: agent,
+    author: agent,
+    text: "🚫 上限到達のため自動応答を停止しました: " + reason,
+    budget: true,
+    ts: Date.now(),
+  });
+  touch();
 }
 
 function publicRuns() {
@@ -509,7 +593,17 @@ async function callClaude(prompt, sessionId, modelOverride, onStep, opts = {}) {
     }
   };
   const { code, err, out, cancelled } = await runCli("claude", args, prompt, AGENT_TIMEOUT_MS, onLine, opts.cwd, opts.ctl);
-  if (cancelled) throw Object.assign(new Error("キャンセルされました"), { cancelled: true });
+  if (cancelled)
+    throw Object.assign(new Error("キャンセルされました"), {
+      cancelled: true,
+      meta: {
+        status: "cancelled",
+        model: modelOverride || "",
+        durationMs: Date.now() - t0,
+        usage: { inTok: 0, outTok: 0, cacheTok: 0 },
+        billing: { mode: "unknown" },
+      },
+    });
   if (!result && code !== 0) throw new Error((err || out || "claude CLI エラー").trim().slice(0, 500));
   if (!result) throw new Error("claude: 結果イベントを受信できませんでした");
   if (result.is_error) throw new Error(String(result.result || "claude エラー").slice(0, 500));
@@ -517,11 +611,12 @@ async function callClaude(prompt, sessionId, modelOverride, onStep, opts = {}) {
   const model = Object.keys(result.modelUsage || {})[0]?.replace(/\[.*\]$/, "") || "";
   const u = result.usage || {};
   const meta = {
+    status: "completed",
+    model,
     durationMs: Date.now() - t0,
-    costUsd: typeof result.total_cost_usd === "number" ? result.total_cost_usd : null,
-    inTok: u.input_tokens || 0,
-    outTok: u.output_tokens || 0,
-    cacheTok: u.cache_read_input_tokens || 0,
+    usage: { inTok: u.input_tokens || 0, outTok: u.output_tokens || 0, cacheTok: u.cache_read_input_tokens || 0 },
+    billing:
+      typeof result.total_cost_usd === "number" ? { mode: "metered", usd: result.total_cost_usd } : { mode: "unknown" },
   };
   return { text: result.result || "(空の応答)", sessionId: result.session_id || sessionId, model, meta };
 }
@@ -600,7 +695,18 @@ async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
     }
   };
   const { code, out, err, cancelled } = await runCli("codex", args, prompt, AGENT_TIMEOUT_MS, onLine, REPO_ROOT, opts.ctl);
-  if (cancelled) throw Object.assign(new Error("キャンセルされました"), { cancelled: true, sessionId: earlySessionId });
+  if (cancelled)
+    throw Object.assign(new Error("キャンセルされました"), {
+      cancelled: true,
+      sessionId: earlySessionId,
+      meta: {
+        status: "cancelled",
+        model: modelOverride || "",
+        durationMs: Date.now() - t0,
+        usage: { ...usage },
+        billing: { mode: "plan" },
+      },
+    });
   let text = "";
   try {
     text = fs.readFileSync(outFile, "utf8").trim();
@@ -620,8 +726,15 @@ async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
     }
   }
   if (code !== 0 && !text) throw new Error((err || out || "codex CLI エラー").trim().slice(0, 500));
-  const meta = { durationMs: Date.now() - t0, costUsd: null, ...usage }; // codex はプラン課金のためコスト情報なし
-  return { text: text || "(空の応答)", sessionId: newSessionId, model: codexModelFromRollout(newSessionId), meta };
+  const model = codexModelFromRollout(newSessionId);
+  const meta = {
+    status: "completed",
+    model,
+    durationMs: Date.now() - t0,
+    usage: { ...usage },
+    billing: { mode: "plan" }, // codex はプラン課金（実測USDなし）
+  };
+  return { text: text || "(空の応答)", sessionId: newSessionId, model, meta };
 }
 
 // ---- 共有タスクプール: 相互レビュー ----
@@ -811,6 +924,12 @@ async function runReview(itemId, reviewer) {
   const item = state.pool.find((p) => p.id === itemId);
   if (!item) return;
   if ((reviewPending[itemId] || []).includes(reviewer)) return; // 同一レビュアーの多重起動防止
+  const overBudget = budgetStatus(null); // レビューは回数/時間の全体枠で判定
+  if (overBudget) {
+    item.reviews.push({ id: id(), reviewer, text: "（上限到達のためスキップ: " + overBudget + "）", verdict: "", error: true, ts: Date.now() });
+    touch();
+    return;
+  }
   (reviewPending[itemId] ||= []).push(reviewer);
   if (item.status === "submitted") item.status = "reviewing";
   touch();
@@ -860,6 +979,13 @@ function buildFixPrompt(item, agent) {
 async function runFix(itemId, agent) {
   const item = state.pool.find((p) => p.id === itemId);
   if (!item || !item.file || fixPending[itemId]) return;
+  const overBudget = budgetStatus(null);
+  if (overBudget) {
+    item.fixes = item.fixes || [];
+    item.fixes.push({ id: id(), agent, text: "（上限到達のためスキップ: " + overBudget + "）", error: true, ts: Date.now() });
+    touch();
+    return;
+  }
   fixPending[itemId] = agent;
   const actKey = "fix:" + itemId;
   const run = startRun("fix", agent, { itemId });
@@ -1102,6 +1228,11 @@ async function agentLoop(topicId, agent) {
       }
       const msgs = unseenFor(topic, agent);
       if (!a.auto || !msgs.length) break;
+      const overBudget = budgetStatus(topicId);
+      if (overBudget) {
+        triggerBudgetHalt(topicId, agent, overBudget);
+        break;
+      }
       const prompt = buildPrompt(topic, agent, msgs, !ta.sessionId);
       const actKey = "thread:" + topicId + ":" + agent;
       const run = startRun("thread", agent, { topicId });
@@ -1148,6 +1279,7 @@ async function agentLoop(topicId, agent) {
             author: agent,
             text: "⏹ 応答をキャンセルしました",
             cancelled: true,
+            meta: e.meta || null,
             ts: Date.now(),
           });
         } else {
@@ -1231,6 +1363,27 @@ async function handleApi(req, res, url) {
     if (run.ctl.cancel) run.ctl.cancel();
     touch();
     return json(res, 202, { ok: true });
+  }
+
+  // ---- 上限設定 ----
+  if (req.method === "PATCH" && url.pathname === "/api/budgets") {
+    const body = await readBody(req);
+    for (const k of ["topicUsd", "runCount", "runMinutes"]) {
+      if (k in body) {
+        const v = body[k];
+        state.budgets[k] = typeof v === "number" && v > 0 ? v : null;
+      }
+    }
+    // 上限を緩めた/外した場合、停止状態が解消していれば自動では復帰させず、明示解除に委ねる
+    touch();
+    return json(res, 200, state.budgets);
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/budgets/resume") {
+    state.budgetHalt = null;
+    for (const a of AGENTS) state.agents[a].auto = true;
+    touch();
+    return json(res, 200, { ok: true });
   }
 
   // ---- トピック（スレッド）管理 ----
