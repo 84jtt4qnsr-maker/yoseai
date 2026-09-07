@@ -185,6 +185,8 @@ function persistState() {
 const running = {};
 const needsRun = {};
 const runKey = (topicId, agent) => topicId + ":" + agent;
+// 合意事項: auto はユーザーの意思、budgetHalt はシステムの安全ラッチ。実効値は両者のAND
+const agentAutoOn = (agent) => state.agents[agent].auto && !state.budgetHalt;
 const findTopic = (topicId) => state.topics.find((t) => t.id === topicId);
 
 function saveState() {
@@ -357,8 +359,7 @@ function budgetStatus(topicId) {
 // 上限到達: 自動実行・全質疑リレーを停止し、理由を記録して UI に明示する
 function triggerBudgetHalt(topicId, agent, reason) {
   if (state.budgetHalt) return;
-  state.budgetHalt = { reason, ts: Date.now() };
-  for (const a of AGENTS) state.agents[a].auto = false;
+  state.budgetHalt = { reason, ts: Date.now() }; // 安全ラッチ（ユーザーの auto 設定には触れない）
   for (const t of state.topics) t.relay = defaultRelay();
   state.messages.push({
     id: id(),
@@ -584,7 +585,7 @@ function qaHop(topic, agent, replyText, sourceMsgId) {
     ts: Date.now(),
   });
   if (r.remaining <= 0) r.active = false; // 最終手: 相手は応答するがそれ以上は中継しない
-  if (state.agents[other].auto) agentLoop(topic.id, other);
+  if (agentAutoOn(other)) agentLoop(topic.id, other);
 }
 
 // stream-json イベント → 実況用の1行テキスト
@@ -1264,7 +1265,7 @@ async function agentLoop(topicId, agent) {
         // 同期失敗しても応答は続行
       }
       const msgs = unseenFor(topic, agent);
-      if (!a.auto || !msgs.length) break;
+      if (!agentAutoOn(agent) || !msgs.length) break;
       const overBudget = budgetStatus(topicId);
       if (overBudget) {
         triggerBudgetHalt(topicId, agent, overBudget);
@@ -1338,7 +1339,7 @@ async function agentLoop(topicId, agent) {
 function maybeTrigger(messages) {
   for (const m of messages) {
     if (!AGENTS.includes(m.thread) || m.author === m.thread) continue;
-    if (state.agents[m.thread].auto && findTopic(m.topicId)) agentLoop(m.topicId, m.thread);
+    if (agentAutoOn(m.thread) && findTopic(m.topicId)) agentLoop(m.topicId, m.thread);
   }
 }
 
@@ -1379,8 +1380,7 @@ async function handleApi(req, res, url) {
       thread: t,
       author,
       text,
-      relayedFrom: typeof body.relayedFrom === "string" ? body.relayedFrom : null,
-      sourceId: typeof body.sourceId === "string" ? body.sourceId : null,
+      // relayedFrom / sourceId はサーバー内部（qaHop / /api/relay）だけが設定できる
       ts: Date.now(),
     }));
     state.messages.push(...created);
@@ -1424,10 +1424,30 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/budgets/resume") {
-    state.budgetHalt = null;
-    for (const a of AGENTS) state.agents[a].auto = true;
+    state.budgetHalt = null; // ラッチ解除のみ。ユーザーが OFF にした auto には触れない
     touch();
     return json(res, 200, { ok: true });
+  }
+
+  // 手動転送（検証付き）: 元メッセージをサーバー側で複製して相手レーンへ
+  if (req.method === "POST" && url.pathname === "/api/relay") {
+    const body = await readBody(req);
+    const src = state.messages.find((m) => m.id === body.messageId);
+    if (!src || !AGENTS.includes(src.thread)) return json(res, 404, { error: "元メッセージが見つかりません" });
+    const copy = {
+      id: id(),
+      topicId: src.topicId,
+      thread: OTHER[src.thread],
+      author: src.author,
+      text: src.text,
+      relayedFrom: src.thread,
+      sourceId: src.id,
+      ts: Date.now(),
+    };
+    state.messages.push(copy);
+    touch();
+    maybeTrigger([copy]);
+    return json(res, 201, copy);
   }
 
   // ---- トピック（スレッド）管理 ----
@@ -1715,6 +1735,7 @@ async function handleApi(req, res, url) {
     const text = typeof body.text === "string" ? body.text.trim() : "";
     const hops = Math.min(20, Math.max(1, Number(body.hops) || 6));
     if (!first || !text) return json(res, 400, { error: "first と text は必須です" });
+    if (state.budgetHalt) return json(res, 400, { error: "上限停止中です（バナーから解除してください）" });
     if (!state.agents.claude.auto || !state.agents.codex.auto)
       return json(res, 400, { error: "質疑モードには両スレッドの自動応答をONにしてください" });
     const qaTopic = findTopic(body.topicId) || state.topics[0];

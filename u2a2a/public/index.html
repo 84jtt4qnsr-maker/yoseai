@@ -668,6 +668,31 @@
   .verdict[data-v="差し戻し"] { color: var(--danger); border-color: #ff7b7b55; }
   .review .r-body { max-height: 200px; overflow-y: auto; word-break: break-word; font-size: 13px; }
 
+  /* コンテキストメニュー */
+  #ctx-menu[hidden] { display: none; }
+  #ctx-menu {
+    position: fixed;
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    min-width: 200px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 4px;
+    box-shadow: 0 8px 24px #000a;
+  }
+  .ctx-item {
+    background: none;
+    border: none;
+    text-align: left;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  .ctx-item:hover { background: var(--panel); border: none; }
+
   dialog {
     background: var(--panel);
     color: var(--text);
@@ -954,7 +979,7 @@ function renderTopicBar() {
   const topics = state.topics || [];
   for (const t of topics) {
     const active = t.id === (currentTopic() || {}).id;
-    const tab = el("div", { class: "topic-tab" + (active ? " active" : ""), onclick: () => { if (!active) switchTopic(t.id); } });
+    const tab = el("div", { class: "topic-tab" + (active ? " active" : ""), "data-topic": t.id, onclick: () => { if (!active) switchTopic(t.id); } });
     // ブラウザライクなドラッグ入れ替え
     tab.setAttribute("draggable", "true");
     tab.addEventListener("dragstart", (e) => e.dataTransfer.setData("text/u2a2a-topic", t.id));
@@ -1058,7 +1083,7 @@ function activityEl(a) {
         .then(() => toast("停止を要求しました（SIGTERM→3秒でSIGKILL）")),
     }));
   }
-  const box = el("div", { class: "activity" }, [
+  const box = el("div", { class: "activity", "data-runid": a.runId || "" }, [
     head,
     el("div", { class: "a-step", text: a.step || "" }),
   ]);
@@ -1360,6 +1385,8 @@ function fmtSize(n) {
 
 // ファイルプレビューのキャッシュ（file+mtime をキーに再取得を抑制）
 const poolPreview = {};
+// 存在しないメディア参照（再描画のたびに404を出さないための失敗キャッシュ）
+const mediaFailed = new Set();
 // 展開中のレビュー id（既定は折りたたみ・判定チップのみ表示）
 const openReviews = new Set();
 
@@ -1494,6 +1521,7 @@ function fileRowEl(p, depth) {
   const base = (p.file || p.title).split("/").pop();
   const row = el("div", {
     class: "pf-row" + (p.id === poolSelectedId ? " sel" : ""),
+    "data-file": p.file || "",
     style: "padding-left:" + (8 + depth * 14) + "px",
     onclick: () => {
       poolSelectedId = p.id;
@@ -1535,6 +1563,7 @@ function renderPool() {
     const active = t.id === (currentTopic() || {}).id;
     return el("div", {
       class: "pf-row" + (poolSelectedId === "topic:" + t.id ? " sel" : ""),
+      "data-topic": t.id,
       style: "padding-left:" + (8 + depth * 14) + "px",
       onclick: () => {
         poolSelectedId = "topic:" + t.id;
@@ -1592,6 +1621,7 @@ function renderPool() {
         const name = d.split("/").pop();
         const folderRow = el("div", {
           class: "pf-row folder" + (poolCurrentDir === d ? " cwd" : ""),
+          "data-dir": d,
           style: "padding-left:" + (8 + depth * 14) + "px",
           title: "クリックで作成先に指定 ／ ドロップで移動先に",
           onclick: () => {
@@ -1910,6 +1940,10 @@ function renderAgentStatus(agent) {
     status.dataset.s = "running";
     status.textContent = "応答中…";
     status.title = "";
+  } else if (state.budgetHalt && a.auto) {
+    status.dataset.s = "error";
+    status.textContent = "上限停止中";
+    status.title = state.budgetHalt.reason;
   } else if (a.lastError) {
     status.dataset.s = "error";
     status.textContent = "エラー（ホバーで詳細）";
@@ -1951,6 +1985,14 @@ function renderThread(agent) {
 
     const isRaw = rawView.has(m.id);
     const actions = el("div", { class: "actions" }, [
+      el("button", {
+        class: "small", text: "⋯", title: "コンテキストメニュー",
+        onclick: (e) => {
+          e.stopPropagation();
+          const r = e.target.getBoundingClientRect();
+          openCtxMenu(r.left, r.bottom + 2, ctxItems({ type: "message", m }));
+        },
+      }),
       el("button", { class: "small", text: "タスク化", onclick: () => openTaskDialog(agent, m) }),
       el("button", {
         class: "small",
@@ -2006,10 +2048,23 @@ function renderThread(agent) {
         // Markdown 記法で既に本文中に埋め込まれているものは重複させない
         if (new RegExp("\\]\\([^)]*" + rel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\)").test(m.text)) continue;
         const url = "/api/pool/file/" + encodeURI(rel);
-        if (isImageExt(rel)) mediaKids.push(el("img", { src: url, alt: rel, loading: "lazy" }));
-        else if (isVideoExt(rel)) mediaKids.push(el("video", { src: url, controls: "", style: "max-width:100%;max-height:260px;border-radius:6px;" }));
-        else if (isAudioExt(rel)) mediaKids.push(el("audio", { src: url, controls: "", style: "width:100%;" }));
-        else mediaKids.push(el("a", { href: url, target: "_blank", rel: "noopener", text: "📄 " + full }));
+        if (mediaFailed.has(rel)) {
+          mediaKids.push(el("span", { class: "pf-size", text: "⚠ ファイルが見つかりません: " + full }));
+        } else if (isImageExt(rel)) {
+          const img = el("img", { src: url, alt: rel, loading: "lazy" });
+          img.addEventListener("error", () => { mediaFailed.add(rel); renderThread(agent); });
+          mediaKids.push(img);
+        } else if (isVideoExt(rel)) {
+          const v = el("video", { src: url, controls: "", preload: "metadata", style: "max-width:100%;max-height:260px;border-radius:6px;" });
+          v.addEventListener("error", () => { mediaFailed.add(rel); renderThread(agent); });
+          mediaKids.push(v);
+        } else if (isAudioExt(rel)) {
+          const au = el("audio", { src: url, controls: "", preload: "metadata", style: "width:100%;" });
+          au.addEventListener("error", () => { mediaFailed.add(rel); renderThread(agent); });
+          mediaKids.push(au);
+        } else {
+          mediaKids.push(el("a", { href: url, target: "_blank", rel: "noopener", text: "📄 " + full }));
+        }
       }
       if (mediaKids.length) kids.push(el("div", { class: "msg-media" }, mediaKids));
     }
@@ -2098,16 +2153,8 @@ async function copy(text) {
 }
 
 async function relay(fromAgent, m) {
-  // 発言者本人（エージェント）の言葉として相手スレッドへ届ける
-  const author = m.author === "user" ? "user" : m.author;
-  await api("/api/messages", "POST", {
-    thread: OTHER[fromAgent],
-    author,
-    text: m.text,
-    relayedFrom: fromAgent,
-    sourceId: m.id,
-    topicId: m.topicId || (currentTopic() || {}).id,
-  });
+  // サーバー側で元メッセージを検証して複製する（relayedFrom/sourceId はサーバーのみが設定）
+  await api("/api/relay", "POST", { messageId: m.id });
   toast(NAMES[OTHER[fromAgent]] + " スレッドへ転送しました");
 }
 
@@ -2345,6 +2392,158 @@ $("#attach-input").addEventListener("change", async (e) => {
   }
   e.target.value = "";
 });
+
+// ---- コンテキストメニュー（合意: 既存操作への別入口。右クリック / ⋯ / Shift+F10）----
+const ctxMenuEl = el("div", { id: "ctx-menu", hidden: "" });
+document.body.appendChild(ctxMenuEl);
+
+function closeCtxMenu() {
+  ctxMenuEl.hidden = true;
+}
+
+function openCtxMenu(x, y, items) {
+  if (!items || !items.length) return;
+  ctxMenuEl.replaceChildren();
+  for (const [label, action] of items) {
+    ctxMenuEl.appendChild(el("button", {
+      class: "ctx-item",
+      text: label,
+      onclick: () => {
+        closeCtxMenu();
+        action();
+      },
+    }));
+  }
+  ctxMenuEl.hidden = false;
+  // 画面外にはみ出さないようクランプ
+  ctxMenuEl.style.left = "0px";
+  ctxMenuEl.style.top = "0px";
+  const r = ctxMenuEl.getBoundingClientRect();
+  ctxMenuEl.style.left = Math.min(x, innerWidth - r.width - 8) + "px";
+  ctxMenuEl.style.top = Math.min(y, innerHeight - r.height - 8) + "px";
+}
+
+function insertToInput(text) {
+  const ta = $("#user-text");
+  ta.value += (ta.value && !ta.value.endsWith("\n") ? "\n" : "") + text;
+  ta.focus();
+}
+
+function quoteToInput(text) {
+  insertToInput(text.split("\n").map((l) => "> " + l).join("\n") + "\n");
+}
+
+const parentDirOf = (file) => (file.includes("/") ? file.slice(0, file.lastIndexOf("/")) : "");
+
+// 対象ごとの操作 allowlist（対象外はブラウザ標準メニューを維持）
+function ctxItems(t) {
+  if (t.type === "run") {
+    return [["⏹ 実行を中断", () => api("/api/runs/" + t.runId + "/cancel", "POST", {}).then(() => toast("停止を要求しました"))]];
+  }
+  if (t.type === "message") {
+    const m = t.m;
+    return [
+      ["コピー", () => copy(m.text)],
+      ["引用して入力欄へ", () => quoteToInput(m.text)],
+      ["タスク化", () => openTaskDialog(m.thread, m)],
+    ];
+  }
+  if (t.type === "poolfile") {
+    const p = t.p;
+    const dir = parentDirOf(p.file);
+    const items = [
+      ["⧉ コピー", () => { poolClipboard = { path: p.file, isDir: false }; renderClipBar(); toast("コピー: " + p.file); }],
+    ];
+    if (poolClipboard)
+      items.push(["📋 ここへ貼り付け（" + (dir || "ルート") + "）", () => api("/api/pool/copy", "POST", { src: poolClipboard.path, destDir: dir }).then((r) => toast("複製: " + r.dest))]);
+    items.push(["パスを入力欄へ挿入", () => insertToInput("u2a2a/pool/" + p.file)]);
+    items.push(["Claude にレビュー依頼", () => api("/api/pool/" + p.id + "/review", "POST", { reviewer: "claude" })]);
+    items.push(["Codex にレビュー依頼", () => api("/api/pool/" + p.id + "/review", "POST", { reviewer: "codex" })]);
+    return items;
+  }
+  if (t.type === "pooldir") {
+    const items = [
+      ["⧉ フォルダをコピー", () => { poolClipboard = { path: t.dir, isDir: true }; renderClipBar(); toast("コピー: " + t.dir + "/"); }],
+    ];
+    if (poolClipboard)
+      items.push(["📋 このフォルダへ貼り付け", () => api("/api/pool/copy", "POST", { src: poolClipboard.path, destDir: t.dir }).then((r) => toast("複製: " + r.dest))]);
+    items.push(["パスを入力欄へ挿入", () => insertToInput("u2a2a/pool/" + t.dir + "/")]);
+    return items;
+  }
+  if (t.type === "topic") {
+    const topic = (state.topics || []).find((x) => x.id === t.id);
+    if (!topic) return [];
+    return [
+      ["📌 要約を更新", () => api("/api/topics/" + topic.id + "/summarize", "POST", {}).then(() => toast("要約を生成中…"))],
+      ["履歴をコピー", async () => {
+        if (!topic.mirrorFile) return;
+        const r = await fetch("/api/pool/file/" + encodeURIComponent(topic.mirrorFile));
+        copy(await r.text());
+      }],
+      ["名前を変更", () => { renamingTopicId = topic.id; renderTopicBar(); }],
+      ["質疑リレーを停止", () => api("/api/qa/stop", "POST", { topicId: topic.id })],
+    ];
+  }
+  return [];
+}
+
+function resolveCtxTarget(elx) {
+  if (!elx || !elx.closest) return null;
+  const act = elx.closest(".activity[data-runid]");
+  if (act && act.dataset.runid) {
+    const run = (state.runs || []).find((r) => r.runId === act.dataset.runid);
+    if (run && run.kind === "thread") return { type: "run", runId: run.runId };
+  }
+  const msg = elx.closest(".msg[data-mid]");
+  if (msg) {
+    const m = state.messages.find((x) => x.id === msg.dataset.mid);
+    if (m) return { type: "message", m };
+  }
+  const row = elx.closest(".pf-row");
+  if (row) {
+    if (row.dataset.topic) return { type: "topic", id: row.dataset.topic };
+    if (row.dataset.dir) return { type: "pooldir", dir: row.dataset.dir };
+    if (row.dataset.file) {
+      const p = (state.pool || []).find((x) => x.file === row.dataset.file);
+      if (p) return { type: "poolfile", p };
+    }
+  }
+  const tab = elx.closest(".topic-tab[data-topic]");
+  if (tab) return { type: "topic", id: tab.dataset.topic };
+  const detail = elx.closest("#pool-detail");
+  if (detail) {
+    if (typeof poolSelectedId === "string" && poolSelectedId.startsWith("topic:"))
+      return { type: "topic", id: poolSelectedId.slice(6) };
+    const p = (state.pool || []).find((x) => x.id === poolSelectedId);
+    if (p) return { type: "poolfile", p };
+  }
+  return null;
+}
+
+document.addEventListener("contextmenu", (e) => {
+  const t = resolveCtxTarget(e.target);
+  if (!t) return; // 対象外はブラウザ標準メニュー
+  const items = ctxItems(t);
+  if (!items.length) return;
+  e.preventDefault();
+  openCtxMenu(e.clientX, e.clientY, items);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.shiftKey && e.key === "F10") {
+    const t = resolveCtxTarget(document.activeElement);
+    if (!t) return;
+    const items = ctxItems(t);
+    if (!items.length) return;
+    e.preventDefault();
+    const r = document.activeElement.getBoundingClientRect();
+    openCtxMenu(r.left + 8, r.bottom + 2, items);
+  }
+  if (e.key === "Escape") closeCtxMenu();
+});
+document.addEventListener("click", (e) => {
+  if (!ctxMenuEl.contains(e.target)) closeCtxMenu();
+});
+document.addEventListener("scroll", closeCtxMenu, true);
 
 // ---- wiring ----
 $("#user-send").addEventListener("click", sendUser);
