@@ -304,7 +304,9 @@ function buildPrompt(topic, agent, msgs, isFirst) {
     ? `あなたは「U2A2Aオーケストレーション」アプリの ${NAMES[agent]} 側スレッドの担当エージェントです。` +
       `このスレッドのトピックは「${topic.title}」です。` +
       `参加者はユーザー・${NAMES[agent]}（あなた）・${NAMES[other]} の三者です。` +
-      `作業ディレクトリは Kometa リポジトリ（閲覧のみ、変更は不可）。` +
+      (agent === "claude"
+        ? `作業ディレクトリは Kometa リポジトリ（閲覧のみ、変更は不可）。`
+        : `作業ディレクトリは u2a2a/pool（成果物置き場・書き込み可）。Kometa リポジトリ本体（${REPO_ROOT}）は閲覧のみ。`) +
       `新着メッセージに ${NAMES[agent]} として日本語で簡潔に返答してください。` +
       `実装作業が必要な場合は作業内容を提案し、タスク化はユーザーに委ねてください。\n\n--- 新着メッセージ ---\n`
     : "--- 新着メッセージ ---\n";
@@ -318,7 +320,11 @@ function buildPrompt(topic, agent, msgs, isFirst) {
       ? `\n\n（成果物ファイルは u2a2a/pool/ 配下にのみ保存できます（他への書き込みは不許可）。` +
         `画像・音声・動画は python3 / ffmpeg を実行して生成できます（PNG/GIF/MP4/WAV 等。保存先は必ず u2a2a/pool/ 配下）。` +
         `保存したら本文にそのパスを書いてください — アプリが画像・動画・音声をインライン表示します）`
-      : `\n\n（あなたの環境はファイル書き込み不可です。SVG・HTML・コード等の成果物は、本文にフェンス付きコードブロック（\`\`\`svg など言語指定付き）で出力してください。アプリが SVG をインライン描画し、ユーザーがワンクリックでプールに保存できます）`;
+      : `\n\n（カレントディレクトリ（u2a2a/pool/ = 成果物置き場）にのみファイルを保存できます。` +
+        `python3 / ffmpeg を実行して画像・音声・動画（PNG/GIF/MP4/WAV 等）を生成できます。` +
+        `リポジトリ本体は ${REPO_ROOT} を絶対パスで参照（閲覧のみ）。` +
+        `保存したら本文に u2a2a/pool/〜 のパスを書いてください — アプリがインライン表示します。` +
+        `短い SVG 等は本文のコードブロックでも構いません）`;
   return preamble + lines + qaNote + artifactNote;
 }
 
@@ -441,9 +447,11 @@ function codexStepFrom(ev) {
 async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
   const outFile = path.join(os.tmpdir(), `u2a2a-codex-${id()}.txt`);
   const base = ["--json", "-o", outFile, "--skip-git-repo-check"];
-  // resume は -s / -C を受け付けない（元セッションから継承）。config 経由で read-only を明示する
+  // resume は -s / -C を受け付けない（cwd は元セッションから継承）。sandbox は config 経由で明示する。
+  // resumeWritable は「cwd=pool で作られたセッション」のみ true にすること（リポジトリ cwd の旧セッションを
+  // workspace-write で再開するとリポジトリ全体が書き込み可能になってしまう）
   const args = sessionId
-    ? ["exec", "resume", sessionId, "-", ...base, "-c", 'sandbox_mode="read-only"']
+    ? ["exec", "resume", sessionId, "-", ...base, "-c", `sandbox_mode="${opts.resumeWritable ? "workspace-write" : "read-only"}"`]
     : opts.writeDir
       ? ["exec", "-", ...base, "-s", "workspace-write", "-C", opts.writeDir]
       : ["exec", "-", ...base, "-s", "read-only", "-C", REPO_ROOT];
@@ -921,13 +929,16 @@ async function agentLoop(topicId, agent) {
       actStart(actKey, NAMES[agent] + " 応答");
       try {
         const call = agent === "claude" ? callClaude : callCodex;
-        // claude はプール配下のファイル保存に加え、メディア生成用に python3 / ffmpeg の実行を許可
+        // claude はプール配下のファイル保存に加え、メディア生成用に python3 / ffmpeg の実行を許可。
+        // codex は cwd=pool の workspace-write で起動（書き込みはプール限定・リポジトリは閲覧のみ）
+        const hadSession = !!ta.sessionId;
         const opts =
           agent === "claude"
             ? { extraArgs: ["--allowedTools", "Write(u2a2a/pool/**)", "Edit(u2a2a/pool/**)", "Bash(python3:*)", "Bash(ffmpeg:*)"] }
-            : {};
+            : { writeDir: POOL_DIR, resumeWritable: !!ta.codexPoolCwd };
         const { text, sessionId, model } = await call(prompt, ta.sessionId, a.modelOverride, (s) => actStep(actKey, s), opts);
         ta.sessionId = sessionId;
+        if (agent === "codex" && !hadSession) ta.codexPoolCwd = true; // 新方式（cwd=pool）で作られた印
         if (model) a.model = model;
         ta.lastSeenTs = msgs[msgs.length - 1].ts;
         a.lastError = "";
@@ -1034,6 +1045,13 @@ async function handleApi(req, res, url) {
     if (req.method === "PATCH") {
       const body = await readBody(req);
       if (typeof body.title === "string" && body.title.trim()) topic.title = body.title.trim().slice(0, 60);
+      // CLI セッションのリセット（次の応答から新セッション。codex は新方式 cwd=pool で始まる）
+      if (AGENTS.includes(body.resetAgent)) {
+        const ta = topic.agents[body.resetAgent];
+        ta.sessionId = null;
+        ta.transcriptOffset = null;
+        delete ta.codexPoolCwd;
+      }
       touch();
       return json(res, 200, topic);
     }

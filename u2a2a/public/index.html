@@ -716,6 +716,7 @@
   <!-- Claude Code 側スレッド -->
   <section class="thread-col" data-agent="claude">
     <div class="thread-head"><span class="role-dot"></span>Claude Code 側スレッド<input class="model-chip" id="model-claude" list="models-claude" title="使用モデルを指定（空欄=CLI既定）。プレースホルダは直近の実使用モデル" /><datalist id="models-claude"><option value="opus"></option><option value="sonnet"></option><option value="haiku"></option></datalist><span class="count" id="count-claude"></span><span class="agent-status" id="status-claude"></span>
+      <button class="small" id="reset-claude" title="このスレッドの Claude CLI セッションをリセット（次の応答から新セッション・文脈もリセット）">⟳</button>
       <label class="auto-ctl"><input type="checkbox" id="auto-claude" />自動応答</label>
     </div>
     <div class="messages" id="messages-claude"></div>
@@ -732,6 +733,7 @@
   <!-- Codex 側スレッド -->
   <section class="thread-col" data-agent="codex">
     <div class="thread-head"><span class="role-dot"></span>Codex 側スレッド<input class="model-chip" id="model-codex" list="models-codex" title="使用モデルを指定（空欄=CLI既定）。プレースホルダは直近の実使用モデル" /><datalist id="models-codex"></datalist><span class="count" id="count-codex"></span><span class="agent-status" id="status-codex"></span>
+      <button class="small" id="reset-codex" title="このスレッドの Codex CLI セッションをリセット（次の応答から新セッション・文脈もリセット。メディア生成対応の新方式に切替）">⟳</button>
       <label class="auto-ctl"><input type="checkbox" id="auto-codex" />自動応答</label>
     </div>
     <div class="messages" id="messages-codex"></div>
@@ -2180,6 +2182,12 @@ $("#user-text").addEventListener("keydown", (e) => {
 for (const agent of ["claude", "codex"]) {
   $("#auto-" + agent).addEventListener("change", (e) => {
     api("/api/agents/" + agent, "PATCH", { auto: e.target.checked });
+  });
+  $("#reset-" + agent).addEventListener("click", (e) => {
+    const t = currentTopic();
+    if (!t) return;
+    api("/api/topics/" + t.id, "PATCH", { resetAgent: agent })
+      .then(() => toast(NAMES[agent] + " は次の応答から新しい CLI セッションになります（文脈はリセット）"));
   });
   const modelInput = $("#model-" + agent);
   const commitModel = () => {

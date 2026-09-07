@@ -50,8 +50,12 @@ node u2a2a/server.mjs
 （スレッドヘッダの「自動応答」でON/OFF、OFF時は従来どおり貼り付け運用）。
 
 - Claude: `claude -p --resume <session>` — 要 `claude` → `/login`
+  - `u2a2a/pool/` 限定の Write/Edit と、メディア生成用の `python3` / `ffmpeg` 実行を許可
 - Codex: `codex exec` / `codex exec resume <session>` — 要 `codex login`
-- どちらも読み取り専用（実装作業はさせない。作業はタスクキュー経由で各アプリにて）
+  - 新セッションは `-s workspace-write -C u2a2a/pool/`（書き込みはプール限定・リポジトリは閲覧のみ）。
+    旧セッション（cwd=リポジトリ）は安全のため read-only のまま — スレッドヘッダの ⟳ でリセットすると新方式に切替
+- どちらもリポジトリ本体への書き込みは不可（実装作業はタスクキュー経由で各アプリにて）
+- 画像（PNG等）・音声（WAV）・動画（MP4, 要ffmpeg）を生成してプールに保存 → スレッドにインライン表示・再生できる
 - セッション ID を保存してスレッドの文脈を継続。エラーはヘッダに赤字表示（ホバーで詳細）
 
 ## レイアウト
