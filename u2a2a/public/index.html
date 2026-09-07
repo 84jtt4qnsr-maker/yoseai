@@ -370,6 +370,15 @@
     display: block;
     margin: 6px 0 0;
   }
+  .msg-meta {
+    margin-top: 5px;
+    font-size: 10.5px;
+    color: var(--dim);
+    font-family: ui-monospace, "SF Mono", monospace;
+    border-top: 1px solid var(--line);
+    padding-top: 3px;
+  }
+  .r-head .msg-meta { border: none; margin: 0; padding: 0; margin-left: auto; }
   .msg-media { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
   .msg-media img { max-width: 100%; max-height: 240px; border-radius: 6px; border: 1px solid var(--line); }
   .msg-media a {
@@ -1064,6 +1073,25 @@ for (const boxId of ["messages-claude", "messages-codex"]) {
 }
 window.addEventListener("resize", scheduleLinks);
 
+// ---- 応答メタ（コスト・トークン・所要時間）表示 ----
+function fmtTok(n) {
+  if (!n) return "0";
+  if (n < 1000) return String(n);
+  return (n / 1000).toFixed(n < 10000 ? 1 : 0) + "k";
+}
+
+function metaText(meta) {
+  if (!meta) return "";
+  const parts = ["⏱ " + fmtElapsed(meta.durationMs || 0)];
+  parts.push("in " + fmtTok(meta.inTok) + (meta.cacheTok ? "（+cache " + fmtTok(meta.cacheTok) + "）" : "") + " / out " + fmtTok(meta.outTok));
+  if (meta.costUsd != null) parts.push("$" + meta.costUsd.toFixed(4));
+  return parts.join("　");
+}
+
+function metaEl(meta) {
+  return el("div", { class: "msg-meta", text: metaText(meta) });
+}
+
 // 経過時間だけ毎秒更新（全再描画はしない）
 setInterval(() => {
   for (const e2 of document.querySelectorAll(".elapsed[data-started]")) {
@@ -1544,10 +1572,26 @@ function renderPool() {
 function renderTopicDetail(box, t) {
   const msgs = (state.messages || []).filter((m) => m.topicId === t.id);
   const active = t.id === (currentTopic() || {}).id;
+  // トピック累計（コスト・トークン）
+  const tot = msgs.reduce(
+    (a, m) => {
+      if (m.meta) {
+        a.cost += m.meta.costUsd || 0;
+        a.inTok += m.meta.inTok || 0;
+        a.outTok += m.meta.outTok || 0;
+      }
+      return a;
+    },
+    { cost: 0, inTok: 0, outTok: 0 }
+  );
   box.appendChild(el("div", { class: "p-head" }, [
     el("span", { class: "origin", text: "🧵 スレッド履歴" }),
     el("span", { class: "p-title", text: t.title }),
     el("span", { class: "pf-size", text: msgs.length + " メッセージ" }),
+    el("span", {
+      class: "pf-size",
+      text: "累計 in " + fmtTok(tot.inTok) + " / out " + fmtTok(tot.outTok) + (tot.cost ? " / $" + tot.cost.toFixed(2) + "（Claude分）" : ""),
+    }),
   ]));
   if (t.mirrorFile) {
     const url = "/api/pool/file/" + encodeURIComponent(t.mirrorFile);
@@ -1629,6 +1673,7 @@ function renderPoolDetail(box, p) {
         el("span", { class: "reviewer", "data-o": r.reviewer, text: "🔎 " + NAMES[r.reviewer] + " のレビュー" }),
       ]);
       if (r.verdict) rHead.appendChild(el("span", { class: "verdict", "data-v": r.verdict, text: "【判定】" + r.verdict }));
+      if (r.meta) rHead.appendChild(metaEl(r.meta));
       const reviewKids = [rHead];
       if (rOpen) {
         const rBody = el("div", { class: "r-body mdview" });
@@ -1651,6 +1696,7 @@ function renderPoolDetail(box, p) {
         el("span", { class: "reviewer", "data-o": f.agent, text: "🔧 " + NAMES[f.agent] + " の修正" + (f.error ? "（失敗）" : "") }),
         el("span", { class: "pf-size", text: fmtTime(f.ts) }),
       ]);
+      if (f.meta) fHead.appendChild(metaEl(f.meta));
       const fixKids = [fHead];
       if (fOpen) {
         const fBody = el("div", { class: "r-body mdview" });
@@ -1844,6 +1890,7 @@ function renderThread(agent) {
       }
       if (mediaKids.length) kids.push(el("div", { class: "msg-media" }, mediaKids));
     }
+    if (m.meta && !(m.relayedFrom && !expandedRelays.has(m.id))) kids.push(metaEl(m.meta));
     kids.push(actions);
     box.appendChild(el("div", { class: "msg" + (m.external ? " external" : ""), "data-author": m.author, "data-mid": m.id }, kids));
   }

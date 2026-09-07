@@ -434,6 +434,7 @@ function claudeStepFrom(ev) {
 }
 
 async function callClaude(prompt, sessionId, modelOverride, onStep, opts = {}) {
+  const t0 = Date.now();
   // プロンプトは stdin 渡し（"---" 等で始まってもオプションと誤認されないように）
   // stream-json でイベントを逐次受け取り、進捗を実況する
   const args = ["-p", "--output-format", "stream-json", "--verbose"];
@@ -461,7 +462,15 @@ async function callClaude(prompt, sessionId, modelOverride, onStep, opts = {}) {
   if (result.is_error) throw new Error(String(result.result || "claude エラー").slice(0, 500));
   // modelUsage のキーがモデルID（"claude-opus-5[1m]" の [1m] はfastモード印なので除く）
   const model = Object.keys(result.modelUsage || {})[0]?.replace(/\[.*\]$/, "") || "";
-  return { text: result.result || "(空の応答)", sessionId: result.session_id || sessionId, model };
+  const u = result.usage || {};
+  const meta = {
+    durationMs: Date.now() - t0,
+    costUsd: typeof result.total_cost_usd === "number" ? result.total_cost_usd : null,
+    inTok: u.input_tokens || 0,
+    outTok: u.output_tokens || 0,
+    cacheTok: u.cache_read_input_tokens || 0,
+  };
+  return { text: result.result || "(空の応答)", sessionId: result.session_id || sessionId, model, meta };
 }
 
 // codex は --json だとモデル名を出力しないため、セッションの rollout ファイル冒頭から読む
@@ -500,6 +509,8 @@ function codexStepFrom(ev) {
 }
 
 async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
+  const t0 = Date.now();
+  const usage = { inTok: 0, outTok: 0, cacheTok: 0 };
   const outFile = path.join(os.tmpdir(), `u2a2a-codex-${id()}.txt`);
   const base = ["--json", "-o", outFile, "--skip-git-repo-check"];
   // resume は -s / -C を受け付けない（cwd は元セッションから継承）。sandbox は config 経由で明示する。
@@ -511,19 +522,24 @@ async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
       ? ["exec", "-", ...base, "-s", "workspace-write", "-C", opts.writeDir]
       : ["exec", "-", ...base, "-s", "read-only", "-C", REPO_ROOT];
   if (modelOverride) args.push("-m", modelOverride);
-  const onLine = onStep
-    ? (line) => {
-        if (!line.trim()) return;
-        let ev;
-        try {
-          ev = JSON.parse(line);
-        } catch {
-          return;
-        }
-        const s = codexStepFrom(ev);
-        if (s) onStep(s);
-      }
-    : null;
+  const onLine = (line) => {
+    if (!line.trim()) return;
+    let ev;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (ev.type === "turn.completed" && ev.usage) {
+      usage.inTok += ev.usage.input_tokens || 0;
+      usage.outTok += ev.usage.output_tokens || 0;
+      usage.cacheTok += ev.usage.cached_input_tokens || 0;
+    }
+    if (onStep) {
+      const s = codexStepFrom(ev);
+      if (s) onStep(s);
+    }
+  };
   const { code, out, err } = await runCli("codex", args, prompt, AGENT_TIMEOUT_MS, onLine);
   let text = "";
   try {
@@ -544,7 +560,8 @@ async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
     }
   }
   if (code !== 0 && !text) throw new Error((err || out || "codex CLI エラー").trim().slice(0, 500));
-  return { text: text || "(空の応答)", sessionId: newSessionId, model: codexModelFromRollout(newSessionId) };
+  const meta = { durationMs: Date.now() - t0, costUsd: null, ...usage }; // codex はプラン課金のためコスト情報なし
+  return { text: text || "(空の応答)", sessionId: newSessionId, model: codexModelFromRollout(newSessionId), meta };
 }
 
 // ---- 共有タスクプール: 相互レビュー ----
@@ -741,8 +758,8 @@ async function runReview(itemId, reviewer) {
   actStart(actKey, NAMES[reviewer] + " レビュー");
   try {
     const call = reviewer === "claude" ? callClaude : callCodex;
-    const { text } = await call(buildReviewPrompt(item, reviewer), null, state.agents[reviewer].modelOverride, (s) => actStep(actKey, s));
-    item.reviews.push({ id: id(), reviewer, text, verdict: verdictFrom(text), ts: Date.now() });
+    const { text, meta } = await call(buildReviewPrompt(item, reviewer), null, state.agents[reviewer].modelOverride, (s) => actStep(actKey, s));
+    item.reviews.push({ id: id(), reviewer, text, verdict: verdictFrom(text), meta, ts: Date.now() });
   } catch (e) {
     item.reviews.push({
       id: id(),
@@ -794,7 +811,7 @@ async function runFix(itemId, agent) {
     const prompt = buildFixPrompt(item, agent);
     const onStep = (s) => actStep(actKey, s);
     const override = state.agents[agent].modelOverride;
-    const { text } =
+    const { text, meta } =
       agent === "claude"
         ? await callClaude(prompt, null, override, onStep, {
             cwd: POOL_DIR,
@@ -802,7 +819,7 @@ async function runFix(itemId, agent) {
           })
         : await callCodex(prompt, null, override, onStep, { writeDir: POOL_DIR });
     item.fixes = item.fixes || [];
-    item.fixes.push({ id: id(), agent, text, ts: Date.now() });
+    item.fixes.push({ id: id(), agent, text, meta, ts: Date.now() });
     const st = statPoolFile(item.file);
     if (st) Object.assign(item, st);
     item.status = "submitted";
@@ -1033,13 +1050,13 @@ async function agentLoop(topicId, agent) {
           agent === "claude"
             ? { extraArgs: ["--allowedTools", "Write(u2a2a/pool/**)", "Edit(u2a2a/pool/**)", "Bash(python3:*)", "Bash(ffmpeg:*)"] }
             : { writeDir: POOL_DIR, resumeWritable: !!ta.codexPoolCwd };
-        const { text, sessionId, model } = await call(prompt, ta.sessionId, a.modelOverride, (s) => actStep(actKey, s), opts);
+        const { text, sessionId, model, meta } = await call(prompt, ta.sessionId, a.modelOverride, (s) => actStep(actKey, s), opts);
         ta.sessionId = sessionId;
         if (agent === "codex" && !hadSession) ta.codexPoolCwd = true; // 新方式（cwd=pool）で作られた印
         if (model) a.model = model;
         ta.lastSeenTs = msgs[msgs.length - 1].ts;
         a.lastError = "";
-        const replyMsg = { id: id(), topicId, thread: agent, author: agent, text, auto: true, ts: Date.now() };
+        const replyMsg = { id: id(), topicId, thread: agent, author: agent, text, auto: true, meta, ts: Date.now() };
         state.messages.push(replyMsg);
         markTranscriptSynced(topic, agent); // 自分の応答分は外部同期の対象外にする
         qaHop(topic, agent, text, replyMsg.id);
