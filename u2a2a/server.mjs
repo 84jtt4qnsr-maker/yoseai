@@ -136,6 +136,71 @@ function threadMirrorName(t) {
   return "threads/" + (sanitizeSegment(t.title) || "thread") + "-" + t.id.slice(0, 8) + ".md";
 }
 
+function buildThreadMirror(t, msgs) {
+  const fmtT = (ts) => new Date(ts).toLocaleString("ja-JP");
+  const qaSessions = msgs.filter((m) => m.qa && m.author === "user").length;
+  const fm =
+    `---\n` +
+    `topicId: ${t.id}\n` +
+    `created: ${new Date(t.ts).toISOString()}\n` +
+    `updated: ${msgs.length ? new Date(msgs[msgs.length - 1].ts).toISOString() : new Date(t.ts).toISOString()}\n` +
+    `messages: ${msgs.length}\n` +
+    `qaSessions: ${qaSessions}\n` +
+    `claudeSession: ${t.agents.claude.sessionId || "(未開始)"}\n` +
+    `codexSession: ${t.agents.codex.sessionId || "(未開始)"}\n` +
+    `---\n\n`;
+
+  // 📦 成果物索引: このスレッドのメッセージ由来のプールアイテム＋本文で言及されたプールファイル
+  const msgIds = new Set(msgs.map((m) => m.id));
+  const artifacts = new Map(); // rel -> 初出時刻
+  for (const p of state.pool) {
+    if (p.file && p.fromMessageId && msgIds.has(p.fromMessageId)) artifacts.set(p.file, p.ts);
+  }
+  for (const m of msgs) {
+    for (const full of m.text.match(/u2a2a\/pool\/[^\s)"'`」()）]+/g) || []) {
+      const rel = full.slice("u2a2a/pool/".length);
+      if (!rel.startsWith("threads/") && !artifacts.has(rel)) artifacts.set(rel, m.ts);
+    }
+  }
+  const artifactSec = artifacts.size
+    ? `## 📦 成果物\n\n` +
+      [...artifacts.entries()].map(([rel, ts]) => `- \`u2a2a/pool/${rel}\`（${fmtT(ts)}）`).join("\n") + "\n\n"
+    : "";
+
+  const tasks = state.tasks.filter((x) => x.topicId === t.id);
+  const taskSec = tasks.length
+    ? `## 🗂 タスク\n\n` +
+      tasks.map((x) => `- [${x.status === "done" ? "x" : " "}] ${x.title}（${NAMES[x.agent]}／${x.status}）`).join("\n") + "\n\n"
+    : "";
+
+  const summarySec = t.summaryText
+    ? `## 📌 概要（自動要約 ${fmtT(t.summaryTs)} 時点）\n\n${t.summaryText}\n\n`
+    : "";
+
+  const history = msgs
+    .map((m) => {
+      const tags = [m.auto ? "自動応答" : null, m.qa ? "質疑" : null, m.external ? "外部同期" : null]
+        .filter(Boolean)
+        .join("・");
+      const head = `### ${NAMES[m.author]} → ${NAMES[m.thread]} 側（${fmtT(m.ts)}${tags ? "／" + tags : ""}）`;
+      if (m.relayedFrom) {
+        // 受信側の中継コピーは冒頭のみ（原文は送信元レーンに全文が残る）
+        const headLine = m.text.split("\n").find((l) => l.trim()) || "";
+        return `${head}\n\n> ↪ ${NAMES[m.relayedFrom]} 側から中継: ${headLine.slice(0, 100)}${m.text.length > 100 ? "…（全文は中継元を参照）" : ""}\n`;
+      }
+      return `${head}\n\n${m.text}\n`;
+    })
+    .join("\n");
+
+  return (
+    fm +
+    `# ${t.title}\n\n` +
+    `（U2A2A スレッド履歴 — 自動生成ミラー。編集しても会話には反映されません）\n\n` +
+    summarySec + artifactSec + taskSec +
+    `## 💬 履歴\n\n` + history
+  );
+}
+
 function writeThreadMirrors() {
   fs.mkdirSync(POOL_THREADS, { recursive: true });
   const valid = new Set();
@@ -144,18 +209,7 @@ function writeThreadMirrors() {
     valid.add(rel);
     t.mirrorFile = rel;
     const msgs = state.messages.filter((m) => m.topicId === t.id);
-    const body =
-      `# ${t.title}\n\n` +
-      `（U2A2A スレッド履歴 — 自動生成ミラー。編集しても会話には反映されません／メッセージ ${msgs.length} 件）\n\n` +
-      msgs
-        .map((m) => {
-          const time = new Date(m.ts).toLocaleString("ja-JP");
-          const tags = [m.auto ? "自動応答" : null, m.qa ? "質疑" : null, m.external ? "外部同期" : null]
-            .filter(Boolean)
-            .join("・");
-          return `## ${NAMES[m.author]} → ${NAMES[m.thread]} 側スレッド（${time}${tags ? "／" + tags : ""}）\n\n${m.text}\n`;
-        })
-        .join("\n");
+    const body = buildThreadMirror(t, msgs);
     if (mirrorCache[rel] === body) continue;
     fs.writeFileSync(path.join(POOL_DIR, rel), body);
     mirrorCache[rel] = body;
@@ -336,6 +390,7 @@ function qaHop(topic, agent, replyText, sourceMsgId) {
   // 先手が初手で終了宣言しても、相手に見せるまではリレーを続ける。
   if (replyText.includes(QA_END_MARK) && r.hopsDone > 0) {
     r.active = false;
+    summarizeTopic(topic.id); // 質疑の決着は要約の節目
     return;
   }
   if (r.remaining <= 0) {
@@ -771,6 +826,47 @@ async function runFix(itemId, agent) {
   }
 }
 
+// ---- スレッド自動要約 ----
+// 節目（12メッセージごと・質疑終了時）に haiku で増分要約し、ミラー冒頭の 📌概要 を更新する
+const SUMMARY_EVERY = 12;
+const summaryPending = new Set();
+
+async function summarizeTopic(topicId) {
+  const topic = findTopic(topicId);
+  if (!topic || summaryPending.has(topicId)) return;
+  const msgs = state.messages.filter((m) => m.topicId === topicId);
+  if (!msgs.length) return;
+  summaryPending.add(topicId);
+  try {
+    const recent = msgs.filter((m) => !m.relayedFrom).slice(-40);
+    const lines = recent
+      .map((m) => `[${NAMES[m.author]}→${NAMES[m.thread]}側] ${m.text.slice(0, 500)}`)
+      .join("\n\n");
+    const prompt =
+      `以下は「U2A2Aオーケストレーション」のスレッド「${topic.title}」の会話です。` +
+      (topic.summaryText ? `\n\n--- 前回までの要約 ---\n${topic.summaryText}\n` : "") +
+      `\n--- 会話（直近・抜粋） ---\n${lines}\n\n--- 指示 ---\n` +
+      `このスレッドの現況要約を日本語・最大10行の箇条書きで書いてください。` +
+      `決定事項・未決の論点・生成された成果物（u2a2a/pool/ パス）を優先。前置きなしで要約本文のみを出力。`;
+    const { text } = await callClaude(prompt, null, "haiku");
+    topic.summaryText = text.trim();
+    topic.summaryAt = msgs.length;
+    topic.summaryTs = Date.now();
+    touch();
+  } catch {
+    // ログイン切れ等。次の節目に再試行
+  } finally {
+    summaryPending.delete(topicId);
+  }
+}
+
+function checkSummaries() {
+  for (const t of state.topics) {
+    const n = state.messages.filter((m) => m.topicId === t.id).length;
+    if (n && n - (t.summaryAt || 0) >= SUMMARY_EVERY) summarizeTopic(t.id);
+  }
+}
+
 function unseenFor(topic, agent) {
   const ta = topic.agents[agent];
   return state.messages
@@ -900,6 +996,7 @@ setInterval(() => {
     }
   }
   if (changed) touch();
+  checkSummaries();
 }, 30_000);
 
 async function agentLoop(topicId, agent) {
@@ -1042,6 +1139,11 @@ async function handleApi(req, res, url) {
   if (parts[0] === "api" && parts[1] === "topics" && parts[2]) {
     const topic = findTopic(parts[2]);
     if (!topic) return json(res, 404, { error: "topic not found" });
+    // 手動での要約更新
+    if (req.method === "POST" && parts[3] === "summarize") {
+      summarizeTopic(topic.id);
+      return json(res, 202, { ok: true });
+    }
     if (req.method === "PATCH") {
       const body = await readBody(req);
       if (typeof body.title === "string" && body.title.trim()) topic.title = body.title.trim().slice(0, 60);

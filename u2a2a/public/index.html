@@ -1567,6 +1567,12 @@ function renderTopicDetail(box, t) {
         copy(await r.text());
       },
     }),
+    el("button", {
+      class: "small",
+      text: "📌 要約を更新",
+      onclick: () => api("/api/topics/" + t.id + "/summarize", "POST", {})
+        .then(() => toast("要約を生成中…（完了するとミラーの📌概要が更新されます）")),
+    }),
   ]);
   box.appendChild(actions);
   // 履歴プレビュー（ミラーファイルを取得して Markdown 表示）
