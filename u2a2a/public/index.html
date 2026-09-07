@@ -705,6 +705,7 @@
   <h1>U2A2A Orchestration</h1>
   <span class="sub">ユーザー ⇄ Claude Code ⇄ Codex ／ やり取りから生まれたタスクを各アプリで作業し、結果を再入力する</span>
   <button id="budget-btn" class="small" style="margin-left:auto" title="実行の上限設定（コスト・回数・時間）">⚙ 上限</button>
+  <button id="health-btn" class="small" title="運用イベント（失敗ログ）とストレージ計測">🩺</button>
 </header>
 
 <!-- トピック（スレッド）タブ -->
@@ -806,6 +807,17 @@
   </div>
 </section>
 </div>
+
+<!-- ヘルス（イベントログ・ストレージ計測）ダイアログ -->
+<dialog id="health-dialog">
+  <h3>🩺 運用イベント</h3>
+  <div class="field"><label id="health-storage"></label></div>
+  <div id="health-events" style="max-height:40vh;overflow-y:auto;font-size:12px;"></div>
+  <div class="buttons">
+    <button id="health-clear">ログをクリア</button>
+    <button id="health-close">閉じる</button>
+  </div>
+</dialog>
 
 <!-- 上限設定ダイアログ -->
 <dialog id="budget-dialog">
@@ -910,7 +922,7 @@
 const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
 const OTHER = { claude: "codex", codex: "claude" };
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
-let state = { messages: [], tasks: [], pool: [], topics: [], agents: {}, running: {}, reviewPending: {}, fixPending: {}, activity: {}, runs: [] };
+let state = { messages: [], tasks: [], pool: [], topics: [], agents: {}, running: {}, reviewPending: {}, fixPending: {}, activity: {}, runs: [], events: [], storageMetrics: {} };
 
 // ---- トピック（スレッド）----
 let currentTopicId = localStorage.getItem("u2a2a-topic") || null;
@@ -1313,6 +1325,7 @@ function render() {
   }
   renderQaBar();
   renderBudgetBar();
+  renderHealth();
   renderPool();
   scheduleLinks();
 }
@@ -1823,6 +1836,33 @@ function renderBudgetBar() {
   if (halt) $("#budget-reason").textContent = "🚫 " + halt.reason + " — 自動応答・質疑リレーを停止しています";
 }
 
+function renderHealth() {
+  const evs = state.events || [];
+  const bad = evs.filter((e) => e.level !== "info").length;
+  const btn = $("#health-btn");
+  btn.textContent = bad ? "🩺 " + bad : "🩺";
+  btn.style.color = evs.some((e) => e.level === "error") ? "var(--danger)" : bad ? "#d8c56f" : "";
+  // ダイアログが開いていれば中身も更新
+  if ($("#health-dialog").open) fillHealthDialog();
+}
+
+function fillHealthDialog() {
+  const sm = state.storageMetrics || {};
+  $("#health-storage").textContent =
+    "state.json: " + fmtSize(sm.lastBytes || 0) + "　保存 " + (sm.saves || 0) + " 回　直近 " + (sm.lastMs || 0) + "ms　累計 " + (sm.totalMs || 0) + "ms";
+  const box = $("#health-events");
+  box.replaceChildren();
+  const evs = [...(state.events || [])].reverse();
+  if (!evs.length) box.appendChild(el("div", { class: "empty", text: "イベントなし — 静かなのは良い知らせです" }));
+  for (const e of evs) {
+    const icon = e.level === "error" ? "🔴" : e.level === "warn" ? "🟡" : "🔵";
+    box.appendChild(el("div", { style: "padding:3px 0;border-bottom:1px solid var(--line);" }, [
+      el("span", { class: "pf-size", text: fmtTime(e.ts) + "　" }),
+      el("span", { text: icon + " [" + e.area + "] " + e.message + (e.count > 1 ? "（×" + e.count + "）" : "") }),
+    ]));
+  }
+}
+
 function renderQaBar() {
   const r = (currentTopic() || {}).relay || {};
   const bar = $("#qa-bar");
@@ -2330,6 +2370,9 @@ $("#budget-btn").addEventListener("click", () => {
   $("#budget-dialog").showModal();
 });
 $("#budget-cancel").addEventListener("click", () => $("#budget-dialog").close());
+$("#health-btn").addEventListener("click", () => { fillHealthDialog(); $("#health-dialog").showModal(); });
+$("#health-close").addEventListener("click", () => $("#health-dialog").close());
+$("#health-clear").addEventListener("click", () => api("/api/events/clear", "POST", {}).then(() => fillHealthDialog()));
 $("#budget-save").addEventListener("click", async () => {
   const num = (id2) => {
     const v = parseFloat($(id2).value);

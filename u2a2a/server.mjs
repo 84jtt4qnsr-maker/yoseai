@@ -134,6 +134,53 @@ function loadState() {
 let state = loadState();
 let saveTimer = null;
 
+// ---- 運用イベントログ（合意事項⑩: 重要な失敗の構造化可視化。永続化しない・最新100件）----
+const events = [];
+
+function logEvent(area, message, level = "error") {
+  const msg = String(message).slice(0, 300);
+  const last = events[events.length - 1];
+  // 同一エラーの連発は集約（5分以内）
+  if (last && last.area === area && last.message === msg && Date.now() - last.ts < 300000) {
+    last.ts = Date.now();
+    last.count = (last.count || 1) + 1;
+  } else {
+    events.push({ ts: Date.now(), level, area, message: msg, count: 1 });
+    if (events.length > 100) events.shift();
+  }
+  try {
+    broadcast();
+  } catch {
+    // 起動直後など broadcast 不能時は無視
+  }
+}
+
+// ---- ストレージ層（合意事項⑨: 計測付き・スキーマ版・物理分割は観測後）----
+const storageMetrics = { saves: 0, lastMs: 0, lastBytes: 0, totalMs: 0 };
+
+function persistState() {
+  const t0 = Date.now();
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    state.schemaVersion = 2;
+    const jsonStr = JSON.stringify(state, null, 2);
+    const tmp = STATE_FILE + ".tmp";
+    fs.writeFileSync(tmp, jsonStr);
+    fs.renameSync(tmp, STATE_FILE);
+    storageMetrics.saves++;
+    storageMetrics.lastMs = Date.now() - t0;
+    storageMetrics.lastBytes = Buffer.byteLength(jsonStr);
+    storageMetrics.totalMs += storageMetrics.lastMs;
+  } catch (e) {
+    logEvent("persist", "state.json の保存に失敗: " + (e.message || e));
+  }
+  try {
+    writeThreadMirrors(); // スレッド履歴を pool/threads/ の実ファイルへ同期
+  } catch (e) {
+    logEvent("mirror", "スレッドミラー生成に失敗: " + (e.message || e), "warn");
+  }
+}
+
 // 実行中フラグは永続化しない（クラッシュ後に張り付くのを防ぐ）。キー: "<topicId>:<agent>"
 const running = {};
 const needsRun = {};
@@ -142,17 +189,7 @@ const findTopic = (topicId) => state.topics.find((t) => t.id === topicId);
 
 function saveState() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const tmp = STATE_FILE + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-    fs.renameSync(tmp, STATE_FILE);
-    try {
-      writeThreadMirrors(); // スレッド履歴を pool/threads/ の実ファイルへ同期
-    } catch {
-      // ミラー生成失敗で保存自体は止めない
-    }
-  }, 100);
+  saveTimer = setTimeout(persistState, 100);
 }
 
 // ---- スレッド履歴ミラー ----
@@ -363,7 +400,7 @@ function actEnd(key) {
 
 function publicState() {
   // running / reviewPending / fixPending は互換用の派生値。正は runs レジストリ
-  return { ...state, running, reviewPending, fixPending, activity, poolDirs, runs: publicRuns() };
+  return { ...state, running, reviewPending, fixPending, activity, poolDirs, runs: publicRuns(), events, storageMetrics };
 }
 
 function broadcast() {
@@ -891,8 +928,8 @@ function scanPoolDir() {
 setInterval(() => {
   try {
     if (scanPoolDir()) touch();
-  } catch {
-    // 次回スキャンに持ち越し
+  } catch (e) {
+    logEvent("pool", "プールスキャンに失敗: " + (e.message || e), "warn");
   }
 }, 20_000);
 
@@ -1060,8 +1097,8 @@ async function summarizeTopic(topicId) {
     topic.summaryAt = msgs.length;
     topic.summaryTs = Date.now();
     touch();
-  } catch {
-    // ログイン切れ等。次の節目に再試行
+  } catch (e) {
+    logEvent("summary", `スレッド要約の生成に失敗（${topic.title}）: ` + (e.message || e), "warn");
   } finally {
     summaryPending.delete(topicId);
   }
@@ -1197,8 +1234,8 @@ setInterval(() => {
       if (running[runKey(topic.id, agent)]) continue; // 自分の応答書き込み中は増分を読まない
       try {
         if (syncExternal(topic, agent)) changed = true;
-      } catch {
-        // 同期失敗は次回に持ち越し
+      } catch (e) {
+        logEvent("sync", `外部セッション同期に失敗（${topic.title}/${agent}）: ` + (e.message || e), "warn");
       }
     }
   }
@@ -1363,6 +1400,13 @@ async function handleApi(req, res, url) {
     if (run.ctl.cancel) run.ctl.cancel();
     touch();
     return json(res, 202, { ok: true });
+  }
+
+  // 運用イベントログのクリア
+  if (req.method === "POST" && url.pathname === "/api/events/clear") {
+    events.length = 0;
+    touch();
+    return json(res, 200, { ok: true });
   }
 
   // ---- 上限設定 ----
@@ -1818,4 +1862,5 @@ saveState();
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`U2A2A Orchestration: http://127.0.0.1:${PORT}`);
+  logEvent("system", "サーバー起動（schemaVersion 2）", "info");
 });
