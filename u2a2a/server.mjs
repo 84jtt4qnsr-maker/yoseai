@@ -564,6 +564,70 @@ function commonRulesBlock(kind) {
   }
 }
 
+// ---- ファイル変更スナップショット（合意事項: レビュアーの根拠が黙って失効しないように）----
+// 前回プロンプト生成時点のファイル状態（mtime/size）を (topic, agent) ごとに保存し、
+// 次回プロンプトに「変更・追加・削除されたパス」を一行添える。対象は固定リストで有界
+function takeFileSnapshot(topicId) {
+  const snap = {};
+  const addFile = (abs, rel) => {
+    try {
+      const st = fs.statSync(abs);
+      if (st.isFile()) snap[rel] = Math.round(st.mtimeMs) + ":" + st.size;
+    } catch {
+      // 消えたファイルはスナップショットに含めない（削除として検出される）
+    }
+  };
+  const walk = (absDir, relDir, depth = 0) => {
+    if (depth > 6) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(absDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name.startsWith(".")) continue; // .work / .trash / 隠しファイルは対象外
+      if (e.name === "node_modules" || e.name === "threads") continue;
+      const abs = path.join(absDir, e.name);
+      const rel = relDir + "/" + e.name;
+      if (e.isDirectory()) walk(abs, rel, depth + 1);
+      else addFile(abs, rel);
+    }
+  };
+  addFile(path.join(REPO_ROOT, "u2a2a/server.mjs"), "u2a2a/server.mjs");
+  walk(path.join(REPO_ROOT, "u2a2a/public"), "u2a2a/public");
+  addFile(RULES_FILE, "u2a2a/pool/U2A2A_RULES.md");
+  if (topicId) walk(path.join(POOL_DIR, "topics", topicId), "u2a2a/pool/topics/" + topicId);
+  walk(path.join(REPO_ROOT, "runtime"), "runtime");
+  try {
+    for (const e of fs.readdirSync(REPO_ROOT, { withFileTypes: true })) {
+      if (e.isFile() && e.name.endsWith(".md")) addFile(path.join(REPO_ROOT, e.name), e.name);
+    }
+  } catch {
+    // ルート走査失敗は無視
+  }
+  return snap;
+}
+
+function fileChangeNote(prev, cur) {
+  if (!prev) return "";
+  const changed = [];
+  const added = [];
+  const removed = [];
+  for (const [rel, sig] of Object.entries(cur)) {
+    if (!(rel in prev)) added.push(rel);
+    else if (prev[rel] !== sig) changed.push(rel);
+  }
+  for (const rel of Object.keys(prev)) if (!(rel in cur)) removed.push(rel);
+  if (!changed.length && !added.length && !removed.length) return "";
+  const fmt = (arr) => (arr.length > 12 ? arr.slice(0, 12).join(", ") + ` 他${arr.length - 12}件` : arr.join(", "));
+  const parts = [];
+  if (changed.length) parts.push("変更: " + fmt(changed));
+  if (added.length) parts.push("追加: " + fmt(added));
+  if (removed.length) parts.push("削除: " + fmt(removed));
+  return `\n\n（あなたの前回の応答以降に変わったファイル — 古い根拠に注意: ${parts.join("／")}）`;
+}
+
 // ---- agent CLI runners ----
 const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
 const OTHER = { claude: "codex", codex: "claude" };
@@ -639,7 +703,7 @@ function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = nul
   });
 }
 
-function buildPrompt(topic, agent, msgs, isFirst) {
+function buildPrompt(topic, agent, msgs, isFirst, changesNote = "") {
   const other = agent === "claude" ? "codex" : "claude";
   const lines = msgs
     .map((m) => {
@@ -666,6 +730,21 @@ function buildPrompt(topic, agent, msgs, isFirst) {
       `新着メッセージに ${NAMES[agent]} として日本語で簡潔に返答してください。` +
       `実装作業が必要な場合は作業内容を提案し、タスク化はユーザーに委ねてください。\n\n--- 新着メッセージ ---\n`
     : "--- 新着メッセージ ---\n";
+  // 質疑の初手（このエージェントがまだ発言しておらず、発端も未見）には論点・発端・ミラー・要約を添える
+  let qaJoinNote = "";
+  const r = topic.relay;
+  if (r.active && r.startMessageId) {
+    const startMsg = state.messages.find((m) => m.id === r.startMessageId);
+    const startInUnseen = msgs.some((m) => m.id === r.startMessageId);
+    const spokeSince = startMsg && state.messages.some((m) => m.topicId === topic.id && m.author === agent && m.ts > startMsg.ts);
+    if (startMsg && !startInUnseen && !spokeSince) {
+      qaJoinNote =
+        `\n\n（この質疑の発端［${NAMES[startMsg.author]}］: ${startMsg.text.slice(0, 300)}${startMsg.text.length > 300 ? "…" : ""}` +
+        (topic.mirrorFile ? `／全経緯は u2a2a/pool/${topic.mirrorFile} で参照可` : "") +
+        (topic.summaryText ? `\nスレッドの現況要約:\n${topic.summaryText.slice(0, 600)}` : "") +
+        `）`;
+    }
+  }
   const qaNote = topic.relay.active
     ? `\n\n（現在 ${NAMES[other]} との質疑応答モードです。議論が浅いうちは結論に飛びつかず、質問・反論・検討を返してください。` +
       `${QA_END_MARK} は、相手の見解を少なくとも一度聞いた上で合意・結論に達した場合のみ、応答の末尾に書いてください。` +
@@ -687,7 +766,7 @@ function buildPrompt(topic, agent, msgs, isFirst) {
     isFirst && topic.summaryText && state.messages.some((m) => m.topicId === topic.id)
       ? `\n\n--- これまでのスレッドの要約（新しいセッションのための文脈） ---\n${topic.summaryText}\n`
       : "";
-  return preamble + contextNote + lines + qaNote + artifactNote + commonRulesBlock("通常応答");
+  return preamble + contextNote + qaJoinNote + lines + qaNote + changesNote + artifactNote + commonRulesBlock("通常応答");
 }
 
 // 質疑モード: エージェントの応答完了を待って相手スレッドへ中継する（トピック単位）
@@ -1431,7 +1510,9 @@ async function agentLoop(topicId, agent) {
         triggerBudgetHalt(topicId, agent, overBudget);
         break;
       }
-      const prompt = buildPrompt(topic, agent, msgs, !ta.sessionId);
+      const curSnapshot = takeFileSnapshot(topicId);
+      const changesNote = fileChangeNote(ta.fileSnapshot, curSnapshot);
+      const prompt = buildPrompt(topic, agent, msgs, !ta.sessionId, changesNote);
       const actKey = "thread:" + topicId + ":" + agent;
       const run = startRun("thread", agent, { topicId });
       run.sessionId = ta.sessionId || null;
@@ -1464,6 +1545,7 @@ async function agentLoop(topicId, agent) {
           ts: Date.now(),
         };
         state.messages.push(replyMsg);
+        ta.fileSnapshot = curSnapshot; // 変更通知の基準を今回時点へ進める
         markTranscriptSynced(topic, agent); // 自分の応答分は外部同期の対象外にする
         qaHop(topic, agent, text, replyMsg.id);
       } catch (e) {
@@ -2038,7 +2120,7 @@ async function handleApi(req, res, url) {
       return json(res, 400, { error: "質疑モードには両スレッドの自動応答をONにしてください" });
     const qaTopic = findTopic(body.topicId) || state.topics[0];
     if (!qaTopic) return json(res, 400, { error: "トピックがありません" });
-    qaTopic.relay = { active: true, remaining: hops, hopsDone: 0 };
+    qaTopic.relay = { active: true, remaining: hops, hopsDone: 0, startMessageId: null };
     qaTopic.qaCount = (qaTopic.qaCount || 0) + 1;
     const msg = {
       id: id(),
@@ -2049,6 +2131,7 @@ async function handleApi(req, res, url) {
       provenance: { ingress: "ui", delivery: "direct", trigger: "manual", source: null },
       ts: Date.now(),
     };
+    qaTopic.relay.startMessageId = msg.id;
     state.messages.push(msg);
     touch();
     agentLoop(qaTopic.id, first);
