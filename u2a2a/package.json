@@ -1,0 +1,9 @@
+{
+  "name": "u2a2a",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test"
+  }
+}

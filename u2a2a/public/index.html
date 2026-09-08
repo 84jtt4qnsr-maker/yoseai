@@ -1768,11 +1768,16 @@ function renderPoolDetail(box, p) {
     const pending = (state.reviewPending || {})[p.id] || [];
     const head = el("div", { class: "p-head" }, [
       el("span", { class: "status", "data-s": p.status, text: POOL_STATUS_LABEL[p.status] || p.status }),
-      el("span", { class: "origin", "data-o": p.origin, text: "持ち込み: " + NAMES[p.origin] }),
+      el("span", {
+        class: "origin",
+        "data-o": p.origin || "",
+        text: p.origin ? "持ち込み: " + NAMES[p.origin] : "作者未確定",
+        title: p.origin ? "" : "実行が複数同時だったため確定できませんでした。レビュー依頼等で正しい作者が判明したら宣言で上書きされます",
+      }),
       el("span", { class: "p-title", text: p.title }),
     ]);
-    if (p.via === "folder") head.appendChild(el("span", { class: "origin", text: "フォルダ投入" }));
-    if (p.via === "upload") head.appendChild(el("span", { class: "origin", text: "アップロード" }));
+    const VIA_LABEL = { folder: "フォルダ投入", upload: "アップロード", created: "新規作成", declared: "宣言", inferred: "推定", agent: "実行中推定" };
+    if (VIA_LABEL[p.via]) head.appendChild(el("span", { class: "origin", text: VIA_LABEL[p.via] }));
 
     const kids = [head];
     if (p.file) {

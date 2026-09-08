@@ -10,6 +10,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { validateStateShape, isRelay, extractDeclaredPaths, judgeBudget, inferAuthor } from "./lib.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -91,11 +92,32 @@ function migrateMeta(holder) {
   };
 }
 
-function loadState() {
+// 履歴保護（合意事項A・最重要）: 読めない state.json で空起動すると、
+// 次の保存が全履歴を上書きし、writeThreadMirrors が旧ミラーまで削除する。
+// 初回のファイル不在のみ新規作成し、それ以外は原本をコピー退避して起動を拒否する
+function fatalStateLoad(reason) {
   try {
-    const raw = fs.readFileSync(STATE_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed.messages) && Array.isArray(parsed.tasks)) {
+    const backup = STATE_FILE + ".broken-" + Date.now();
+    fs.copyFileSync(STATE_FILE, backup);
+    console.error("[U2A2A] 原本をコピー退避しました:", backup);
+  } catch {
+    // 退避できなくても原本はそのまま残る
+  }
+  console.error("[U2A2A] state.json を読み込めないため、履歴保護のため起動を中止します:", reason);
+  process.exit(1);
+}
+
+function loadState() {
+  let raw;
+  try {
+    raw = fs.readFileSync(STATE_FILE, "utf8");
+  } catch (e) {
+    if (e && e.code === "ENOENT") return emptyState(); // 初回のみ新規作成
+    fatalStateLoad("読み込み失敗: " + (e.message || e));
+  }
+  try {
+    const parsed = validateStateShape(JSON.parse(raw));
+    {
       parsed.agents = parsed.agents || {};
       if (!Array.isArray(parsed.pool)) parsed.pool = [];
       // 旧形式（単一スレッド）→ トピック制へ移行
@@ -188,10 +210,9 @@ function loadState() {
       }
       return parsed;
     }
-  } catch {
-    // first run or unreadable file — start fresh
+  } catch (e) {
+    fatalStateLoad("解析または移行に失敗: " + (e.stack || e.message || e));
   }
-  return emptyState();
 }
 
 let state = loadState();
@@ -322,8 +343,8 @@ function buildThreadMirror(t, msgs) {
         .filter(Boolean)
         .join("・");
       const head = `### ${NAMES[m.author]} → ${NAMES[m.thread]} 側（${fmtT(m.ts)}${tags ? "／" + tags : ""}）`;
-      if (pv.source) {
-        // 受信側の中継コピーは冒頭のみ（原文は送信元レーンに全文が残る）
+      if (isRelay(pv)) {
+        // 受信側の中継コピーは冒頭のみ（原文は送信元レーンに全文が残る）。引き継ぎは全文を残す
         const headLine = m.text.split("\n").find((l) => l.trim()) || "";
         return `${head}\n\n> ↪ ${NAMES[pv.source.agent]} 側から中継: ${headLine.slice(0, 100)}${m.text.length > 100 ? "…（全文は中継元を参照）" : ""}\n`;
       }
@@ -388,7 +409,15 @@ function startRun(kind, agent, ids = {}) {
 
 function endRun(runId) {
   const r = runs[runId];
-  if (r) bumpUsageDay(Date.now() - r.startedAt);
+  if (r) {
+    bumpUsageDay(Date.now() - r.startedAt);
+    // run が消える前に一度スキャンし、書かれたばかりのファイルの帰属を確定させる（合意事項C）
+    try {
+      if (scanPoolDir()) touch();
+    } catch {
+      // スキャン失敗は定期スキャンで回収
+    }
+  }
   delete runs[runId];
 }
 
@@ -406,26 +435,26 @@ function bumpUsageDay(ms) {
 }
 
 function topicCostUsd(topicId) {
-  return state.messages.reduce(
+  const msgUsd = state.messages.reduce(
     (a, m) => a + (m.topicId === topicId && m.meta && m.meta.billing && m.meta.billing.mode === "metered" ? m.meta.billing.usd : 0),
     0
   );
+  const t = findTopic(topicId);
+  return msgUsd + ((t && t.summaryCostUsd) || 0);
 }
 
-// 上限超過なら理由文字列を返す。走行中の経過時間も含めて判定する
+// 上限超過なら理由文字列を返す。回数・時間とも走行中を含めて判定する（lib.judgeBudget）
 function budgetStatus(topicId) {
-  const b = state.budgets || {};
-  const day = todayStr();
-  const ud = state.usageDay && state.usageDay.date === day ? state.usageDay : { runs: 0, ms: 0 };
-  const inflightMs = Object.values(runs).reduce((a, r) => a + (Date.now() - r.startedAt), 0);
-  if (b.runCount && ud.runs >= b.runCount) return `本日の実行回数上限（${b.runCount}回）に到達`;
-  if (b.runMinutes && ud.ms + inflightMs >= b.runMinutes * 60000)
-    return `本日の累計実行時間上限（${b.runMinutes}分）に到達`;
-  if (b.topicUsd && topicId) {
-    const usd = topicCostUsd(topicId);
-    if (usd >= b.topicUsd) return `このトピックのコスト上限（$${b.topicUsd}）に到達（累計 $${usd.toFixed(2)}）`;
-  }
-  return null;
+  const inflight = Object.values(runs);
+  return judgeBudget({
+    budgets: state.budgets,
+    usageDay: state.usageDay,
+    today: todayStr(),
+    inflightMs: inflight.reduce((a, r) => a + (Date.now() - r.startedAt), 0),
+    inflightCount: inflight.length,
+    topicUsd: topicId ? topicCostUsd(topicId) : 0,
+    topicCap: topicId ? (state.budgets || {}).topicUsd : null,
+  });
 }
 
 // 上限到達: 自動実行・全質疑リレーを停止し、理由を記録して UI に明示する
@@ -685,8 +714,11 @@ function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = nul
       });
     }
     const timer = setTimeout(() => {
-      killTree(child, "SIGKILL");
       err += `\n(タイムアウト: ${timeoutMs / 1000}秒)`;
+      killTree(child, "SIGTERM"); // キャンセルと同じ作法で穏当に止め、3秒で昇格
+      setTimeout(() => {
+        if (!closed) killTree(child, "SIGKILL");
+      }, 3000);
     }, timeoutMs);
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
@@ -1094,6 +1126,46 @@ function migratePoolItems() {
 // プール内のフォルダ一覧（相対パス）。スキャンごとに更新し、UI のツリー表示に使う
 let poolDirs = [];
 
+// 応答本文のパス宣言に基づく確定登録（合意事項C: 帰属の一次経路。規約に基づく宣言の読み取り）
+function registerDeclaredArtifacts(text, agent, topicId, msgId) {
+  let changed = false;
+  for (const rel of extractDeclaredPaths(text)) {
+    const abs = poolFilePath(rel);
+    let st;
+    try {
+      st = abs && fs.statSync(abs);
+    } catch {
+      continue; // 言及だけで実在しないパスは登録しない
+    }
+    if (!st || !st.isFile()) continue;
+    const item = state.pool.find((p) => p.file === rel);
+    if (!item) {
+      state.pool.push({
+        id: id(),
+        title: rel,
+        file: rel,
+        origin: agent,
+        via: "declared",
+        topicId: topicIdFromPath(rel) || topicId || null,
+        status: "submitted",
+        reviews: [],
+        fromMessageId: msgId,
+        ...statPoolFile(rel),
+        ts: Date.now(),
+      });
+      changed = true;
+    } else if (item.via === "inferred" || item.via === "unknown" || (item.via === "folder" && item.origin === "user")) {
+      // 宣言は推定より強い
+      item.origin = agent;
+      item.via = "declared";
+      if (!item.topicId) item.topicId = topicIdFromPath(rel) || topicId || null;
+      if (!item.fromMessageId) item.fromMessageId = msgId;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 // フォルダ監視: pool/ 以下（サブフォルダ含む）のファイルを再帰的に自動登録
 function scanPoolDir() {
   let changed = false;
@@ -1127,16 +1199,16 @@ function scanPoolDir() {
   for (const name of files) {
     if (!known.has(name)) {
       const tid = topicIdFromPath(name);
-      // 帰属判定: 該当トピックで実行中（or 直近）の run があれば、その agent の成果物として記録
-      const run = Object.values(runs).find(
-        (r) => (r.kind === "thread" && tid && r.topicId === tid) || (r.kind === "fix" && !tid)
-      );
+      // 帰属判定（合意事項C）: 候補 run がちょうど1件のときだけ推定。複数なら「作者未確定」。
+      // 候補ゼロ（実行なし）は従来どおりユーザーの手動投入とみなす
+      const inf = inferAuthor(name, tid, Object.values(runs));
+      const origin = inf.origin || (inf.candidates === 0 ? "user" : null);
       state.pool.push({
         id: id(),
         title: name,
         file: name,
-        origin: run ? run.agent : "user",
-        via: run ? "agent" : "folder",
+        origin,
+        via: inf.origin ? "inferred" : inf.candidates === 0 ? "folder" : "unknown",
         topicId: tid,
         status: "submitted",
         reviews: [],
@@ -1179,8 +1251,8 @@ function buildReviewPrompt(item, reviewer) {
   const text = readPoolTextForReview(item);
   const contentPart =
     text != null
-      ? `--- 成果物「${item.title}」（持ち込み: ${NAMES[item.origin]}${rel ? `／ファイル: ${rel}` : ""}） ---\n${text}`
-      : `成果物「${item.title}」（持ち込み: ${NAMES[item.origin]}）はリポジトリ内のファイル ${rel} にあります。` +
+      ? `--- 成果物「${item.title}」（持ち込み: ${(NAMES[item.origin] || "作者未確定")}${rel ? `／ファイル: ${rel}` : ""}） ---\n${text}`
+      : `成果物「${item.title}」（持ち込み: ${(NAMES[item.origin] || "作者未確定")}）はリポジトリ内のファイル ${rel} にあります。` +
         `内容を読み取ってレビューしてください（読み取れない形式ならその旨を書いてください）。`;
   return (
     `あなたは「U2A2Aオーケストレーション」の共有タスクプール（u2a2a/pool/ = アプリ専用の成果物置き場）のレビュアー（${NAMES[reviewer]}）です。` +
@@ -1316,11 +1388,16 @@ const summaryPending = new Set();
 async function summarizeTopic(topicId) {
   const topic = findTopic(topicId);
   if (!topic || summaryPending.has(topicId)) return;
+  // 予算管理下に置く（合意事項B）: 停止中・上限超過なら halt は起こさず静かにスキップ
+  if (state.budgetHalt || budgetStatus(topicId)) return;
   const msgs = state.messages.filter((m) => m.topicId === topicId);
   if (!msgs.length) return;
   summaryPending.add(topicId);
+  const run = startRun("summary", "claude", { topicId });
+  const actKey = "summary:" + topicId;
+  actStart(actKey, "スレッド要約", run.runId);
   try {
-    const recent = msgs.filter((m) => !(m.provenance && m.provenance.source)).slice(-40);
+    const recent = msgs.filter((m) => !isRelay(m.provenance)).slice(-40); // 引き継ぎは要約対象に含める
     const lines = recent
       .map((m) => `[${NAMES[m.author]}→${NAMES[m.thread]}側] ${m.text.slice(0, 500)}`)
       .join("\n\n");
@@ -1331,15 +1408,20 @@ async function summarizeTopic(topicId) {
       `このスレッドの現況要約を日本語・最大12行で書いてください。` +
       `必ず「## 合意済み」「## 未決」の2見出しで構造化し、生成された成果物（u2a2a/pool/ パス）は合意済み側に含める。` +
       `前置きなしで要約本文のみを出力。`;
-    const { text } = await callClaude(prompt, null, "haiku");
+    const { text, meta } = await callClaude(prompt, null, "haiku", (s2) => actStep(actKey, s2), { ctl: run.ctl });
+    if (meta && meta.billing && meta.billing.mode === "metered") {
+      topic.summaryCostUsd = (topic.summaryCostUsd || 0) + meta.billing.usd; // 計上漏れ防止
+    }
     topic.summaryText = text.trim();
     topic.summaryAt = msgs.length;
     topic.summaryTs = Date.now();
     topic.summaryLastMsgId = msgs[msgs.length - 1].id; // 「どこまでを対象にした要約か」を固定
     touch();
   } catch (e) {
-    logEvent("summary", `スレッド要約の生成に失敗（${topic.title}）: ` + (e.message || e), "warn");
+    if (!e.cancelled) logEvent("summary", `スレッド要約の生成に失敗（${topic.title}）: ` + (e.message || e), "warn");
   } finally {
+    endRun(run.runId);
+    actEnd(actKey);
     summaryPending.delete(topicId);
   }
 }
@@ -1488,6 +1570,15 @@ setInterval(() => {
     }
   }
   if (changed) touch();
+  // 時間上限に走行中で到達したら、実行を中断してラッチを立てる（合意事項B）
+  if (!state.budgetHalt) {
+    const reason = budgetStatus(null);
+    if (reason && /実行時間上限/.test(reason) && Object.keys(runs).length) {
+      const anyRun = Object.values(runs)[0];
+      for (const r of Object.values(runs)) if (r.ctl && r.ctl.cancel) r.ctl.cancel();
+      triggerBudgetHalt(anyRun.topicId || state.topics[0].id, anyRun.agent || "claude", reason + "（実行中の処理を中断しました）");
+    }
+  }
   checkSummaries();
 }, 30_000);
 
@@ -1562,6 +1653,7 @@ async function agentLoop(topicId, agent) {
             if (clean) topic.relay.agenda = clean.slice(0, 120);
           }
         }
+        registerDeclaredArtifacts(text, agent, topicId, replyMsg.id); // 宣言に基づく成果物の確定登録
         ta.fileSnapshot = curSnapshot; // 変更通知の基準を今回時点へ進める
         markTranscriptSynced(topic, agent); // 自分の応答分は外部同期の対象外にする
         qaHop(topic, agent, text, replyMsg.id);
@@ -1714,7 +1806,8 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && parts[0] === "api" && parts[1] === "runs" && parts[2] && parts[3] === "cancel") {
     const run = runs[parts[2]];
     if (!run) return json(res, 404, { error: "run not found（既に終了しています）" });
-    if (run.kind !== "thread") return json(res, 400, { error: "初版でキャンセルできるのはスレッド応答のみです" });
+    if (run.kind !== "thread" && run.kind !== "summary")
+      return json(res, 400, { error: "キャンセルできるのはスレッド応答と要約のみです" });
     const topic = findTopic(run.topicId);
     if (topic) topic.relay = defaultRelay(); // 質疑リレーも止める
     needsRun[runKey(run.topicId, run.agent)] = false;
