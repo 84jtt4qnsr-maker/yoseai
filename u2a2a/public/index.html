@@ -67,6 +67,12 @@
     user-select: none;
   }
   .topic-tab.active { color: var(--text); background: var(--panel-2); font-weight: 600; }
+  /* 実行中トピックの緑パルスドット（別トピックの活動もタブで分かる） */
+  .topic-tab .run-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--user); animation: dot-pulse 1.6s ease-in-out infinite; }
+  @keyframes dot-pulse {
+    0%, 100% { opacity: 0.35; box-shadow: 0 0 0 0 rgba(123, 216, 143, 0); }
+    50% { opacity: 1; box-shadow: 0 0 6px 1px rgba(123, 216, 143, 0.4); }
+  }
   .topic-tab .t-btn {
     border: none;
     background: none;
@@ -291,6 +297,12 @@
   .thread-col[data-glow="ok"] .messages { box-shadow: inset 0 0 0 1px rgba(110, 168, 254, 0.55), inset 0 0 16px rgba(110, 168, 254, 0.28), inset 0 0 48px rgba(110, 168, 254, 0.08); }
   .thread-col[data-glow="wait"] .messages { box-shadow: inset 0 0 0 1px rgba(231, 200, 107, 0.55), inset 0 0 16px rgba(231, 200, 107, 0.28), inset 0 0 48px rgba(231, 200, 107, 0.08); }
   .thread-col[data-glow="err"] .messages { box-shadow: inset 0 0 0 1px rgba(255, 123, 123, 0.6), inset 0 0 16px rgba(255, 123, 123, 0.3), inset 0 0 48px rgba(255, 123, 123, 0.1); }
+  /* 質疑リレー中: 流線（relay-flow 0.8s）の2倍周期・同色で枠を明滅させ、光の律動を揃える */
+  .thread-col[data-glow="relay"] .messages { animation: relay-pulse 1.6s linear infinite; }
+  @keyframes relay-pulse {
+    0%, 100% { box-shadow: inset 0 0 0 1px rgba(123, 216, 143, 0.5), inset 0 0 12px rgba(123, 216, 143, 0.16); }
+    50% { box-shadow: inset 0 0 0 1px rgba(123, 216, 143, 0.18), inset 0 0 12px rgba(123, 216, 143, 0.05); }
+  }
   /* プール側も同じ発光言語: レビュー/修正の実行中は緑の呼吸、判定確定時は色を一瞬点灯して減衰 */
   .pf-row.glow-run { animation: row-breath 2.6s ease-in-out infinite; border-radius: 6px; }
   @keyframes row-breath {
@@ -1032,6 +1044,19 @@ function switchTopic(id) {
   render();
 }
 
+// 実行中ランが属するトピック集合（スレッド応答は topicId、レビュー/修正/要約は成果物経由で解決）
+function busyTopicIds() {
+  const ids = new Set();
+  for (const r of state.runs || []) {
+    if (r.topicId) ids.add(r.topicId);
+    else if (r.itemId) {
+      const p = (state.pool || []).find((x) => x.id === r.itemId);
+      if (p && p.topicId) ids.add(p.topicId);
+    }
+  }
+  return ids;
+}
+
 function renderTopicBar() {
   const bar = $("#topic-bar");
   bar.replaceChildren();
@@ -1072,6 +1097,7 @@ function renderTopicBar() {
       continue;
     }
     const count = (state.messages || []).filter((m) => m.topicId === t.id).length;
+    if (busyTopicIds().has(t.id)) tab.appendChild(el("span", { class: "run-dot", title: "このトピックで実行中" }));
     tab.appendChild(el("span", { text: t.title + (count ? "（" + count + "）" : "") }));
     if (active) {
       tab.appendChild(el("button", {
@@ -2278,6 +2304,7 @@ function applyThreadGlow(agent, a, ta) {
   const unseen = msgs.some((m) => m.author !== agent && m.ts > (ta.lastSeenTs || 0));
   let glow = "";
   if (isRunning(agent)) glow = "run";
+  else if ((topic.relay || {}).active) glow = "relay"; // 質疑リレー中は流線と律動を揃えて明滅
   else if (a.lastError) glow = "err";
   else if ((state.budgetHalt && a.auto) || ta.interruptedSessionId || (last && last.cancelled)) glow = "wait";
   else if (unseen && !a.auto) glow = "wait";
