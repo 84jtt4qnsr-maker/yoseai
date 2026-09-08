@@ -420,6 +420,8 @@
   .empty { color: var(--dim); font-size: 12.5px; text-align: center; margin-top: 24px; }
 
   /* エージェント返答入力 */
+  /* 手動貼り付け欄は普段使わないため既定は非表示（スレッドの右クリック→手動で発言を追加）*/
+  .agent-input[hidden] { display: none; }
   .agent-input {
     border-top: 1px solid var(--line);
     padding: 7px 14px;
@@ -795,8 +797,8 @@
       <label class="auto-ctl"><input type="checkbox" id="auto-claude" />自動応答</label>
     </div>
     <div class="messages" id="messages-claude"></div>
-    <div class="agent-input">
-      <textarea id="input-claude" placeholder="Claude Code の返答・質問を貼り付け／入力 — Cmd+Enter で追加"></textarea>
+    <div class="agent-input" hidden>
+      <textarea id="input-claude" placeholder="Claude Code の返答・質問を貼り付け／入力 — Cmd+Enter で追加・Esc で閉じる"></textarea>
       <button data-agent-send="claude">Claude として追加</button>
     </div>
     <div class="task-zone">
@@ -812,8 +814,8 @@
       <label class="auto-ctl"><input type="checkbox" id="auto-codex" />自動応答</label>
     </div>
     <div class="messages" id="messages-codex"></div>
-    <div class="agent-input">
-      <textarea id="input-codex" placeholder="Codex の返答・質問を貼り付け／入力 — Cmd+Enter で追加"></textarea>
+    <div class="agent-input" hidden>
+      <textarea id="input-codex" placeholder="Codex の返答・質問を貼り付け／入力 — Cmd+Enter で追加・Esc で閉じる"></textarea>
       <button data-agent-send="codex">Codex として追加</button>
     </div>
     <div class="task-zone">
@@ -2441,7 +2443,17 @@ function sendAgent(agent) {
   const text = input.value.trim();
   if (!text) return;
   api("/api/messages", "POST", { thread: agent, author: agent, text, topicId: (currentTopic() || {}).id })
-    .then(() => { input.value = ""; });
+    .then(() => { input.value = ""; hideAgentInput(agent); });
+}
+
+// 手動貼り付け欄（既定は非表示。右クリック→手動で発言を追加で開き、送信・Esc で閉じる）
+function showAgentInput(agent) {
+  const input = $("#input-" + agent);
+  input.closest(".agent-input").hidden = false;
+  input.focus();
+}
+function hideAgentInput(agent) {
+  $("#input-" + agent).closest(".agent-input").hidden = true;
 }
 
 // ---- dialogs ----
@@ -2717,7 +2729,11 @@ function ctxItems(t) {
           toast("この地点までの履歴で分岐しました（セッションは新規・要約を引き継ぎ）");
         }),
       ],
+      ["✍ " + NAMES[m.thread] + " の発言を手動追加", () => showAgentInput(m.thread)],
     ];
+  }
+  if (t.type === "thread") {
+    return [["✍ " + NAMES[t.agent] + " の発言を手動追加（貼り付け）", () => showAgentInput(t.agent)]];
   }
   if (t.type === "poolfile") {
     const p = t.p;
@@ -2787,6 +2803,11 @@ function resolveCtxTarget(elx) {
       return { type: "topic", id: poolSelectedId.slice(6) };
     const p = (state.pool || []).find((x) => x.id === poolSelectedId);
     if (p) return { type: "poolfile", p };
+  }
+  // スレッド列の残り領域（入力欄内はブラウザ標準のコピー/ペーストメニューを維持）
+  if (!elx.closest("input, textarea")) {
+    const col = elx.closest(".thread-col[data-agent]");
+    if (col) return { type: "thread", agent: col.dataset.agent };
   }
   return null;
 }
@@ -2904,6 +2925,7 @@ for (const btn of document.querySelectorAll("[data-agent-send]")) {
   btn.addEventListener("click", () => sendAgent(agent));
   $("#input-" + agent).addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") sendAgent(agent);
+    if (e.key === "Escape") hideAgentInput(agent);
   });
 }
 
