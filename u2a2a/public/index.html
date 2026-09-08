@@ -291,6 +291,29 @@
   .thread-col[data-glow="ok"] .messages { box-shadow: inset 0 0 0 1px rgba(110, 168, 254, 0.55), inset 0 0 16px rgba(110, 168, 254, 0.28), inset 0 0 48px rgba(110, 168, 254, 0.08); }
   .thread-col[data-glow="wait"] .messages { box-shadow: inset 0 0 0 1px rgba(231, 200, 107, 0.55), inset 0 0 16px rgba(231, 200, 107, 0.28), inset 0 0 48px rgba(231, 200, 107, 0.08); }
   .thread-col[data-glow="err"] .messages { box-shadow: inset 0 0 0 1px rgba(255, 123, 123, 0.6), inset 0 0 16px rgba(255, 123, 123, 0.3), inset 0 0 48px rgba(255, 123, 123, 0.1); }
+  /* プール側も同じ発光言語: レビュー/修正の実行中は緑の呼吸、判定確定時は色を一瞬点灯して減衰 */
+  .pf-row.glow-run { animation: row-breath 2.6s ease-in-out infinite; border-radius: 6px; }
+  @keyframes row-breath {
+    0%, 100% { box-shadow: inset 0 0 0 1px rgba(123, 216, 143, 0.10); }
+    50% { box-shadow: inset 0 0 0 1px rgba(123, 216, 143, 0.55), inset 0 0 10px rgba(123, 216, 143, 0.16); }
+  }
+  #pool-detail { transition: box-shadow 0.8s ease; }
+  #pool-detail[data-glow="run"] { animation: glow-breath 2.6s ease-in-out infinite; }
+  #pool-detail[data-flash="ok"] { animation: flash-ok 2.2s ease-out 1; }
+  #pool-detail[data-flash="wait"] { animation: flash-wait 2.2s ease-out 1; }
+  #pool-detail[data-flash="err"] { animation: flash-err 2.2s ease-out 1; }
+  @keyframes flash-ok {
+    0% { box-shadow: inset 0 0 0 1px rgba(110, 168, 254, 0.85), inset 0 0 24px rgba(110, 168, 254, 0.45), inset 0 0 64px rgba(110, 168, 254, 0.14); }
+    100% { box-shadow: inset 0 0 0 1px rgba(110, 168, 254, 0), inset 0 0 24px rgba(110, 168, 254, 0), inset 0 0 64px rgba(110, 168, 254, 0); }
+  }
+  @keyframes flash-wait {
+    0% { box-shadow: inset 0 0 0 1px rgba(231, 200, 107, 0.85), inset 0 0 24px rgba(231, 200, 107, 0.45), inset 0 0 64px rgba(231, 200, 107, 0.14); }
+    100% { box-shadow: inset 0 0 0 1px rgba(231, 200, 107, 0), inset 0 0 24px rgba(231, 200, 107, 0), inset 0 0 64px rgba(231, 200, 107, 0); }
+  }
+  @keyframes flash-err {
+    0% { box-shadow: inset 0 0 0 1px rgba(255, 123, 123, 0.9), inset 0 0 24px rgba(255, 123, 123, 0.5), inset 0 0 64px rgba(255, 123, 123, 0.16); }
+    100% { box-shadow: inset 0 0 0 1px rgba(255, 123, 123, 0), inset 0 0 24px rgba(255, 123, 123, 0), inset 0 0 64px rgba(255, 123, 123, 0); }
+  }
   .msg {
     background: var(--panel);
     border: 1px solid var(--line);
@@ -1725,7 +1748,7 @@ function fileRowEl(p, depth) {
   const busy = pending.length || (state.fixPending || {})[p.id];
   const base = (p.file || p.title).split("/").pop();
   const row = el("div", {
-    class: "pf-row" + (p.id === poolSelectedId ? " sel" : ""),
+    class: "pf-row" + (p.id === poolSelectedId ? " sel" : "") + (busy ? " glow-run" : ""),
     "data-file": p.file || "",
     style: "padding-left:" + (8 + depth * 14) + "px",
     onclick: () => {
@@ -1862,6 +1885,8 @@ function renderPool() {
 
   // 詳細
   detailBox.replaceChildren();
+  const selItem = isTopicSel ? null : items.find((p) => p.id === poolSelectedId);
+  updatePoolGlow(detailBox, selItem);
   if (isTopicSel) {
     const t = topics.find((x) => "topic:" + x.id === poolSelectedId);
     if (t) {
@@ -1869,13 +1894,45 @@ function renderPool() {
       return;
     }
   }
-  const sel = items.find((p) => p.id === poolSelectedId);
+  const sel = selItem;
   if (!sel) {
     detailBox.appendChild(el("div", { class: "empty", text: "ファイルを選択してください" }));
     return;
   }
   renderPoolDetail(detailBox, sel);
 }
+
+// プール詳細パネルの発光。実行中は呼吸、レビュー判定・修正完了の着弾時は結果色を一瞬点灯
+// 承認=青 / 条件付き承認=黄 / 差し戻し・エラー=赤
+const poolRunSeen = {}; // itemId -> { r: レビュー件数, f: 修正件数 }
+let poolSeenInit = false;
+function updatePoolGlow(detailBox, sel) {
+  let flash = "";
+  for (const p of state.pool || []) {
+    const seen = poolRunSeen[p.id] || { r: (p.reviews || []).length, f: (p.fixes || []).length };
+    const r = (p.reviews || []).length, f = (p.fixes || []).length;
+    if (poolSeenInit && sel && p.id === sel.id) {
+      if (r > seen.r) {
+        const last = p.reviews[r - 1];
+        flash = last.error || last.verdict === "差し戻し" ? "err" : last.verdict === "条件付き承認" ? "wait" : "ok";
+      } else if (f > seen.f) {
+        flash = p.fixes[f - 1].error ? "err" : "ok";
+      }
+    }
+    poolRunSeen[p.id] = { r, f };
+  }
+  poolSeenInit = true;
+  const busy = sel && (((state.reviewPending || {})[sel.id] || []).length || (state.fixPending || {})[sel.id]);
+  detailBox.dataset.glow = busy ? "run" : "";
+  if (flash) {
+    detailBox.removeAttribute("data-flash");
+    void detailBox.offsetWidth; // 再点灯できるようアニメーションをリセット
+    detailBox.dataset.flash = flash;
+  }
+}
+$("#pool-detail").addEventListener("animationend", (e) => {
+  if (e.animationName.startsWith("flash-")) $("#pool-detail").removeAttribute("data-flash");
+});
 
 function renderTopicDetail(box, t) {
   const msgs = (state.messages || []).filter((m) => m.topicId === t.id);
