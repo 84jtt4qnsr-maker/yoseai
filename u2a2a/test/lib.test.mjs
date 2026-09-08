@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validateStateShape, isRelay, extractDeclaredPaths, judgeBudget, inferAuthor } from "../lib.mjs";
+import { validateStateShape, isRelay, extractDeclaredPaths, judgeBudget, inferAuthor, safeVersionFileName } from "../lib.mjs";
 
 test("validateStateShape: 正常な形状は通す", () => {
   const st = { messages: [], tasks: [], pool: [], topics: [] };
@@ -78,4 +78,15 @@ test("inferAuthor: 候補がちょうど1件のときだけ推定（合意事項
 test("inferAuthor: トピック不明のファイルは無関係な thread run に帰属しない", () => {
   const runs = [{ kind: "thread", agent: "claude", topicId: "t9" }];
   assert.deepEqual(inferAuthor("stray.md", null, runs), { origin: null, via: "unknown", candidates: 0 });
+});
+
+test("safeVersionFileName: 正当な版名のみ許可し、トラバーサルを拒否（監査4巡目）", () => {
+  assert.equal(safeVersionFileName("v1.md"), true);
+  assert.equal(safeVersionFileName("v12.tar.gz"), true);
+  assert.equal(safeVersionFileName("../../../../src/App.tsx"), false);
+  assert.equal(safeVersionFileName("v1/../x.md"), false);
+  assert.equal(safeVersionFileName("v1.md/"), false);
+  assert.equal(safeVersionFileName("x1.md"), false);
+  assert.equal(safeVersionFileName(""), false);
+  assert.equal(safeVersionFileName(null), false);
 });

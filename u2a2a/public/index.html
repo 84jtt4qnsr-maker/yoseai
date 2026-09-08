@@ -668,6 +668,24 @@
   .verdict[data-v="差し戻し"] { color: var(--danger); border-color: #ff7b7b55; }
   .review .r-body { max-height: 200px; overflow-y: auto; word-break: break-word; font-size: 13px; }
 
+  /* 成果物の版履歴 */
+  .p-history { margin-top: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
+  .history-head, .history-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; }
+  .history-head { justify-content: space-between; }
+  .history-note { margin: 8px 0; color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
+  .history-warning { color: #e7c86b; font-size: 12px; overflow-wrap: anywhere; }
+  .history-list { list-style: none; margin: 8px 0; padding: 0; max-height: 220px; overflow-y: auto; }
+  .history-row { padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 12px; color: var(--dim); }
+  .history-row strong { color: var(--text); }
+  .history-row button[aria-pressed="true"] { border-color: var(--text); color: var(--text); }
+  .history-diff-title { display: block; margin-top: 10px; font-size: 12px; }
+  .history-diff { margin: 8px 0 0; padding: 8px; max-height: 320px; overflow: auto; white-space: pre; font-size: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+  .history-diff .diff-add { color: #a0e5ad; background: #7bd88f15; }
+  .history-diff .diff-remove { color: #ffabab; background: #ff7b7b15; }
+  #pool-detail .review .r-head { flex-wrap: wrap; }
+  .review-version { font-size: 11px; color: var(--dim); }
+  #pool-detail .actions button:disabled { opacity: 0.45; cursor: not-allowed; }
+
   /* コンテキストメニュー */
   #ctx-menu[hidden] { display: none; }
   #ctx-menu {
@@ -1397,6 +1415,158 @@ const mediaFailed = new Set();
 // 展開中のレビュー id（既定は折りたたみ・判定チップのみ表示）
 const openReviews = new Set();
 
+// 選択中の成果物だけを保持。SSE の再描画では再取得せず、履歴・実行状態の変化で更新する。
+let poolHistory = null;
+const VERSION_REASONS = { "fix-before": "修正前", "fix-after": "修正後", review: "レビュー開始" };
+const HISTORY_UNSUPPORTED = { binary: "UTF-8テキスト以外", "too-large": "256 KiB超", "no-file": "ファイル実体なし" };
+
+async function readPoolHistory(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "履歴を取得できません（HTTP " + res.status + "）");
+  return data;
+}
+
+function poolHistoryState(p) {
+  const key = JSON.stringify([p.id, p.file, p.mtime, p.size, p.missing, p.versions, p.versionsUnsupported,
+    (p.reviews || []).length, (p.fixes || []).length,
+    (state.reviewPending || {})[p.id], (state.fixPending || {})[p.id]]);
+  if (poolHistory && poolHistory.key === key) return poolHistory;
+  const previous = poolHistory && poolHistory.itemId === p.id ? poolHistory : null;
+  // 再取得中も保存済み一覧を維持し、SSEで届いた新しい版を補う。
+  const versions = new Map((previous ? previous.versions : []).map((v) => [v.id, v]));
+  for (const version of p.versions || []) versions.set(version.id, version);
+  const history = poolHistory = {
+    itemId: p.id, key, pending: true, versions: [...versions.values()].sort((a, b) => a.n - b.n),
+    unsupportedReason: p.versionsUnsupported !== undefined ? p.versionsUnsupported : previous?.unsupportedReason,
+    selectedToId: previous ? previous.selectedToId : null,
+    diff: previous ? previous.diff : null,
+  };
+  readPoolHistory("/api/pool/" + encodeURIComponent(p.id) + "/versions")
+    .then((data) => {
+      if (!Array.isArray(data.versions)) throw new Error("履歴の応答形式を確認してください");
+      history.versions = [...data.versions].sort((a, b) => a.n - b.n);
+      history.unsupportedReason = data.unsupportedReason;
+    })
+    .catch((e) => { history.error = e.message; })
+    .finally(() => {
+      history.pending = false;
+      if (poolHistory === history && poolSelectedId === p.id) renderPool();
+    });
+  return history;
+}
+
+function versionLabel(versions, id) {
+  if (!id) return "版未記録";
+  const version = versions.find((v) => v.id === id);
+  return version ? "v" + version.n : "保存版（番号不明）";
+}
+
+function poolHistoryEl(p, history) {
+  const section = el("section", { class: "p-history", "aria-label": "成果物の履歴" });
+  section.appendChild(el("div", { class: "history-head" }, [
+    el("strong", { text: "履歴" }),
+    el("button", { class: "small", text: "再取得", onclick: () => {
+      history.key = null; history.selectedToId = null; history.diff = null; renderPool();
+    } }),
+  ]));
+  const note = (text, warning = false) => el("div", { class: "history-note" + (warning ? " history-warning" : ""), text });
+  if (history.pending) section.appendChild(note("履歴を読み込み中…"));
+  if (history.error) section.appendChild(note("履歴の読み込み失敗: " + history.error + "。「再取得」で再試行できます。", true));
+  if (history.unsupportedReason) {
+    section.appendChild(note("履歴対象外（" + (HISTORY_UNSUPPORTED[history.unsupportedReason] || history.unsupportedReason) + "）"));
+  }
+  if (!history.versions.length) {
+    if (!history.pending && !history.error && !history.unsupportedReason) section.appendChild(note("保存版はまだありません。レビュー開始・修正時に保存されます。"));
+    return section;
+  }
+  section.appendChild(note("修正・レビュー開始時の保存版です。外部編集の全履歴は保存しません。"));
+  const list = el("ol", { class: "history-list" });
+  for (let i = history.versions.length - 1; i >= 0; i--) {
+    const version = history.versions[i];
+    const savedAt = new Date(version.ts);
+    const row = el("li", { class: "history-row" }, [
+      el("strong", { text: "v" + version.n }),
+      el("span", { text: VERSION_REASONS[version.reason] || version.reason || "理由未記録" }),
+      el("span", { text: NAMES[version.agent] || "担当未記録" }),
+      el("time", { text: savedAt.toLocaleString("ja-JP"),
+        ...(Number.isNaN(savedAt.getTime()) ? {} : { datetime: savedAt.toISOString() }) }),
+      el("span", { text: fmtSize(version.size) }),
+    ]);
+    if (version.partial) row.appendChild(el("span", { class: "history-warning", text: "途中失敗", title: "修正は失敗しましたが、変更された内容を保存しました" }));
+    if (i > 0) {
+      const from = history.versions[i - 1];
+      row.appendChild(el("button", {
+        class: "small", text: "v" + from.n + " → v" + version.n + " の差分",
+        "aria-pressed": String(history.selectedToId === version.id),
+        onclick: () => { history.selectedToId = version.id; renderPool(); },
+      }));
+    }
+    list.appendChild(row);
+  }
+  section.appendChild(list);
+  const index = history.versions.findIndex((v) => v.id === history.selectedToId);
+  if (index < 1) {
+    section.appendChild(note(history.versions.length === 1 ? "比較には2版以上必要です。" : "一覧の「差分」から直前の版と比較できます。"));
+    return section;
+  }
+  const from = history.versions[index - 1], to = history.versions[index];
+  const diffKey = JSON.stringify([from.id, to.id]);
+  if (!history.diff || history.diff.key !== diffKey) {
+    const diff = history.diff = { key: diffKey, pending: true, scrollTop: 0, scrollLeft: 0 };
+    const query = new URLSearchParams({ from: from.id, to: to.id });
+    readPoolHistory("/api/pool/" + encodeURIComponent(p.id) + "/diff?" + query)
+      .then((data) => {
+        if (typeof data.diff !== "string") throw new Error("差分の応答形式を確認してください");
+        diff.data = data;
+      })
+      .catch((e) => { diff.error = e.message; })
+      .finally(() => {
+        diff.pending = false;
+        // 項目・比較先を切り替えた後に古い応答で表示を戻さない。
+        if (poolHistory && poolHistory.itemId === p.id && poolHistory.diff === diff && poolSelectedId === p.id) renderPool();
+      });
+  }
+  section.appendChild(el("strong", { class: "history-diff-title", text: "v" + from.n + " → v" + to.n + " の差分" }));
+  const diff = history.diff;
+  if (diff.pending) section.appendChild(note("差分を読み込み中…"));
+  else if (diff.error) {
+    section.appendChild(note("差分の読み込み失敗: " + diff.error, true));
+    section.appendChild(el("button", { class: "small", text: "差分を再試行", onclick: () => { history.diff = null; renderPool(); } }));
+  } else {
+    if (diff.data.truncated) section.appendChild(note("差分は一部のみ表示しています（256 KiB上限）。全文ではありません。", true));
+    if (!diff.data.diff) section.appendChild(note(diff.data.truncated ? "表示できる差分がありません。" : "内容の差分はありません。"));
+    else {
+      const pre = el("pre", {
+        class: "history-diff", tabindex: "0", "aria-label": "v" + from.n + " から v" + to.n + " の差分",
+        onscroll: (e) => { diff.scrollTop = e.target.scrollTop; diff.scrollLeft = e.target.scrollLeft; },
+      });
+      // 成果物由来の差分は必ず textContent 経由。HTML/Markdown として解釈しない。
+      const lines = diff.data.diff.split("\n");
+      lines.forEach((line, i) => {
+        const header = i < 2 && /^(---|\+\+\+) v\d+$/.test(line);
+        const kind = !header && line.startsWith("+") ? " diff-add"
+          : !header && line.startsWith("-") ? " diff-remove" : "";
+        pre.appendChild(el("span", { class: "diff-line" + kind, text: line + (i < lines.length - 1 ? "\n" : "") }));
+      });
+      section.appendChild(pre);
+      requestAnimationFrame(() => { if (pre.isConnected) { pre.scrollTop = diff.scrollTop; pre.scrollLeft = diff.scrollLeft; } });
+    }
+  }
+  return section;
+}
+
+// api() の409表示を維持し、失敗時に成功トーストや未処理のPromiseを残さない。
+async function poolAction(path, method, body, successMessage) {
+  try {
+    await api(path, method, body);
+    if (successMessage) toast(successMessage);
+  } catch (e) {
+    // HTTPエラーはapi()が通知済み。fetchのネットワーク例外だけ補う。
+    if (e instanceof TypeError) toast(e.message || "通信に失敗しました");
+  }
+}
+
 function poolPreviewEl(p) {
   const body = el("div", { class: "p-body mdview" });
   if (p.body) {
@@ -1789,6 +1959,8 @@ function renderPoolDetail(box, p) {
       kids.push(fileRow);
     }
     kids.push(poolPreviewEl(p));
+    const history = poolHistoryState(p);
+    kids.push(poolHistoryEl(p, history));
     for (const r of p.reviews || []) {
       const rOpen = openReviews.has(r.id);
       const rHead = el("div", {
@@ -1802,6 +1974,14 @@ function renderPoolDetail(box, p) {
         el("span", { class: "reviewer", "data-o": r.reviewer, text: "🔎 " + NAMES[r.reviewer] + " のレビュー" }),
       ]);
       if (r.verdict) rHead.appendChild(el("span", { class: "verdict", "data-v": r.verdict, text: "【判定】" + r.verdict }));
+      rHead.appendChild(el("span", {
+        class: "review-version", text: "対象: " + versionLabel(history.versions, r.versionId),
+        title: [r.versionId, r.sha256].filter(Boolean).join(" / "),
+      }));
+      if (r.stale) rHead.appendChild(el("span", {
+        class: "history-warning", text: "⚠ レビュー中に変更あり",
+        title: "レビュー開始時と終了時でファイル内容が異なります。この判定は現在の内容を保証しません。",
+      }));
       if (r.meta) rHead.appendChild(metaEl(r.meta));
       const reviewKids = [rHead];
       if (rOpen) {
@@ -1826,7 +2006,12 @@ function renderPoolDetail(box, p) {
         el("span", { class: "pf-size", text: fmtTime(f.ts) }),
       ]);
       if (f.meta) fHead.appendChild(metaEl(f.meta));
+      if (f.beforeVersionId || f.afterVersionId) fHead.appendChild(el("span", {
+        class: "review-version",
+        text: versionLabel(history.versions, f.beforeVersionId) + " → " + versionLabel(history.versions, f.afterVersionId),
+      }));
       const fixKids = [fHead];
+      if (f.historyError) fixKids.push(el("div", { class: "history-warning", text: "履歴保存失敗: " + f.historyError }));
       if (fOpen) {
         const fBody = el("div", { class: "r-body mdview" });
         fBody.innerHTML = renderMarkdown(f.text);
@@ -1850,7 +2035,8 @@ function renderPoolDetail(box, p) {
         actions.appendChild(el("button", {
           class: "small",
           text: NAMES[agent] + " にレビュー依頼",
-          onclick: () => api("/api/pool/" + p.id + "/review", "POST", { reviewer: agent }),
+          ...(fixer ? { disabled: "", title: "修正が完了してからレビューできます" } : {}),
+          onclick: () => poolAction("/api/pool/" + p.id + "/review", "POST", { reviewer: agent }),
         }));
       }
     }
@@ -1859,8 +2045,8 @@ function renderPoolDetail(box, p) {
         actions.appendChild(el("button", {
           class: "small",
           text: NAMES[agent] + " に修正依頼",
-          onclick: () => api("/api/pool/" + p.id + "/fix", "POST", { agent })
-            .then(() => toast(NAMES[agent] + " が修正を開始しました（完了後、自動で再レビュー）")),
+          ...(pending.length ? { disabled: "", title: "レビューが完了してから修正できます" } : {}),
+          onclick: () => poolAction("/api/pool/" + p.id + "/fix", "POST", { agent }, NAMES[agent] + " が修正を開始しました（完了後、自動で再レビュー）"),
         }));
       }
     }
@@ -1883,7 +2069,8 @@ function renderPoolDetail(box, p) {
     actions.appendChild(el("button", {
       class: "small",
       text: "削除",
-      onclick: (e) => armedDelete(e.target, () => api("/api/pool/" + p.id, "DELETE").then(() => toast(".trash へ退避しました"))),
+      ...(fixer || pending.length ? { disabled: "", title: "修正・レビューが完了してから削除できます" } : {}),
+      onclick: (e) => armedDelete(e.target, () => poolAction("/api/pool/" + p.id, "DELETE", undefined, ".trash へ退避しました")),
     }));
     kids.push(actions);
     for (const k of kids) box.appendChild(k);
@@ -2520,8 +2707,8 @@ function ctxItems(t) {
     if (poolClipboard)
       items.push(["📋 ここへ貼り付け（" + (dir || "ルート") + "）", () => api("/api/pool/copy", "POST", { src: poolClipboard.path, destDir: dir }).then((r) => toast("複製: " + r.dest))]);
     items.push(["パスを入力欄へ挿入", () => insertToInput("u2a2a/pool/" + p.file)]);
-    items.push(["Claude にレビュー依頼", () => api("/api/pool/" + p.id + "/review", "POST", { reviewer: "claude" })]);
-    items.push(["Codex にレビュー依頼", () => api("/api/pool/" + p.id + "/review", "POST", { reviewer: "codex" })]);
+    items.push(["Claude にレビュー依頼", () => poolAction("/api/pool/" + p.id + "/review", "POST", { reviewer: "claude" })]);
+    items.push(["Codex にレビュー依頼", () => poolAction("/api/pool/" + p.id + "/review", "POST", { reviewer: "codex" })]);
     return items;
   }
   if (t.type === "pooldir") {

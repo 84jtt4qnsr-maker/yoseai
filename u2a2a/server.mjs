@@ -10,7 +10,22 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { validateStateShape, isRelay, extractDeclaredPaths, judgeBudget, inferAuthor } from "./lib.mjs";
+import {
+  validateStateShape,
+  isRelay,
+  extractDeclaredPaths,
+  judgeBudget,
+  inferAuthor,
+  historyEligibility,
+  sha256Hex,
+  appendVersion,
+  resolveVersionPair,
+  unifiedDiff,
+  truncateUtf8,
+  HISTORY_MAX_BYTES,
+  DIFF_MAX_BYTES,
+  safeVersionFileName,
+} from "./lib.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -21,6 +36,9 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 // エージェント CLI（cwd=リポジトリ・読み取り可）からパスでそのまま読める。
 const POOL_DIR = path.join(__dirname, "pool");
 const POOL_TRASH = path.join(POOL_DIR, ".trash");
+// 成果物バージョン履歴の置き場（仕様: SPEC-成果物バージョン履歴.md）。
+// .versions/<itemId>/manifest.json が正本で、アイテム削除後も残す（ドット始まりなのでスキャン対象外）
+const POOL_VERSIONS = path.join(POOL_DIR, ".versions");
 // スレッド履歴の自動ミラー置き場（成果物アイテムとしては登録しないシステム領域）
 const POOL_THREADS = path.join(POOL_DIR, "threads");
 // トピック別成果物の保存先（合意: パスは完全 topicId で不変。タイトルは UI が state から表示）
@@ -1093,17 +1111,267 @@ function isTextPoolFile(name) {
   return TEXT_EXTS.has(path.extname(name).toLowerCase());
 }
 
-// レビュー用にファイル内容を読む（テキストのみ・先頭8000文字）
+// レビュー本文の先頭 8000 文字だけを添え、全文の参照先（リポジトリ相対パス）を示す
+const REVIEW_TEXT_MAX_CHARS = 8000;
+function clipReviewText(full, fullRefPath) {
+  return full.length > REVIEW_TEXT_MAX_CHARS
+    ? full.slice(0, REVIEW_TEXT_MAX_CHARS) + `\n…（先頭${REVIEW_TEXT_MAX_CHARS}文字のみ。全文は ${fullRefPath} を参照）`
+    : full;
+}
+
+// レビュー用にファイル内容を読む（テキストのみ・先頭8000文字）。履歴対象外のアイテム用（対象なら保存版の本文を使う）
 function readPoolTextForReview(item) {
   if (!item.file) return item.body || null; // 旧形式フォールバック
   if (!isTextPoolFile(item.file)) return null;
   try {
     const full = fs.readFileSync(poolFilePath(item.file), "utf8");
     if (full.includes("\0")) return null;
-    return full.length > 8000 ? full.slice(0, 8000) + `\n…（先頭8000文字のみ。全文は u2a2a/pool/${item.file} を参照）` : full;
+    return clipReviewText(full, `u2a2a/pool/${item.file}`);
   } catch {
     return null;
   }
+}
+
+// ---- 成果物バージョン履歴（仕様: SPEC-成果物バージョン履歴.md）----
+// 実体は pool/.versions/<itemId>/{manifest.json, v<n>.<ext>}。manifest が正本、item.versions は参照用コピー。
+// 対象は UTF-8 テキスト・256 KiB 以下。版が切られるのは修正前後とレビュー開始時のみ（外部変更は stale 検知だけ）
+
+const REVIEW_DIFF_MAX_BYTES = 12_000; // レビュープロンプトに添える差分の上限（本文の 8000 文字制限と同程度）
+
+const versionsDir = (itemId) => path.join(POOL_VERSIONS, String(itemId));
+
+// manifest を読む。無ければ null。壊れていれば throw（黙って新規扱いにして既存の版ファイルを上書きしない）
+function readManifest(itemId) {
+  const file = path.join(versionsDir(itemId), "manifest.json");
+  if (!fs.existsSync(file)) return null;
+  const m = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (!m || !Array.isArray(m.versions)) throw new Error("manifest.json の形式が不正です");
+  // 監査4巡目【高】: manifest の内容は信頼しない。itemId と各版のファイル名・形式を検証し、
+  // 版ディレクトリ外への読み書き（パストラバーサル）を入口で遮断する
+  if (m.itemId !== undefined && String(m.itemId) !== String(itemId))
+    throw new Error(`manifest.json の itemId が一致しません（${m.itemId}）`);
+  for (const v of m.versions) {
+    if (!v || !Number.isInteger(v.n) || v.n < 1 || !safeVersionFileName(v.file) || !/^[0-9a-f]{64}$/.test(v.sha256 || ""))
+      throw new Error(`manifest.json の版エントリが不正です（n=${v && v.n}, file=${String(v && v.file).slice(0, 40)}）`);
+  }
+  return m;
+}
+
+// 版ファイルの絶対パス。ファイル名検証・ディレクトリ封じ込め・シンボリックリンク拒否を通す
+function versionAbsPath(itemId, version) {
+  if (!safeVersionFileName(version.file)) throw new Error(`版ファイル名が不正です: ${String(version.file).slice(0, 40)}`);
+  const dir = versionsDir(itemId);
+  const abs = path.join(dir, version.file);
+  if (!abs.startsWith(dir + path.sep)) throw new Error("版ファイルのパスが版ディレクトリ外を指しています");
+  try {
+    if (fs.lstatSync(abs).isSymbolicLink()) throw new Error(`版ファイル ${version.file} がシンボリックリンクです（拒否）`);
+  } catch (e) {
+    if (!isMissingError(e)) throw e;
+  }
+  return abs;
+}
+
+// 「ファイルが無い」系のエラーか。EIO / EACCES 等の読み取り障害と区別する
+const isMissingError = (e) => e && (e.code === "ENOENT" || e.code === "ENOTDIR");
+
+// tmp に書いて rename（途中で落ちても中途半端なファイルを正本の名前で残さない）。上書きを意図する manifest・復旧用
+function writeFileAtomic(file, data) {
+  fs.writeFileSync(file + ".tmp", data);
+  fs.renameSync(file + ".tmp", file);
+}
+
+// 新しい版ファイル用: 同名のファイルが既にあれば上書きせず失敗する（link は既存を置き換えない）。
+// manifest と版ファイルが食い違った状態で版を切り直しても、保存済みの本文を潰さないための書き込み側の防護
+function writeFileExclusive(file, data) {
+  fs.writeFileSync(file + ".tmp", data);
+  try {
+    fs.linkSync(file + ".tmp", file);
+  } catch (e) {
+    if (e && e.code === "EEXIST") throw new Error(`版ファイル ${path.basename(file)} が既に存在します（manifest と版ファイルの食い違い。上書きせず中止）`);
+    throw e;
+  } finally {
+    fs.rmSync(file + ".tmp", { force: true });
+  }
+}
+
+function writeManifest(itemId, manifest) {
+  const dir = versionsDir(itemId);
+  fs.mkdirSync(dir, { recursive: true });
+  writeFileAtomic(path.join(dir, "manifest.json"), JSON.stringify(manifest, null, 2));
+}
+
+// 版ディレクトリに残っている版ファイル名（manifest が無いときに「新規履歴か索引欠損か」を見分けるのに使う）
+function listVersionFiles(itemId) {
+  try {
+    return fs.readdirSync(versionsDir(itemId)).filter((f) => /^v\d+\./.test(f));
+  } catch (e) {
+    if (isMissingError(e)) return [];
+    throw e;
+  }
+}
+
+// 版を切るときに使う manifest。無ければ新規履歴として空の manifest を返す — ただし版ファイルや item.versions
+// （索引の写し）が残っているなら「新規」ではなく「索引欠損」なので throw する（呼び出し側は保存失敗として中止）。
+// 初版として書き直すと既存の v1 を新しい本文で上書きし、保存済みの内容が消えるため。
+// 復旧は manifest.json の復元（.bak 等）か、.versions/<itemId>/ ごと退避したうえで item.versions を空にすること
+function manifestForAppend(item) {
+  const m = readManifest(item.id);
+  if (m) return m;
+  const files = listVersionFiles(item.id);
+  const refs = (item.versions || []).length;
+  if (files.length || refs) {
+    throw new Error(
+      `manifest.json が無いのに履歴が残っています（版ファイル ${files.length} 件／索引の写し ${refs} 件）。` +
+        `初版として書き直すと既存の版を上書きするため中止。manifest.json を復元するか .versions/${item.id}/ を退避してください`,
+    );
+  }
+  return { itemId: item.id, file: item.file, versions: [] };
+}
+
+// 版ファイルのプール内相対パス（レビュープロンプトの全文参照先に使う）
+const versionRelPath = (itemId, version) => `.versions/${itemId}/${version.file}`;
+
+// 版ファイルを読み、内容の sha256 が manifest と一致することを確認する（不一致は code: "EINTEGRITY" で throw）。
+// 差分・レビュー添付に使う旧版は必ずここを通す（破損した旧版を「前版と同一内容」等の正常な差分として見せない）
+function readVersionVerified(itemId, version) {
+  const buf = fs.readFileSync(versionAbsPath(itemId, version));
+  if (sha256Hex(buf) !== version.sha256) {
+    const e = new Error(`版ファイル ${version.file} の内容が manifest の sha256 と一致しません（破損の疑い）`);
+    e.code = "EINTEGRITY";
+    throw e;
+  }
+  return buf;
+}
+
+function readVersionText(manifest, version) {
+  return readVersionVerified(manifest.itemId, version).toString("utf8");
+}
+
+// 版ファイルの実体が manifest と一致するか（無い→false／内容の sha256 が違う→false／読み取り障害→throw）
+function versionFileIntact(itemId, version) {
+  try {
+    readVersionVerified(itemId, version);
+    return true;
+  } catch (e) {
+    if (isMissingError(e) || e.code === "EINTEGRITY") return false;
+    throw e;
+  }
+}
+
+// 現在の実ファイルを履歴用に読む。{ buf, unsupported } — unsupported: null | "no-file" | "too-large" | "binary"
+// 不存在だけを "no-file"（対象外）にし、EIO / EACCES 等の読み取り障害は throw する。
+// 対象外は「保存をスキップして続行」だが、障害は「保存失敗（修正中止）」として扱う必要があるため混同しない
+function readForHistory(item) {
+  const abs = item.file ? poolFilePath(item.file) : null;
+  if (!abs) return { buf: null, unsupported: "no-file" };
+  try {
+    const st = fs.statSync(abs);
+    if (!st.isFile()) return { buf: null, unsupported: "no-file" };
+    if (st.size > HISTORY_MAX_BYTES) return { buf: null, unsupported: "too-large" };
+    const buf = fs.readFileSync(abs);
+    return { buf, unsupported: historyEligibility(buf) };
+  } catch (e) {
+    if (isMissingError(e)) return { buf: null, unsupported: "no-file" };
+    throw e;
+  }
+}
+
+// 現在の実ファイルの sha256（不存在・読み取り障害なら null）。レビューの stale 判定用（null は対象版と一致しない＝stale）
+function currentSha(item) {
+  try {
+    const { buf } = readForHistory(item);
+    return buf ? sha256Hex(buf) : null;
+  } catch {
+    return null;
+  }
+}
+
+// 版を切る。戻り値: { version, created, sha256, buf }／対象外: { unsupported }／読み取り障害・保存失敗: throw
+// 直前の版と同じ内容なら新たに切らず既存の版を返す（無変更の修正で版が増えない）。
+// 既存の版を再利用するときは版ファイルの実体（存在・sha256）を検証し、欠落・不整合なら今読んだ内容から復旧する
+// （manifest の sha256 と一致する内容が手元にあるので復旧できる。復旧も失敗すれば throw → 呼び出し側が保存失敗として扱う）。
+// 新しい版は既存ファイルを上書きしない書き込み（writeFileExclusive）で切り、manifest 欠損時は履歴の残骸があれば中止する
+function snapshotVersion(item, { reason, runId = null, agent = null, partial = false }) {
+  const { buf, unsupported } = readForHistory(item);
+  if (unsupported) {
+    item.versionsUnsupported = unsupported;
+    return { unsupported };
+  }
+  const sha256 = sha256Hex(buf);
+  const base = manifestForAppend(item);
+  base.file = item.file; // 版ファイルの拡張子は追加時点の所在から決める
+  const { manifest, version, created } = appendVersion(base, { sha256, size: buf.length, ts: Date.now(), reason, runId, agent, partial });
+  const dir = versionsDir(item.id);
+  if (created) {
+    fs.mkdirSync(dir, { recursive: true });
+    try {
+      writeFileExclusive(versionAbsPath(item.id, version), buf);
+    } catch (e) {
+      // 監査4巡目【中】: 「版ファイル保存成功 → manifest 保存失敗 → 再試行」の残骸なら、
+      // 内容一致（sha256）を確認したうえで既存ファイルを採用して復旧する。不一致なら従来どおり中止
+      if (!/既に存在します/.test(e.message || "")) throw e;
+      if (!versionFileIntact(item.id, version))
+        throw new Error(`版ファイル ${version.file} が既存かつ内容不一致のため中止（.versions/${item.id}/ の手動確認が必要）`);
+      logEvent("versions", `既存の版ファイル ${version.file} を採用（前回の索引保存失敗からの復旧）（${item.file}）`, "warn");
+    }
+    writeManifest(item.id, manifest);
+  } else if (!versionFileIntact(item.id, version)) {
+    fs.mkdirSync(dir, { recursive: true });
+    writeFileAtomic(versionAbsPath(item.id, version), buf);
+    if (!versionFileIntact(item.id, version)) throw new Error(`版ファイル ${version.file} を復旧できません`);
+    logEvent("versions", `版ファイル ${version.file} が欠落／不整合だったため現在の内容から復旧（${item.file}）`, "warn");
+  }
+  item.versions = manifest.versions;
+  item.versionsUnsupported = null;
+  return { version, created, sha256, buf };
+}
+
+// 起動時に manifest（正本）から item.versions を復元する（再起動後の履歴保持）
+function syncVersionsFromManifests() {
+  for (const item of state.pool) {
+    try {
+      const m = readManifest(item.id);
+      if (m) item.versions = m.versions;
+    } catch (e) {
+      logEvent("versions", `履歴 manifest の読み込みに失敗（${item.file}）: ` + (e.message || e), "warn");
+    }
+  }
+}
+
+// レビュープロンプト用の履歴情報: 対象版の本文（保存したスナップショットそのもの）・前版・前版からの差分・前回までの判定
+// snap は snapshotVersion の戻り値。本文は snap.buf（保存した版と同一のバイト列）を使い、実ファイルは再読込しない
+// （レビュー中の外部編集で「記録は v1・読んだのは v2」になるのを防ぐ）。差分の取得失敗は diffError として区別する
+function buildReviewHistory(item, snap) {
+  const { version, buf } = snap;
+  const text = buf.toString("utf8");
+  const snapshotFile = versionRelPath(item.id, version);
+  let manifest = null, prev = null, diff = "", truncated = false, diffError = null;
+  try {
+    manifest = readManifest(item.id);
+    const pair = manifest ? resolveVersionPair(manifest, null, version.id) : null;
+    prev = pair ? pair.from : null;
+    if (prev) {
+      const full = unifiedDiff(readVersionText(manifest, prev), text, { fromLabel: "v" + prev.n, toLabel: "v" + version.n });
+      ({ text: diff, truncated } = truncateUtf8(full, REVIEW_DIFF_MAX_BYTES));
+    }
+  } catch (e) {
+    diffError = String(e.message || e).slice(0, 200);
+    logEvent("versions", `前版との差分生成に失敗（${item.file}）: ` + (e.message || e), "warn");
+  }
+  const verdicts = (item.reviews || [])
+    .filter((r) => !r.error)
+    .map((r) => {
+      const v = (item.versions || []).find((x) => x.id === r.versionId);
+      return NAMES[r.reviewer] + ": " + (r.verdict || "判定なし") + (v ? "（v" + v.n + "）" : "");
+    })
+    .join("／");
+  return { version, text, snapshotFile, prev, diff, truncated, diffError, verdicts };
+}
+
+// レビュー記録に付ける版情報。終了時点の実ファイルが対象版と違えば stale
+function reviewVersionFields(item, history) {
+  if (!history) return { versionId: null, sha256: null, stale: false };
+  return { versionId: history.version.id, sha256: history.version.sha256, stale: currentSha(item) !== history.version.sha256 };
 }
 
 // 旧形式（body 内蔵）のアイテムをファイル実体へ移行する
@@ -1246,14 +1514,41 @@ function verdictFrom(text) {
   return m ? m[1] : "";
 }
 
-function buildReviewPrompt(item, reviewer) {
+function buildReviewPrompt(item, reviewer, history = null) {
   const rel = item.file ? `u2a2a/pool/${item.file}` : null;
-  const text = readPoolTextForReview(item);
-  const contentPart =
-    text != null
-      ? `--- 成果物「${item.title}」（持ち込み: ${(NAMES[item.origin] || "作者未確定")}${rel ? `／ファイル: ${rel}` : ""}） ---\n${text}`
-      : `成果物「${item.title}」（持ち込み: ${(NAMES[item.origin] || "作者未確定")}）はリポジトリ内のファイル ${rel} にあります。` +
-        `内容を読み取ってレビューしてください（読み取れない形式ならその旨を書いてください）。`;
+  const origin = NAMES[item.origin] || "作者未確定";
+  let contentPart;
+  if (history) {
+    // 履歴対象: 本文も全文参照先も保存済みスナップショットに固定する（実ファイルはレビュー中に変わり得るため参照させない）
+    const snapRel = `u2a2a/pool/${history.snapshotFile}`;
+    contentPart =
+      `--- 成果物「${item.title}」（持ち込み: ${origin}／ファイル: ${rel}／レビュー対象: v${history.version.n} のスナップショット ${snapRel}） ---\n` +
+      clipReviewText(history.text, snapRel) +
+      `\n（レビュー対象はこの v${history.version.n} の本文です。全文が必要なら ${snapRel} を読んでください。${rel} は実行中に変更され得るので参照しないこと）`;
+  } else {
+    const text = readPoolTextForReview(item);
+    contentPart =
+      text != null
+        ? `--- 成果物「${item.title}」（持ち込み: ${origin}${rel ? `／ファイル: ${rel}` : ""}） ---\n${text}`
+        : `成果物「${item.title}」（持ち込み: ${origin}）はリポジトリ内のファイル ${rel} にあります。` +
+          `内容を読み取ってレビューしてください（読み取れない形式ならその旨を書いてください）。`;
+  }
+  // 履歴（仕様: 最新版全文は従来どおり。前版との差分と前回判定は補助情報として添える）
+  let historyPart = "";
+  if (history && history.version) {
+    const head = history.prev ? `前版 v${history.prev.n} からの差分` : "初版（前版なし）";
+    const body = history.diffError
+      ? `（前版との差分を取得できませんでした: ${history.diffError}。差分は使えないので上記の本文全体で判断してください）`
+      : history.diff
+        ? history.diff + (history.truncated ? "\n…（差分が大きいため先頭のみ）" : "")
+        : history.prev
+          ? "（前版と同一内容）"
+          : "";
+    historyPart =
+      `\n\n--- 履歴（レビュー対象: v${history.version.n}／${head}） ---\n` +
+      body +
+      (history.verdicts ? `\n前回までの判定: ${history.verdicts}` : "");
+  }
   return (
     `あなたは「U2A2Aオーケストレーション」の共有タスクプール（u2a2a/pool/ = アプリ専用の成果物置き場）のレビュアー（${NAMES[reviewer]}）です。` +
     `以下の成果物を、Kometa リポジトリ（閲覧のみ可）の実態と照らして、忖度なく具体的にレビューしてください。\n` +
@@ -1262,6 +1557,7 @@ function buildReviewPrompt(item, reviewer) {
     `- 良い点は簡潔に認める\n` +
     `- 最後に必ず1行、次の形式で判定を書く: 【判定】承認 / 条件付き承認 / 差し戻し\n\n` +
     contentPart +
+    historyPart +
     commonRulesBlock("レビュー")
   );
 }
@@ -1269,6 +1565,7 @@ function buildReviewPrompt(item, reviewer) {
 async function runReview(itemId, reviewer) {
   const item = state.pool.find((p) => p.id === itemId);
   if (!item) return;
+  if (fixPending[itemId]) return; // 修正実行中は書き込み途中のファイルをレビューしない（API は 409、ここは二重防御）
   if ((reviewPending[itemId] || []).includes(reviewer)) return; // 同一レビュアーの多重起動防止
   const overBudget = budgetStatus(null); // レビューは回数/時間の全体枠で判定
   if (overBudget) {
@@ -1282,10 +1579,42 @@ async function runReview(itemId, reviewer) {
   const actKey = "review:" + itemId + ":" + reviewer;
   const run = startRun("review", reviewer, { itemId });
   actStart(actKey, NAMES[reviewer] + " レビュー", run.runId);
+  const finish = () => {
+    endRun(run.runId);
+    actEnd(actKey);
+    reviewPending[itemId] = (reviewPending[itemId] || []).filter((r) => r !== reviewer);
+    if (!reviewPending[itemId].length) delete reviewPending[itemId];
+    touch();
+  };
+  // レビュー対象の版を保存し、何を見て判定したかを記録する。プロンプトの本文はこの保存版（同一バイト列）から作る。
+  // 履歴対象のファイルで保存に失敗したら（読み取り障害・manifest 破損／索引欠損・版ファイル復旧不能）レビューは中止し、
+  // error 付きの記録に historyError を残す（修正の「前版が保存できなければ実行しない」と同じ扱い。
+  // 続行すると「どの版を見た判定か」も「レビュー中の変更検知」も保証できず、通常の判定と区別が付かなくなる）。
+  // 対象外（binary／too-large／no-file）はこれまでどおり versionId: null で実ファイルからレビューする
+  let history = null;
+  try {
+    const snap = snapshotVersion(item, { reason: "review", runId: run.runId, agent: reviewer });
+    if (!snap.unsupported) history = buildReviewHistory(item, snap);
+  } catch (e) {
+    const historyError = "レビュー対象版を保存できません: " + String(e.message || e).slice(0, 200);
+    item.reviews.push({
+      id: id(),
+      reviewer,
+      text: "（レビュー中止: " + historyError + "。履歴の保存先を直してから再レビューしてください）",
+      verdict: "",
+      error: true,
+      historyError,
+      ts: Date.now(),
+      ...reviewVersionFields(item, null),
+    });
+    logEvent("versions", `レビュー対象版の保存に失敗（${item.file}）: ` + (e.message || e));
+    finish();
+    return;
+  }
   try {
     const call = reviewer === "claude" ? callClaude : callCodex;
-    const { text, meta } = await call(buildReviewPrompt(item, reviewer), null, state.agents[reviewer].modelOverride, (s) => actStep(actKey, s));
-    item.reviews.push({ id: id(), reviewer, text, verdict: verdictFrom(text), meta, ts: Date.now() });
+    const { text, meta } = await call(buildReviewPrompt(item, reviewer, history), null, state.agents[reviewer].modelOverride, (s) => actStep(actKey, s));
+    item.reviews.push({ id: id(), reviewer, text, verdict: verdictFrom(text), meta, ts: Date.now(), ...reviewVersionFields(item, history) });
   } catch (e) {
     item.reviews.push({
       id: id(),
@@ -1294,13 +1623,10 @@ async function runReview(itemId, reviewer) {
       verdict: "",
       error: true,
       ts: Date.now(),
+      ...reviewVersionFields(item, history),
     });
   } finally {
-    endRun(run.runId);
-    actEnd(actKey);
-    reviewPending[itemId] = (reviewPending[itemId] || []).filter((r) => r !== reviewer);
-    if (!reviewPending[itemId].length) delete reviewPending[itemId];
-    touch();
+    finish();
   }
 }
 
@@ -1325,7 +1651,7 @@ function buildFixPrompt(item, agent) {
 
 async function runFix(itemId, agent) {
   const item = state.pool.find((p) => p.id === itemId);
-  if (!item || !item.file || fixPending[itemId]) return;
+  if (!item || !item.file || fixPending[itemId] || reviewPending[itemId]) return; // レビュー中の修正は API が 409。ここは二重防御
   const overBudget = budgetStatus(null);
   if (overBudget) {
     item.fixes = item.fixes || [];
@@ -1337,12 +1663,38 @@ async function runFix(itemId, agent) {
   const actKey = "fix:" + itemId;
   const run = startRun("fix", agent, { itemId });
   actStart(actKey, NAMES[agent] + " 修正", run.runId);
-  // 修正前の版を .trash に世代バックアップ
+  item.fixes = item.fixes || [];
+  const fix = { id: id(), agent, ts: Date.now() };
+  const finish = () => {
+    endRun(run.runId);
+    actEnd(actKey);
+    delete fixPending[itemId];
+    touch();
+  };
+  // 修正前の版を保存（仕様: 保存失敗は修正を中止。履歴対象外のファイルは従来どおり .trash へ世代バックアップして続行）
+  let tracked = false;
   try {
-    fs.copyFileSync(poolFilePath(item.file), path.join(POOL_TRASH, Date.now() + "-prefix-" + item.file.replaceAll("/", "__")));
-  } catch {
-    // バックアップ失敗でも修正は続行
+    const snap = snapshotVersion(item, { reason: "fix-before", runId: run.runId, agent });
+    if (snap.unsupported) {
+      try {
+        fs.copyFileSync(poolFilePath(item.file), path.join(POOL_TRASH, Date.now() + "-prefix-" + item.file.replaceAll("/", "__")));
+      } catch {
+        // 対象外ファイルのバックアップ失敗は従来どおり続行
+      }
+    } else {
+      tracked = true;
+      fix.beforeVersionId = snap.version.id;
+    }
+  } catch (e) {
+    fix.historyError = "修正前の版を保存できません: " + String(e.message || e).slice(0, 200);
+    fix.text = "（修正中止: " + fix.historyError + "）";
+    fix.error = true;
+    item.fixes.push(fix);
+    logEvent("versions", `修正前の版の保存に失敗（${item.file}）: ` + (e.message || e));
+    finish();
+    return;
   }
+  let cliOk = false;
   try {
     const prompt = buildFixPrompt(item, agent);
     const onStep = (s) => actStep(actKey, s);
@@ -1354,29 +1706,37 @@ async function runFix(itemId, agent) {
             extraArgs: ["--permission-mode", "acceptEdits"], // 書き込みは cwd=pool/ 内のみ
           })
         : await callCodex(prompt, null, override, onStep, { writeDir: POOL_DIR });
-    item.fixes = item.fixes || [];
-    item.fixes.push({ id: id(), agent, text, meta, ts: Date.now() });
+    Object.assign(fix, { text, meta });
+    cliOk = true;
     const st = statPoolFile(item.file);
     if (st) Object.assign(item, st);
     item.status = "submitted";
-    touch();
-    // 元レビュアー（修正者以外）が自動で再レビュー
+  } catch (e) {
+    Object.assign(fix, { text: "（修正失敗: " + String(e.message || e).slice(0, 300) + "）", error: true });
+  }
+  // 修正後の版を成否問わず保存（失敗時は partial）→ ロック解除 → 履歴保存に成功したときだけ自動再レビュー
+  let historyOk = true;
+  if (tracked) {
+    try {
+      const snap = snapshotVersion(item, { reason: "fix-after", runId: run.runId, agent, partial: !cliOk });
+      if (snap.unsupported) {
+        historyOk = false;
+        fix.historyError = "修正後のファイルが履歴対象外になりました: " + snap.unsupported;
+      } else {
+        fix.afterVersionId = snap.version.id;
+      }
+    } catch (e) {
+      historyOk = false;
+      fix.historyError = "修正後の版を保存できません: " + String(e.message || e).slice(0, 200);
+      logEvent("versions", `修正後の版の保存に失敗（${item.file}）: ` + (e.message || e));
+    }
+  }
+  item.fixes.push(fix);
+  finish();
+  if (cliOk && historyOk) {
+    // 元レビュアー（修正者以外）が自動で再レビュー（ロック解除後に開始する）
     const reviewers = [...new Set((item.reviews || []).filter((r) => !r.error).map((r) => r.reviewer))].filter((r) => r !== agent);
     for (const r of reviewers.length ? reviewers : [OTHER[agent]]) runReview(item.id, r);
-  } catch (e) {
-    item.fixes = item.fixes || [];
-    item.fixes.push({
-      id: id(),
-      agent,
-      text: "（修正失敗: " + String(e.message || e).slice(0, 300) + "）",
-      error: true,
-      ts: Date.now(),
-    });
-  } finally {
-    endRun(run.runId);
-    actEnd(actKey);
-    delete fixPending[itemId];
-    touch();
   }
 }
 
@@ -1996,16 +2356,27 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && (url.pathname === "/api/pool/copy" || url.pathname === "/api/pool/move")) {
     const isMove = url.pathname.endsWith("/move");
     const body = await readBody(req);
-    const src = typeof body.src === "string" ? body.src.replace(/\/+$/, "") : "";
-    const destDir = typeof body.destDir === "string" ? body.destDir.replace(/\/+$/, "") : "";
+    let src = typeof body.src === "string" ? body.src.replace(/\/+$/, "") : "";
+    let destDir = typeof body.destDir === "string" ? body.destDir.replace(/\/+$/, "") : "";
     const srcAbs = poolFilePath(src);
     const destDirAbs = destDir ? poolFilePath(destDir) : POOL_DIR;
     if (!srcAbs || !fs.existsSync(srcAbs)) return json(res, 400, { error: "src が見つかりません" });
     if (!destDirAbs || !fs.existsSync(destDirAbs) || !fs.statSync(destDirAbs).isDirectory())
       return json(res, 400, { error: "destDir が不正です" });
+    // パス表記の違い（./ や余分な区切り等）で実行中チェックを迂回できないよう、実体パスから正準化する
+    src = path.relative(POOL_DIR, srcAbs);
+    destDir = destDirAbs === POOL_DIR ? "" : path.relative(POOL_DIR, destDirAbs);
     const isDir = fs.statSync(srcAbs).isDirectory();
     if (isDir && (destDir === src || destDir.startsWith(src + "/")))
       return json(res, 400, { error: "フォルダを自分自身の中へは移動/コピーできません" });
+    // 修正／レビュー実行中のアイテム（とそれを含むフォルダ）は移動しない。CLI には開始時のパスを渡しているので、
+    // 途中で移動すると修正は旧パスに書かれ、後版保存は移動先の未修正内容を「修正後」として記録してしまう
+    if (isMove) {
+      const busy = state.pool.find(
+        (p) => p.file && (fixPending[p.id] || reviewPending[p.id]) && (p.file === src || (isDir && p.file.startsWith(src + "/"))),
+      );
+      if (busy) return json(res, 409, { error: `実行中（修正／レビュー）のアイテム ${busy.file} を含むため移動できません（完了後に移動してください）` });
+    }
     const srcParent = src.includes("/") ? src.slice(0, src.lastIndexOf("/")) : "";
     if (isMove && srcParent === destDir) return json(res, 200, { ok: true, dest: src }); // 同じ場所への移動は何もしない
     // 衝突しない移動/コピー先の名前を決める
@@ -2174,6 +2545,54 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  // 版一覧（仕様: 削除済みアイテムでも manifest があれば返す。対象外の理由は現状のファイルから判定）
+  if (req.method === "GET" && parts[0] === "api" && parts[1] === "pool" && parts[2] && parts[3] === "versions" && parts.length === 4) {
+    const item = state.pool.find((p) => p.id === parts[2]);
+    let manifest;
+    try {
+      manifest = readManifest(parts[2]);
+    } catch (e) {
+      return json(res, 500, { error: "履歴 manifest を読めません: " + (e.message || e) });
+    }
+    if (!item && !manifest) return json(res, 404, { error: "pool item not found" });
+    const versions = manifest ? manifest.versions : (item && item.versions) || [];
+    let unsupportedReason = null;
+    if (item) {
+      try {
+        unsupportedReason = readForHistory(item).unsupported;
+      } catch (e) {
+        unsupportedReason = "read-error"; // EIO / EACCES 等。対象外ではなく「今は読めない」（UI は理由文字列をそのまま表示）
+        logEvent("versions", `実ファイルを読めません（${item.file}）: ` + (e.message || e), "warn");
+      }
+    }
+    return json(res, 200, { versions, unsupportedReason });
+  }
+
+  // 指定版間の unified diff（from 省略時は to の直前の版。256 KiB 超は truncated）
+  if (req.method === "GET" && parts[0] === "api" && parts[1] === "pool" && parts[2] && parts[3] === "diff" && parts.length === 4) {
+    const toId = url.searchParams.get("to");
+    if (!toId) return json(res, 400, { error: "to（版 id）を指定してください" });
+    let manifest;
+    try {
+      manifest = readManifest(parts[2]);
+    } catch (e) {
+      return json(res, 500, { error: "履歴 manifest を読めません: " + (e.message || e) });
+    }
+    if (!manifest) return json(res, 404, { error: "履歴がありません" });
+    const pair = resolveVersionPair(manifest, url.searchParams.get("from") || null, toId);
+    if (!pair) return json(res, 404, { error: "指定の版が見つかりません" });
+    const { from, to } = pair;
+    try {
+      const full = from
+        ? unifiedDiff(readVersionText(manifest, from), readVersionText(manifest, to), { fromLabel: "v" + from.n, toLabel: "v" + to.n })
+        : "";
+      const { text, truncated } = truncateUtf8(full, DIFF_MAX_BYTES);
+      return json(res, 200, { from, to, diff: text, truncated });
+    } catch (e) {
+      return json(res, 500, { error: "版ファイルを読めません: " + (e.message || e) });
+    }
+  }
+
   if (parts[0] === "api" && parts[1] === "pool" && parts[2]) {
     const item = state.pool.find((p) => p.id === parts[2]);
     if (!item) return json(res, 404, { error: "pool item not found" });
@@ -2182,6 +2601,7 @@ async function handleApi(req, res, url) {
       const body = await readBody(req);
       const reviewer = AGENTS.includes(body.reviewer) ? body.reviewer : null;
       if (!reviewer) return json(res, 400, { error: "reviewer は claude / codex" });
+      if (fixPending[item.id]) return json(res, 409, { error: "このアイテムは修正実行中です（完了後にレビューしてください）" });
       runReview(item.id, reviewer);
       return json(res, 202, { ok: true });
     }
@@ -2193,6 +2613,7 @@ async function handleApi(req, res, url) {
       if (!agent) return json(res, 400, { error: "agent は claude / codex" });
       if (!item.file) return json(res, 400, { error: "ファイル実体のない旧形式アイテムは修正できません" });
       if (fixPending[item.id]) return json(res, 409, { error: "このアイテムは修正実行中です" });
+      if (reviewPending[item.id]) return json(res, 409, { error: "このアイテムはレビュー実行中です（完了後に修正してください）" });
       runFix(item.id, agent);
       return json(res, 202, { ok: true });
     }
@@ -2205,7 +2626,8 @@ async function handleApi(req, res, url) {
     }
 
     if (req.method === "DELETE" && parts.length === 3) {
-      // 実ファイルは消さず .trash へ退避（誤削除からの復元用）
+      if (fixPending[item.id] || reviewPending[item.id]) return json(res, 409, { error: "実行中（修正／レビュー）のアイテムは削除できません" });
+      // 実ファイルは消さず .trash へ退避（誤削除からの復元用）。.versions/<itemId>/ は残す（manifest が索引を保持）
       if (item.file) {
         try {
           fs.renameSync(poolFilePath(item.file), path.join(POOL_TRASH, Date.now() + "-" + item.file.replaceAll("/", "__")));
@@ -2390,7 +2812,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 fs.mkdirSync(POOL_TRASH, { recursive: true });
+fs.mkdirSync(POOL_VERSIONS, { recursive: true });
 migratePoolItems();
+syncVersionsFromManifests();
 scanPoolDir();
 try {
   writeThreadMirrors();
