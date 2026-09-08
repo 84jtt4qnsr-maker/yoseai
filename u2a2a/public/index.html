@@ -680,6 +680,9 @@
   .history-row button[aria-pressed="true"] { border-color: var(--text); color: var(--text); }
   .history-diff-title { display: block; margin-top: 10px; font-size: 12px; }
   .history-diff { margin: 8px 0 0; padding: 8px; max-height: 320px; overflow: auto; white-space: pre; font-size: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+  /* 行はブロック要素。横スクロール時も背景が行末まで届くよう内容幅に合わせて伸ばす */
+  .diff-line { display: block; width: fit-content; min-width: 100%; }
+  .diff-line:empty::before { content: " "; white-space: pre; }
   .history-diff .diff-add { color: #a0e5ad; background: #7bd88f15; }
   .history-diff .diff-remove { color: #ffabab; background: #ff7b7b15; }
   #pool-detail .review .r-head { flex-wrap: wrap; }
@@ -1442,6 +1445,12 @@ function poolHistoryState(p) {
     selectedToId: previous ? previous.selectedToId : null,
     diff: previous ? previous.diff : null,
   };
+  // ファイル実体のない旧形式はサーバに聞くまでもなく対象外（選択のたびの往復を省く）
+  if (!p.file) {
+    history.pending = false;
+    history.unsupportedReason = "no-file";
+    return history;
+  }
   readPoolHistory("/api/pool/" + encodeURIComponent(p.id) + "/versions")
     .then((data) => {
       if (!Array.isArray(data.versions)) throw new Error("履歴の応答形式を確認してください");
@@ -1467,7 +1476,8 @@ function poolHistoryEl(p, history) {
   section.appendChild(el("div", { class: "history-head" }, [
     el("strong", { text: "履歴" }),
     el("button", { class: "small", text: "再取得", onclick: () => {
-      history.key = null; history.selectedToId = null; history.diff = null; renderPool();
+      // 比較先の選択は維持する（失敗からの復旧のたびに選び直させない）
+      history.key = null; history.diff = null; renderPool();
     } }),
   ]));
   const note = (text, warning = false) => el("div", { class: "history-note" + (warning ? " history-warning" : ""), text });
@@ -1537,18 +1547,24 @@ function poolHistoryEl(p, history) {
     if (diff.data.truncated) section.appendChild(note("差分は一部のみ表示しています（256 KiB上限）。全文ではありません。", true));
     if (!diff.data.diff) section.appendChild(note(diff.data.truncated ? "表示できる差分がありません。" : "内容の差分はありません。"));
     else {
-      const pre = el("pre", {
-        class: "history-diff", tabindex: "0", "aria-label": "v" + from.n + " から v" + to.n + " の差分",
-        onscroll: (e) => { diff.scrollTop = e.target.scrollTop; diff.scrollLeft = e.target.scrollLeft; },
-      });
-      // 成果物由来の差分は必ず textContent 経由。HTML/Markdown として解釈しない。
-      const lines = diff.data.diff.split("\n");
-      lines.forEach((line, i) => {
-        const header = i < 2 && /^(---|\+\+\+) v\d+$/.test(line);
-        const kind = !header && line.startsWith("+") ? " diff-add"
-          : !header && line.startsWith("-") ? " diff-remove" : "";
-        pre.appendChild(el("span", { class: "diff-line" + kind, text: line + (i < lines.length - 1 ? "\n" : "") }));
-      });
+      // 数千ノードになり得るため一度だけ構築し、SSE再描画では同じ要素を使い回す
+      if (!diff.el) {
+        const pre = diff.el = el("pre", {
+          class: "history-diff", tabindex: "0", "aria-label": "v" + from.n + " から v" + to.n + " の差分",
+          onscroll: (e) => { diff.scrollTop = e.target.scrollTop; diff.scrollLeft = e.target.scrollLeft; },
+        });
+        // 成果物由来の差分は必ず textContent 経由。HTML/Markdown として解釈しない。
+        // 行は display:block（コピー時は要素境界が改行になる）
+        const lines = diff.data.diff.split("\n");
+        if (lines[lines.length - 1] === "") lines.pop();
+        lines.forEach((line, i) => {
+          const header = i < 2 && /^(---|\+\+\+) v\d+$/.test(line);
+          const kind = !header && line.startsWith("+") ? " diff-add"
+            : !header && line.startsWith("-") ? " diff-remove" : "";
+          pre.appendChild(el("span", { class: "diff-line" + kind, text: line }));
+        });
+      }
+      const pre = diff.el;
       section.appendChild(pre);
       requestAnimationFrame(() => { if (pre.isConnected) { pre.scrollTop = diff.scrollTop; pre.scrollLeft = diff.scrollLeft; } });
     }
@@ -2008,7 +2024,9 @@ function renderPoolDetail(box, p) {
       if (f.meta) fHead.appendChild(metaEl(f.meta));
       if (f.beforeVersionId || f.afterVersionId) fHead.appendChild(el("span", {
         class: "review-version",
-        text: versionLabel(history.versions, f.beforeVersionId) + " → " + versionLabel(history.versions, f.afterVersionId),
+        // チップが出る＝履歴機能は動いていたので、片側の欠落は「未記録」ではなく保存失敗
+        text: (f.beforeVersionId ? versionLabel(history.versions, f.beforeVersionId) : "保存失敗")
+          + " → " + (f.afterVersionId ? versionLabel(history.versions, f.afterVersionId) : "保存失敗"),
       }));
       const fixKids = [fHead];
       if (f.historyError) fixKids.push(el("div", { class: "history-warning", text: "履歴保存失敗: " + f.historyError }));
@@ -2040,12 +2058,15 @@ function renderPoolDetail(box, p) {
         }));
       }
     }
-    if (p.file && !(state.fixPending || {})[p.id]) {
+    if (p.file) {
+      // レビューボタンと同じく、実行中は非表示でなく無効化で理由を示す
+      const fixBlock = fixer ? "修正が完了してから修正できます"
+        : pending.length ? "レビューが完了してから修正できます" : null;
       for (const agent of ["claude", "codex"]) {
         actions.appendChild(el("button", {
           class: "small",
           text: NAMES[agent] + " に修正依頼",
-          ...(pending.length ? { disabled: "", title: "レビューが完了してから修正できます" } : {}),
+          ...(fixBlock ? { disabled: "", title: fixBlock } : {}),
           onclick: () => poolAction("/api/pool/" + p.id + "/fix", "POST", { agent }, NAMES[agent] + " が修正を開始しました（完了後、自動で再レビュー）"),
         }));
       }
