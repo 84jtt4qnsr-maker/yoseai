@@ -280,7 +280,17 @@
     flex-direction: column;
     gap: 8px;
     min-height: 120px;
+    transition: box-shadow 0.8s ease;
   }
+  /* 状態発光: 実行中=淡緑の呼吸グラデ、正常完了=青、対応待ち=黄、エラー等=赤（1pxリング＋内側グラデ）*/
+  .thread-col[data-glow="run"] .messages { animation: glow-breath 2.6s ease-in-out infinite; }
+  @keyframes glow-breath {
+    0%, 100% { box-shadow: inset 0 0 0 1px rgba(123, 216, 143, 0.22), inset 0 0 10px rgba(123, 216, 143, 0.08), inset 0 0 34px rgba(123, 216, 143, 0.04); }
+    50% { box-shadow: inset 0 0 0 1px rgba(123, 216, 143, 0.75), inset 0 0 22px rgba(123, 216, 143, 0.35), inset 0 0 64px rgba(123, 216, 143, 0.12); }
+  }
+  .thread-col[data-glow="ok"] .messages { box-shadow: inset 0 0 0 1px rgba(110, 168, 254, 0.55), inset 0 0 16px rgba(110, 168, 254, 0.28), inset 0 0 48px rgba(110, 168, 254, 0.08); }
+  .thread-col[data-glow="wait"] .messages { box-shadow: inset 0 0 0 1px rgba(231, 200, 107, 0.55), inset 0 0 16px rgba(231, 200, 107, 0.28), inset 0 0 48px rgba(231, 200, 107, 0.08); }
+  .thread-col[data-glow="err"] .messages { box-shadow: inset 0 0 0 1px rgba(255, 123, 123, 0.6), inset 0 0 16px rgba(255, 123, 123, 0.3), inset 0 0 48px rgba(255, 123, 123, 0.1); }
   .msg {
     background: var(--panel);
     border: 1px solid var(--line);
@@ -2197,6 +2207,25 @@ function renderAgentStatus(agent) {
     status.textContent = a.auto ? "CLI 自動応答" : "手動（貼り付け）";
     status.title = "";
   }
+  applyThreadGlow(agent, a, ta);
+}
+
+// スレッド枠の状態発光。実行中 > エラー > 対応待ち（上限停止・中断・手動対応待ち）> 正常完了
+function applyThreadGlow(agent, a, ta) {
+  const col = document.querySelector('.thread-col[data-agent="' + agent + '"]');
+  const topic = currentTopic();
+  if (!col || !topic) return;
+  const msgs = state.messages.filter((m) => m.thread === agent && m.topicId === topic.id);
+  const last = msgs[msgs.length - 1];
+  // 相手（ユーザー・他スレッド）からの発言に未応答のままか
+  const unseen = msgs.some((m) => m.author !== agent && m.ts > (ta.lastSeenTs || 0));
+  let glow = "";
+  if (isRunning(agent)) glow = "run";
+  else if (a.lastError) glow = "err";
+  else if ((state.budgetHalt && a.auto) || ta.interruptedSessionId || (last && last.cancelled)) glow = "wait";
+  else if (unseen && !a.auto) glow = "wait";
+  else if (last && last.author === agent && last.meta && last.meta.status === "completed") glow = "ok";
+  col.dataset.glow = glow;
 }
 
 function renderThread(agent) {
