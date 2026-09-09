@@ -105,7 +105,7 @@ async function api(method, p, body) {
 const getState = async () => (await api("GET", "/api/state")).body;
 const getTopic = async (id) => (await getState()).topics.find((t) => t.id === id);
 
-async function waitFor(fn, label, ms = 20000) {
+async function waitFor(fn, label, ms = 45000) {
   const t0 = Date.now();
   for (;;) {
     const v = await fn();

@@ -15,6 +15,7 @@
     --user: #7bd88f;
     --claude: #ffab5e;
     --codex: #6fd7ff;
+    --grok: #b99aff;
     --danger: #ff7b7b;
   }
   * { box-sizing: border-box; }
@@ -220,8 +221,6 @@
     letter-spacing: 0.03em;
     white-space: nowrap;
   }
-  .thread-col[data-agent="claude"] .thread-head .role-dot { background: var(--claude); }
-  .thread-col[data-agent="codex"] .thread-head .role-dot { background: var(--codex); }
   .thread-head .count { color: var(--dim); font-weight: 400; font-size: 12px; margin-left: 8px; }
   .thread-head .auto-ctl {
     margin-left: auto;
@@ -812,16 +811,54 @@
     pointer-events: none;
   }
   #toast.show { opacity: 1; }
+
+  /* 参加者列はDOMを保ち、折りたたみは表示だけを変更する。 */
+  main { grid-template-columns: var(--thread-tracks, 1fr 1fr); }
+  body.three-agents #content { grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr); }
+  body.three-agents.pool-collapsed #content { grid-template-columns: minmax(0, 1fr) auto; }
+  .thread-head { flex-wrap: wrap; }
+  .thread-col .thread-head .role-dot, .thread-rail .role-dot { background: var(--agent-color); }
+  .thread-rail { flex: 1; display: flex; align-items: center; flex-direction: column; gap: 12px; border-radius: 0; padding: 10px 4px; min-height: 0; }
+  .thread-rail[hidden] { display: none; }
+  .rail-name, .rail-unread { writing-mode: vertical-rl; }
+  .thread-col.is-folded > :not(.thread-rail) { display: none !important; }
+  .thread-col.is-folded[data-glow="run"] .thread-rail { animation: glow-breath 2.6s ease-in-out infinite; }
+  .thread-col.is-folded[data-glow="relay"] .thread-rail { animation: relay-pulse 1.6s linear infinite; }
+  .thread-col.is-folded[data-glow="err"] .thread-rail { box-shadow: inset 0 0 16px #ff7b7b66; }
+  .thread-col.is-folded[data-glow="wait"] .thread-rail { box-shadow: inset 0 0 16px #e7c86b66; }
+  .thread-col.is-folded[data-glow="ok"] .thread-rail { box-shadow: inset 0 0 16px #6ea8fe66; }
+  .msg[data-author="grok"] { border-left-color: var(--grok); }
+  .msg[data-author="grok"] .who, .origin[data-o="grok"], .reviewer[data-o="grok"] { color: var(--grok); }
+  #agent-access, #qa-participants { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  #agent-access { padding: 4px 16px; font-size: 12px; }
+  #agent-access:empty { display: none; }
+  .agent-status[data-s="wait"] { color: #e7c86b; }
+  #qa-participants { padding: 6px 16px; border-bottom: 1px solid var(--line); }
+  #qa-participants[hidden], #topic-participants[hidden] { display: none; }
+  .agent-choice { display: inline-flex; align-items: center; gap: 6px; margin: 4px 10px 4px 0; font-size: 12px; }
+  .agent-choice input { width: auto; }
+  #qa-status[data-reason="agreed"] { color: #7bd88f; }
+  #qa-status[data-reason]:not([data-reason="agreed"]):not([data-reason=""]) { color: var(--danger); }
+  .stopped-note { color: var(--danger); }
+  @media (max-width: 1100px) {
+    body.three-agents main { display: flex; flex-direction: column; overflow-y: auto; }
+    body.three-agents main .thread-col { flex: 1 0 260px; min-height: 260px; border-left: none; border-top: 1px solid var(--line); }
+    body.three-agents main .thread-col.is-folded { flex: 0 0 44px; min-height: 44px; }
+    body.three-agents .thread-rail { flex-direction: row; justify-content: flex-start; padding: 6px 12px; }
+    body.three-agents .rail-name, body.three-agents .rail-unread { writing-mode: horizontal-tb; }
+  }
 </style>
 </head>
 <body>
 <header>
   <h1>U2A2A Orchestration</h1>
-  <span class="sub">ユーザー ⇄ Claude Code ⇄ Codex ／ やり取りから生まれたタスクを各アプリで作業し、結果を再入力する</span>
+  <span class="sub">ユーザー ⇄ 参加エージェント ／ やり取りから生まれたタスクを各アプリで作業し、結果を再入力する</span>
   <button id="budget-btn" class="small" style="margin-left:auto" title="実行の上限設定（コスト・回数・時間）">⚙ 上限</button>
   <button id="projects-btn" class="small">📁 プロジェクト</button>
   <button id="health-btn" class="small" title="運用イベント（失敗ログ）とストレージ計測">🩺</button>
 </header>
+
+<div id="agent-access" aria-live="polite"></div>
 
 <!-- トピック（スレッド）タブ -->
 <div id="topic-bar"></div>
@@ -832,13 +869,7 @@
 <div id="user-band">
   <span class="role-dot" title="ユーザー"></span>
   <textarea id="user-text" placeholder="ユーザーとして発言（回答・質問）— Cmd+Enter で送信"></textarea>
-  <select id="user-target" title="送信先スレッド">
-    <option value="claude">→ Claude Code</option>
-    <option value="codex">→ Codex</option>
-    <option value="both">→ 両方</option>
-    <option value="qa-claude">🗨 質疑（Claude先手）</option>
-    <option value="qa-codex">🗨 質疑（Codex先手）</option>
-  </select>
+  <select id="user-target" title="送信先スレッド"></select>
   <input id="qa-agenda" placeholder="今回決めること（空欄=先手が起案）" title="質疑の論点。空欄ならリレー開始側のエージェントが起案し、進行中にバーから修正できます" hidden style="width:220px" />
   <input id="qa-hops" type="number" min="1" max="20" value="6" title="自動中継の上限手数" hidden />
   <label class="auto-ctl" id="test-mark-wrap" title="テスト送信: エージェントは明示された生成・操作は行うが、追加調査・実装へは広げない"><input type="checkbox" id="test-mark" />🧪</label>
@@ -846,6 +877,7 @@
   <input id="attach-input" type="file" multiple hidden />
   <button id="user-send">送信</button>
 </div>
+<div id="qa-participants" hidden></div>
 <div id="budget-bar" hidden>
   <span id="budget-reason"></span>
   <button id="budget-resume" class="small">解除して自動応答を再開</button>
@@ -854,44 +886,13 @@
   <span id="qa-status"></span>
   <input id="qa-agenda-edit" title="今回決めること（編集すると次の中継から反映）" style="width:260px;padding:2px 8px;font-size:12px" />
   <button id="qa-stop" class="small">質疑を停止</button>
+  <button id="qa-dismiss" class="small" hidden>閉じる</button>
 </div>
 
 <div id="content">
 <main>
   <svg id="link-layer"></svg>
-  <!-- Claude Code 側スレッド -->
-  <section class="thread-col" data-agent="claude">
-    <div class="thread-head"><span class="role-dot"></span>Claude Code 側スレッド<input class="model-chip" id="model-claude" list="models-claude" title="使用モデルを指定（空欄=CLI既定）。プレースホルダは直近の実使用モデル" /><datalist id="models-claude"><option value="opus"></option><option value="sonnet"></option><option value="haiku"></option></datalist><span class="count" id="count-claude"></span><span class="agent-status" id="status-claude"></span>
-      <button class="small" id="reset-claude" title="このスレッドの Claude CLI セッションをリセット（次の応答から新セッション・文脈もリセット）">⟳</button>
-      <label class="auto-ctl"><input type="checkbox" id="auto-claude" />自動応答</label>
-    </div>
-    <div class="messages" id="messages-claude"></div>
-    <div class="agent-input" hidden>
-      <textarea id="input-claude" placeholder="Claude Code の返答・質問を貼り付け／入力 — Cmd+Enter で追加・Esc で閉じる"></textarea>
-      <button data-agent-send="claude">Claude として追加</button>
-    </div>
-    <div class="task-zone">
-      <h2 id="tasks-head-claude"></h2>
-      <div id="tasks-claude"></div>
-    </div>
-  </section>
-
-  <!-- Codex 側スレッド -->
-  <section class="thread-col" data-agent="codex">
-    <div class="thread-head"><span class="role-dot"></span>Codex 側スレッド<input class="model-chip" id="model-codex" list="models-codex" title="使用モデルを指定（空欄=CLI既定）。プレースホルダは直近の実使用モデル" /><datalist id="models-codex"></datalist><span class="count" id="count-codex"></span><span class="agent-status" id="status-codex"></span>
-      <button class="small" id="reset-codex" title="このスレッドの Codex CLI セッションをリセット（次の応答から新セッション・文脈もリセット。メディア生成対応の新方式に切替）">⟳</button>
-      <label class="auto-ctl"><input type="checkbox" id="auto-codex" />自動応答</label>
-    </div>
-    <div class="messages" id="messages-codex"></div>
-    <div class="agent-input" hidden>
-      <textarea id="input-codex" placeholder="Codex の返答・質問を貼り付け／入力 — Cmd+Enter で追加・Esc で閉じる"></textarea>
-      <button data-agent-send="codex">Codex として追加</button>
-    </div>
-    <div class="task-zone">
-      <h2 id="tasks-head-codex"></h2>
-      <div id="tasks-codex"></div>
-    </div>
-  </section>
+  <!-- topic.participants から列を生成 -->
 </main>
 
 <!-- 共有タスクプール -->
@@ -952,6 +953,7 @@
   <form id="project-choice-form">
     <div id="project-topic-title-field" class="field"><label for="project-topic-title">スレッド名（任意）</label><input id="project-topic-title" maxlength="60" autocomplete="off" /></div>
     <div class="field"><label for="project-choice-select">プロジェクト</label><select id="project-choice-select"></select></div>
+    <fieldset id="topic-participants"><legend>参加者</legend><div id="topic-participant-options"></div></fieldset>
     <div id="project-choice-preview"></div>
     <p id="project-choice-note" class="project-hint"></p>
     <div id="project-choice-error" class="project-error" role="status"></div>
@@ -998,11 +1000,7 @@
   <h3>共有タスクプールへ持ち込み</h3>
   <div class="field">
     <label>持ち込み元</label>
-    <select id="pool-origin">
-      <option value="user">ユーザー</option>
-      <option value="claude">Claude Code</option>
-      <option value="codex">Codex</option>
-    </select>
+    <select id="pool-origin"></select>
   </div>
   <div class="field">
     <label>タイトル</label>
@@ -1010,7 +1008,7 @@
   </div>
   <div class="field">
     <label>成果物テキスト（Markdown 可。`u2a2a/pool/` に .md として保存されます）</label>
-    <textarea id="pool-body"></textarea>
+    <textarea id="pool-text"></textarea>
   </div>
   <div class="field">
     <label>保存ファイル名（任意。拡張子込みで指定 — 空欄なら タイトル.md）</label>
@@ -1021,12 +1019,24 @@
     <input type="file" id="pool-file" />
   </div>
   <div class="field">
-    <label><input type="checkbox" id="pool-autoreview" checked /> 登録と同時に相手エージェントが自動レビュー（ユーザー持ち込みは両者）</label>
+    <label><input type="checkbox" id="pool-autoreview" checked /> 登録と同時に選択した参加者が自動レビュー</label>
   </div>
+  <fieldset><legend>レビュー依頼先</legend><div id="pool-reviewers"></div></fieldset>
   <div class="buttons">
     <button id="pool-cancel">キャンセル</button>
     <button id="pool-create">プールへ登録</button>
   </div>
+</dialog>
+
+<dialog id="agent-action-dialog" aria-labelledby="agent-action-title">
+  <h3 id="agent-action-title"></h3>
+  <form id="agent-action-form">
+    <div class="field"><label for="agent-action-target">担当</label><select id="agent-action-target"></select></div>
+    <label class="agent-choice"><input type="checkbox" id="agent-action-offline" />オフライン（web検索を使わない）</label>
+    <p id="agent-action-state" role="status"></p>
+    <p id="agent-action-error" class="project-error" role="alert"></p>
+    <div class="buttons"><button id="agent-action-cancel" type="button">キャンセル</button><button id="agent-action-submit" type="submit">依頼する</button></div>
+  </form>
 </dialog>
 
 <!-- タスク化ダイアログ -->
@@ -1034,10 +1044,7 @@
   <h3>タスク化</h3>
   <div class="field">
     <label>担当</label>
-    <select id="task-agent">
-      <option value="claude">Claude Code</option>
-      <option value="codex">Codex</option>
-    </select>
+    <select id="task-agent"></select>
   </div>
   <div class="field">
     <label>タイトル</label>
@@ -1069,8 +1076,7 @@
 <div id="toast"></div>
 
 <script>
-const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
-const OTHER = { claude: "codex", codex: "claude" };
+const NAMES = Object.assign(Object.create(null), { user: "ユーザー" });
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
 let state = { messages: [], tasks: [], pool: [], topics: [], projects: [], agents: {}, running: {}, reviewPending: {}, fixPending: {}, activity: {}, runs: [], events: [], storageMetrics: {} };
 
@@ -1169,7 +1175,8 @@ function renderTopicBar() {
   }
   bar.appendChild(el("button", {
     id: "topic-add", text: "＋ 新規スレッド",
-    onclick: () => openProjectChoice("new"),
+    title: "Shift＋クリックで参加者・プロジェクトを選択",
+    onclick: (event) => openProjectChoice("new", undefined, null, event.shiftKey),
   }));
 }
 const POOL_STATUS_LABEL = { submitted: "持ち込み", reviewing: "レビュー", approved: "承認", rejected: "差し戻し" };
@@ -1267,7 +1274,7 @@ function updateRelayLinks() {
       );
     }
     const src = srcMsg && document.querySelector('.msg[data-mid="' + srcMsg.id + '"]');
-    if (!src) continue;
+    if (!src || src.closest(".is-folded") || tgt.closest(".is-folded")) continue;
     // 各メッセージの中心Yを、所属スレッドの表示範囲内にクランプ
     // （画面外へスクロールした分は端に張り付き、線の傾きがズレ量を示す）
     const anchor = (el2) => {
@@ -1296,9 +1303,6 @@ function updateRelayLinks() {
   svg.innerHTML = parts.join("");
 }
 
-for (const boxId of ["messages-claude", "messages-codex"]) {
-  document.getElementById(boxId).addEventListener("scroll", scheduleLinks, { passive: true });
-}
 window.addEventListener("resize", scheduleLinks);
 
 // ---- 応答メタ（コスト・トークン・所要時間）表示 ----
@@ -1315,6 +1319,8 @@ function metaText(meta) {
   parts.push("in " + fmtTok(u.inTok) + (u.cacheTok ? "（+cache " + fmtTok(u.cacheTok) + "）" : "") + " / out " + fmtTok(u.outTok));
   const usd = meta.billing && meta.billing.mode === "metered" ? meta.billing.usd : meta.costUsd;
   if (usd != null) parts.push("$" + usd.toFixed(4));
+  else if (meta.billing?.mode === "unknown") parts.push("費用不明");
+  if (meta.billing && meta.model) parts.push(meta.model);
   if (meta.status && meta.status !== "completed") parts.push("⚠ " + meta.status);
   return parts.join("　");
 }
@@ -1483,6 +1489,361 @@ function el(tag, attrs = {}, children = []) {
   return node;
 }
 
+// ---- 参加者・表示定義（サーバの agentDefs が正。旧 state は2名に限定）----
+const LEGACY_DEFS = { claude: { name: "Claude Code", cssVar: "--claude" }, codex: { name: "Codex", cssVar: "--codex" } };
+const STOP_LABELS = { agreed: "合意成立", hops: "中継回数の上限", budget: "予算上限", error: "実行エラー", cancelled: "実行を中断", "auto-off": "自動応答OFF", unauthed: "未認証", manual: "手動停止" };
+const agentDefs = () => state.agentDefs || LEGACY_DEFS;
+const agentIds = () => Object.keys(agentDefs()).filter((id) => /^[a-z][a-z0-9_-]*$/.test(id));
+const participantsOf = (topic = currentTopic()) => topic?.participants || ["claude", "codex"];
+const topicForItem = (p) => (state.topics || []).find((t) => t.id === p.topicId);
+const itemParticipants = (p) => participantsOf(topicForItem(p) || null);
+const agentReady = (id) => id === "grok" ? state.agents?.[id]?.authed === true : !!agentDefs()[id] && state.agents?.[id]?.authed !== false;
+const authLabel = (id) => agentReady(id) ? "認証済み" : state.agents?.[id]?.authed === false ? "未認証（grok login）" : "確認中";
+const defaultParticipants = () => {
+  const ready = agentIds().filter((id) => state.agents?.[id]?.auto && agentReady(id));
+  return ready.length ? ready : ["claude", "codex"];
+};
+const agentColor = (id) => /^--[a-z][a-z0-9-]*$/.test(agentDefs()[id]?.cssVar || "") ? "var(" + agentDefs()[id].cssVar + ")" : "var(--dim)";
+let columnTopic = null;
+const columnDrafts = new Map();
+const foldedColumns = new Map();
+let qaChoice = { topicId: null, order: [] };
+let poolDialogTopicId = null;
+let poolDialogDir = "";
+let agentAction = null;
+const authChecking = new Set();
+let authAutoSaving = false;
+const dismissedQaStops = new Map();
+const qaStopKey = (r) => JSON.stringify([r.id, r.startMessageId, r.stopReason]);
+const qaStopStorageKey = (topicId) => "u2a2a-qa-stop:" + topicId;
+function qaStopDismissed(topic) {
+  if (!topic) return false;
+  let saved = dismissedQaStops.get(topic.id);
+  try { if (saved === undefined) saved = localStorage.getItem(qaStopStorageKey(topic.id)); } catch {}
+  return saved === qaStopKey(topic.relay || {});
+}
+function rememberQaStop(topic, dismissed) {
+  if (!topic) return;
+  const key = qaStopKey(topic.relay || {});
+  if (dismissed) dismissedQaStops.set(topic.id, key);
+  else dismissedQaStops.delete(topic.id);
+  // 保存禁止・容量超過でも、現在のページでは閉じられる。
+  try {
+    if (dismissed) localStorage.setItem(qaStopStorageKey(topic.id), key);
+    else localStorage.removeItem(qaStopStorageKey(topic.id));
+  } catch {}
+}
+
+function syncAgentDefinitions() {
+  for (const id of agentIds()) NAMES[id] = agentDefs()[id].name || id;
+}
+
+function participantChecks(box, ids, selected, changed, busy = false) {
+  // 選択・認証の更新ではDOMを交換せず、操作中のフォーカスを保つ。
+  const key = JSON.stringify(ids);
+  if (box.dataset.optionsKey !== key) {
+    box.dataset.optionsKey = key;
+    box.replaceChildren(...ids.map((id) => el("label", { class: "agent-choice" }, [
+      el("input", { type: "checkbox", value: id }), el("span"),
+    ])));
+  }
+  for (const label of box.children) {
+    const input = label.querySelector("input"), id = input.value;
+    input.checked = selected.includes(id);
+    // 未認証を新たに選ぶことは不可。継承済みの選択は明示的に外せる。
+    input.disabled = busy || (!agentReady(id) && !input.checked);
+    input.setAttribute("aria-label", NAMES[id] || id);
+    input.onchange = () => changed(id, input.checked);
+    label.querySelector("span").textContent = (NAMES[id] || id) + (!agentReady(id) ? " — " + authLabel(id) : "");
+  }
+}
+
+function syncParticipantChoice() {
+  const choice = projectChoice;
+  const field = $("#topic-participants");
+  field.hidden = !choice || choice.mode === "bind";
+  if (field.hidden) return;
+  participantChecks($("#topic-participant-options"), agentIds(), choice.participants, (id, checked) => {
+    choice.participants = checked ? [...choice.participants, id] : choice.participants.filter((a) => a !== id);
+    syncProjectChoice();
+  }, choice.busy);
+  if (choice.participants.length === 1 && choice.participants.every(agentReady)) {
+    $("#project-choice-note").textContent += " 参加者は1名です。質疑リレー・他の参加者への転送は利用できません。";
+  }
+  if (!choice.participants.length || choice.participants.some((id) => !agentReady(id))) {
+    $("#project-choice-save").disabled = true;
+    $("#project-choice-note").textContent += " 未認証・確認中の参加者はチェックを外せます。認証済みの参加者を1名以上選択してください。";
+  }
+}
+
+function createThreadColumn(agent) {
+  const head = el("div", { class: "thread-head" }, [
+    el("span", { class: "role-dot" }), el("span", { class: "agent-title", text: NAMES[agent] + " 側スレッド" }),
+    el("input", { class: "model-chip", id: "model-" + agent, list: "models-" + agent, "aria-label": NAMES[agent] + " のモデル", title: "使用モデル（空欄=CLI既定）" }),
+    el("datalist", { id: "models-" + agent }), el("span", { class: "count", id: "count-" + agent }),
+    el("span", { class: "agent-status", id: "status-" + agent }),
+    el("button", { class: "small", id: "reset-" + agent, text: "⟳", title: "CLIセッションをリセット" }),
+    el("label", { class: "auto-ctl" }, [el("input", { type: "checkbox", id: "auto-" + agent }), document.createTextNode("自動応答")]),
+    el("button", { class: "small fold-column", text: "折りたたむ", onclick: () => toggleColumn(agent) }),
+  ]);
+  const rail = el("button", { class: "thread-rail", hidden: "", onclick: () => toggleColumn(agent) }, [
+    el("span", { class: "role-dot" }), el("span", { class: "rail-name", text: NAMES[agent] }), el("span", { class: "rail-unread" }),
+  ]);
+  const messages = el("div", { class: "messages", id: "messages-" + agent });
+  messages.addEventListener("scroll", scheduleLinks, { passive: true });
+  const input = el("textarea", { id: "input-" + agent, placeholder: NAMES[agent] + " の発言を手動追加 — Cmd+Enter／Esc" });
+  input.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") sendAgent(agent);
+    if (e.key === "Escape") hideAgentInput(agent);
+  });
+  const col = el("section", { class: "thread-col", "data-agent": agent, "aria-label": NAMES[agent] }, [
+    head, rail, messages,
+    el("div", { class: "agent-input", hidden: "" }, [input, el("button", { text: NAMES[agent] + " として追加", onclick: () => sendAgent(agent) })]),
+    el("div", { class: "task-zone" }, [el("h2", { id: "tasks-head-" + agent }), el("div", { id: "tasks-" + agent })]),
+  ]);
+  col.style.setProperty("--agent-color", agentColor(agent));
+  return col;
+}
+
+function ensureAgentColumns() {
+  const main = $("main"), topic = currentTopic();
+  const ids = participantsOf(topic).filter((id) => agentIds().includes(id));
+  const changedTopic = columnTopic !== (topic?.id || null);
+  if (changedTopic) {
+    for (const col of main.querySelectorAll(".thread-col")) {
+      columnDrafts.set(columnTopic + ":" + col.dataset.agent, { text: col.querySelector("textarea").value, open: !col.querySelector(".agent-input").hidden });
+    }
+    columnTopic = topic?.id || null;
+  }
+  for (const col of main.querySelectorAll(".thread-col")) if (!ids.includes(col.dataset.agent)) col.remove();
+  for (const id of ids) {
+    let col = main.querySelector('[data-agent="' + id + '"]');
+    const created = !col;
+    if (created) { col = createThreadColumn(id); main.appendChild(col); wireAgent(id); }
+    col.querySelector(".agent-title").textContent = NAMES[id] + " 側スレッド";
+    col.querySelector(".rail-name").textContent = NAMES[id];
+    col.style.setProperty("--agent-color", agentColor(id));
+    if (changedTopic || created) {
+      const draft = columnDrafts.get(columnTopic + ":" + id);
+      col.querySelector("textarea").value = draft?.text || "";
+      col.querySelector(".agent-input").hidden = !draft?.open;
+    }
+  }
+  // 同じ列構成のSSE更新ではDOMを移動しない（フォーカス・選択を保持）。
+  const order = [...main.querySelectorAll(".thread-col")].map((col) => col.dataset.agent);
+  if (order.join() !== ids.join()) for (const id of ids) main.appendChild(main.querySelector('[data-agent="' + id + '"]'));
+  applyColumnLayout();
+}
+
+function toggleColumn(agent) {
+  const key = currentTopic()?.id || "";
+  const folded = foldedColumns.get(key) || new Set();
+  if (folded.has(agent)) folded.delete(agent);
+  else {
+    if (participantsOf().filter((id) => !folded.has(id)).length <= 1) return toast("少なくとも1列は開いておきます");
+    folded.add(agent);
+  }
+  foldedColumns.set(key, folded);
+  applyColumnLayout();
+  const col = document.querySelector('.thread-col[data-agent="' + agent + '"]');
+  col?.querySelector(folded.has(agent) ? ".thread-rail" : ".fold-column")?.focus();
+  scheduleLinks();
+}
+
+function applyColumnLayout() {
+  const topic = currentTopic(), folded = foldedColumns.get(topic?.id || "") || new Set();
+  const tracks = [];
+  for (const col of document.querySelectorAll(".thread-col")) {
+    const id = col.dataset.agent, closed = folded.has(id);
+    col.classList.toggle("is-folded", closed);
+    const rail = col.querySelector(".thread-rail");
+    rail.hidden = !closed;
+    const unseen = state.messages.filter((m) => m.topicId === topic?.id && m.thread === id && m.author !== id && m.ts > (topic?.agents?.[id]?.lastSeenTs || 0)).length;
+    rail.querySelector(".rail-unread").textContent = "未読 " + unseen;
+    rail.setAttribute("aria-label", NAMES[id] + " を展開・未読 " + unseen);
+    col.querySelector(".fold-column").setAttribute("aria-expanded", String(!closed));
+    tracks.push(closed ? "44px" : "minmax(0, 1fr)");
+  }
+  $("main").style.setProperty("--thread-tracks", tracks.join(" ") || "1fr");
+  document.body.classList.toggle("three-agents", participantsOf().length >= 3);
+}
+
+function syncSendTargets() {
+  const select = $("#user-target"), previous = select.value, ids = participantsOf();
+  const key = JSON.stringify(ids.map((id) => [id, NAMES[id], agentReady(id), authLabel(id)]));
+  if (select.dataset.optionsKey !== key) {
+    select.dataset.optionsKey = key;
+    select.replaceChildren();
+    for (const id of ids) select.appendChild(el("option", { value: id, text: "→ " + NAMES[id] + (!agentReady(id) ? "（" + authLabel(id) + "）" : ""), ...(!agentReady(id) ? { disabled: "" } : {}) }));
+    if (ids.length > 1) select.appendChild(el("option", { value: "all", text: ids.length === 2 ? "→ 両方" : "→ 全員", ...(ids.some((id) => !agentReady(id)) ? { disabled: "" } : {}) }));
+    if (ids.length > 1) for (const id of ids) select.appendChild(el("option", { value: "qa-" + id, text: "🗨 質疑（" + NAMES[id] + "先手）", ...(!agentReady(id) ? { disabled: "" } : {}) }));
+    if ([...select.options].some((o) => o.value === previous)) select.value = previous;
+  }
+  syncQaChoice();
+}
+
+function syncQaChoice() {
+  const first = $("#user-target").value.startsWith("qa-") ? $("#user-target").value.slice(3) : null;
+  const ids = participantsOf(), topicId = currentTopic()?.id;
+  $("#qa-hops").hidden = !first; $("#qa-agenda").hidden = !first; $("#qa-participants").hidden = !first;
+  if (!first) return;
+  if (qaChoice.topicId !== topicId || qaChoice.first !== first) qaChoice = { topicId, first, order: [first, ...ids.filter((id) => id !== first)] };
+  const box = $("#qa-participants");
+  const key = JSON.stringify([topicId, first, qaChoice.order, ids.map((id) => [id, NAMES[id], agentReady(id), authLabel(id)])]);
+  if (box.dataset.optionsKey === key) return;
+  box.dataset.optionsKey = key;
+  box.replaceChildren(el("span", { text: "参加順:" }));
+  for (const id of ids) {
+    const select = el("select", { "aria-label": NAMES[id] + " の質疑順" }, [el("option", { value: "", text: "不参加" })]);
+    for (let n = 1; n <= ids.length; n++) select.appendChild(el("option", { value: n, text: String(n) }));
+    select.value = qaChoice.order.includes(id) ? String(qaChoice.order.indexOf(id) + 1) : "";
+    select.disabled = id === first || !agentReady(id);
+    select.addEventListener("change", () => {
+      qaChoice.order = qaChoice.order.filter((a) => a !== id);
+      if (select.value) qaChoice.order.splice(Math.max(1, Number(select.value) - 1), 0, id);
+      syncQaChoice();
+    });
+    // 未認証の既定参加者も、順序とは別に明示的に除外できる。
+    const remove = el("button", { type: "button", class: "small", text: "外す", onclick: () => { qaChoice.order = qaChoice.order.filter((a) => a !== id); syncQaChoice(); } });
+    remove.disabled = id === first || !qaChoice.order.includes(id);
+    box.appendChild(el("label", { class: "agent-choice" }, [el("span", { text: NAMES[id] }), select, remove]));
+  }
+}
+
+async function checkAgentAuth() {
+  if (authChecking.has("grok")) return;
+  authChecking.add("grok"); renderAuthControls();
+  try {
+    const result = await api("/api/agents/grok/check-auth", "POST", {});
+    state.agents.grok = { ...state.agents.grok, authed: result.authed, authCheckedTs: result.checkedTs };
+    toast(result.message || authLabel("grok"));
+  } catch (e) { toast(e.message); }
+  finally { authChecking.delete("grok"); render(); }
+}
+
+function renderAuthControls() {
+  const box = $("#agent-access");
+  const hasGrok = agentIds().includes("grok");
+  const inColumn = participantsOf().includes("grok");
+  const key = JSON.stringify([hasGrok, inColumn, NAMES.grok, state.agents?.grok?.authed,
+    state.agents?.grok?.auto, authChecking.has("grok"), authAutoSaving]);
+  if (box.dataset.optionsKey === key) return;
+  box.dataset.optionsKey = key;
+  box.replaceChildren();
+  // 参加列がない場合だけここにトグルを置き、列ヘッダとの重複を避ける。
+  if (!hasGrok) return;
+  const auto = el("input", { type: "checkbox", "aria-label": NAMES.grok + " 自動応答" });
+  auto.checked = !!state.agents?.grok?.auto;
+  auto.disabled = authAutoSaving;
+  auto.addEventListener("change", async () => {
+    authAutoSaving = true;
+    auto.disabled = true;
+    try {
+      const value = auto.checked;
+      await api("/api/agents/grok", "PATCH", { auto: value });
+      state.agents.grok.auto = value;
+    }
+    catch (e) { toast(e.message); }
+    finally { authAutoSaving = false; delete box.dataset.optionsKey; renderAuthControls(); }
+  });
+  const check = el("button", { type: "button", class: "small", text: authChecking.size ? "確認中…" : "再確認", onclick: checkAgentAuth });
+  check.disabled = authChecking.size > 0;
+  box.append(el("span", { class: "auth-badge", text: NAMES.grok + ": " + authLabel("grok") }), check);
+  if (!inColumn) box.append(el("label", { class: "auto-ctl" }, [auto, document.createTextNode("自動応答")]));
+}
+
+function chooseDestination(kind, fromAgent, m, event) {
+  event?.stopPropagation();
+  const topic = (state.topics || []).find((t) => t.id === m.topicId);
+  const peers = topic ? participantsOf(topic).filter((id) => id !== fromAgent) : [];
+  const send = async (toAgent) => {
+    if (!agentReady(toAgent)) return toast(NAMES[toAgent] + " は" + authLabel(toAgent));
+    try {
+      await api(kind === "handoff" ? "/api/handoff" : "/api/relay", "POST", { messageId: m.id, toAgent });
+      toast(NAMES[toAgent] + (kind === "handoff" ? " へ引き継ぎました" : " へ転送しました"));
+    } catch (e) { toast(e.message); }
+  };
+  if (peers.length === 1) return send(peers[0]);
+  if (!peers.length) return toast("宛先となる参加者がいません");
+  const r = event?.currentTarget?.getBoundingClientRect();
+  const x = r ? r.left : parseFloat(ctxMenuEl.style.left) || 0;
+  const y = r ? r.bottom : parseFloat(ctxMenuEl.style.top) || 0;
+  const items = peers.map((id) => [NAMES[id] + (!agentReady(id) ? "（" + authLabel(id) + "）" : ""), () => send(id)]);
+  // コンテキストメニュー内の操作から開く場合、元のclickで閉じられないようにする。
+  if (event) openCtxMenu(x, y, items);
+  else setTimeout(() => openCtxMenu(x, y, items), 0);
+}
+
+function syncPoolReviewers(reset = false) {
+  const topic = (state.topics || []).find((t) => t.id === poolDialogTopicId);
+  const ids = participantsOf(topic || null);
+  const origin = $("#pool-origin").value;
+  const box = $("#pool-reviewers");
+  const selected = reset ? ids.filter((id) => id !== origin) : [...box.querySelectorAll("input:checked")].map((input) => input.value);
+  const key = JSON.stringify([ids.map((id) => [id, agentReady(id)]), selected, origin, $("#pool-autoreview").checked]);
+  if (box.dataset.optionsKey === key) return;
+  box.dataset.optionsKey = key;
+  box.replaceChildren();
+  for (const id of ids.filter((id) => id !== origin)) {
+    const check = el("input", { type: "checkbox", value: id });
+    check.checked = selected.includes(id);
+    check.disabled = !$("#pool-autoreview").checked;
+    box.appendChild(el("label", { class: "agent-choice" }, [check, el("span", { text: NAMES[id] + (!agentReady(id) ? "（未実施: " + authLabel(id) + "）" : "") })]));
+  }
+}
+
+function openAgentAction(p, kind) {
+  agentAction = { itemId: p.id, kind, busy: false };
+  $("#agent-action-title").textContent = kind === "fix" ? "修正を依頼" : "レビューを依頼";
+  const select = $("#agent-action-target");
+  select.replaceChildren();
+  for (const id of itemParticipants(p)) select.appendChild(el("option", { value: id, text: NAMES[id] + (!agentReady(id) ? "（" + authLabel(id) + "）" : ""), ...(!agentReady(id) ? { disabled: "" } : {}) }));
+  $("#agent-action-offline").checked = false;
+  $("#agent-action-error").textContent = "";
+  $("#agent-action-dialog").showModal();
+  syncAgentAction();
+}
+
+function syncAgentAction() {
+  if (!agentAction || !$("#agent-action-dialog").open) return;
+  const p = state.pool.find((item) => item.id === agentAction.itemId), target = $("#agent-action-target").value;
+  for (const option of $("#agent-action-target").options) {
+    option.disabled = !agentReady(option.value);
+    option.textContent = NAMES[option.value] + (!agentReady(option.value) ? "（" + authLabel(option.value) + "）" : "");
+  }
+  const blocked = !p ? "成果物が見つかりません" : !itemParticipants(p).includes(target) ? "参加者を選択してください"
+    : !agentReady(target) ? NAMES[target] + " は" + authLabel(target)
+    : state.fixPending?.[p.id] ? "修正が完了するまでお待ちください"
+    : agentAction.kind === "fix" && state.reviewPending?.[p.id]?.length ? "レビューが完了するまでお待ちください"
+    : agentAction.kind === "review" && state.reviewPending?.[p.id]?.includes(target) ? "レビュー実行中です" : "";
+  $("#agent-action-state").textContent = blocked;
+  $("#agent-action-submit").disabled = agentAction.busy || !!blocked;
+  $("#agent-action-target").disabled = agentAction.busy;
+  $("#agent-action-offline").disabled = agentAction.busy;
+  $("#agent-action-cancel").disabled = agentAction.busy;
+}
+
+$("#agent-action-target").addEventListener("change", syncAgentAction);
+$("#agent-action-cancel").addEventListener("click", () => $("#agent-action-dialog").close());
+$("#agent-action-dialog").addEventListener("cancel", (event) => { if (agentAction?.busy) event.preventDefault(); });
+$("#agent-action-dialog").addEventListener("close", () => { agentAction = null; });
+$("#agent-action-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  syncAgentAction();
+  if (!agentAction || $("#agent-action-submit").disabled) return;
+  const action = agentAction, target = $("#agent-action-target").value;
+  const body = { [action.kind === "fix" ? "agent" : "reviewer"]: target, offline: $("#agent-action-offline").checked };
+  action.busy = true; syncAgentAction();
+  try {
+    await api("/api/pool/" + encodeURIComponent(action.itemId) + "/" + action.kind, "POST", body);
+    $("#agent-action-dialog").close(); toast("依頼を受け付けました");
+  } catch (e) { $("#agent-action-error").textContent = e.message; }
+  finally { action.busy = false; syncAgentAction(); }
+});
+$("#pool-origin").addEventListener("change", () => syncPoolReviewers(true));
+$("#pool-autoreview").addEventListener("change", () => syncPoolReviewers());
+
+
 // ---- ローカルプロジェクト（実体は移動せず、参照先だけを登録）----
 const projectProbes = new Map();
 const projectProbeQueue = [];
@@ -1636,7 +1997,7 @@ function renderProjectUI() {
     if ($("#projects-dialog").open) renderProjectList();
   }
   const topic = currentTopic();
-  const errors = ["claude", "codex"].map((agent) => topic?.agents?.[agent]?.lastError ?? state.agents?.[agent]?.lastError ?? "");
+  const errors = participantsOf(topic).map((agent) => topic?.agents?.[agent]?.lastError ?? state.agents?.[agent]?.lastError ?? "");
   const blockedMessage = (state.messages || []).findLast((m) => m.topicId === topic?.id && m.blocked);
   const errorKey = JSON.stringify([topic?.id, topic?.projectId, errors, blockedMessage?.id]);
   if (projectExecutionErrorKey !== errorKey) {
@@ -1729,16 +2090,20 @@ async function mutateProject(project, method, body) {
   }
 }
 
-async function openProjectChoice(mode, topic, messageId = null) {
+async function openProjectChoice(mode, topic, messageId = null, forceSelection = false) {
   if (mode === "new" && topic === undefined) topic = currentTopic();
   if (mode === "bind" && topic?.projectLocked) return toast("実行後は変更できません。🌿 分岐で別プロジェクトのトピックを作れます");
   if (mode !== "new" && !topic) return toast("対象トピックが見つかりません");
-  // 登録ゼロ・未紐付けなら従来の1クリック作成を維持する。
-  // 未登録IDが残るトピックは、勝手に既定へ戻さず選択を求める。
-  if (mode !== "bind" && !(state.projects || []).length && !topic?.projectId) {
+  const participants = mode === "branch" ? [...participantsOf(topic)] : defaultParticipants();
+  // 既定が従来の2名で、追加の認証済み候補がなければ1クリック作成を維持。
+  // Grokが選べる場合、またはShift＋新規クリックでは参加者選択を開く。
+  const legacyPair = participants.length === 2 && participants.includes("claude") && participants.includes("codex");
+  if (mode !== "bind" && !forceSelection && !(state.projects || []).length && !topic?.projectId
+      && legacyPair && participants.every(agentReady)
+      && agentIds().filter(agentReady).every((id) => participants.includes(id))) {
     try {
       const path = mode === "new" ? "/api/topics" : "/api/topics/" + encodeURIComponent(topic.id) + "/branch";
-      const created = await projectRequest(path, "POST", mode === "new" ? {} : { messageId });
+      const created = await projectRequest(path, "POST", { ...(mode === "branch" ? { messageId } : {}), participants });
       if (!created.id) throw new Error("トピックの応答形式が不正です。再操作前に一覧を確認してください。");
       state.topics = [...(state.topics || []).filter((t) => t.id !== created.id), created];
       switchTopic(created.id);
@@ -1748,10 +2113,11 @@ async function openProjectChoice(mode, topic, messageId = null) {
     } catch (e) { toast(projectErrorText(e)); }
     return;
   }
-  projectChoice = { mode, topicId: topic?.id, messageId, selected: topic?.projectId || "", busy: false };
+  projectChoice = { mode, topicId: topic?.id, messageId, selected: topic?.projectId || "", busy: false, participants };
   $("#project-choice-title").textContent = mode === "new" ? "新規スレッド" : mode === "branch" ? "この地点から分岐" : "対象プロジェクトを選択";
   $("#project-topic-title-field").hidden = mode !== "new";
   $("#project-topic-title").value = "";
+  delete $("#topic-participant-options").dataset.optionsKey;
   $("#project-choice-error").textContent = "";
   $("#project-choice-save").textContent = mode === "new" ? "作成" : mode === "branch" ? "分岐を作成" : "対象を保存";
   $("#project-choice-dialog").showModal();
@@ -1787,6 +2153,7 @@ function syncProjectChoice() {
   preview.replaceChildren();
   if (findProject(choice.selected)) preview.appendChild(el("div", { class: "project-path", text: findProject(choice.selected).path }));
   preview.appendChild(projectProbeEl(choice.selected));
+  syncParticipantChoice();
 }
 
 async function submitProjectChoice(event) {
@@ -1801,6 +2168,7 @@ async function submitProjectChoice(event) {
     const path = choice.mode === "new" ? "/api/topics" : "/api/topics/" + encodeURIComponent(choice.topicId) + (choice.mode === "branch" ? "/branch" : "");
     const body = choice.mode === "new" ? { title: $("#project-topic-title").value.trim() || undefined, projectId }
       : choice.mode === "branch" ? { messageId: choice.messageId, projectId } : { projectId };
+    if (choice.mode !== "bind") body.participants = [...choice.participants];
     const topic = await projectRequest(path, choice.mode === "bind" ? "PATCH" : "POST", body);
     if (!topic.id) throw new Error("トピックの応答形式が不正です。再操作前に一覧を確認してください。");
     const old = (state.topics || []).find((t) => t.id === topic.id);
@@ -1854,9 +2222,15 @@ $("#project-choice-dialog").addEventListener("close", () => { projectChoice = nu
 // ---- render ----
 function render() {
   ensureTopic();
+  syncAgentDefinitions();
+  ensureAgentColumns();
+  syncSendTargets();
+  renderAuthControls();
+  syncAgentAction();
+  if ($("#pool-dialog").open) syncPoolReviewers();
   renderTopicBar();
   renderProjectUI();
-  for (const agent of ["claude", "codex"]) {
+  for (const agent of participantsOf().filter((id) => agentIds().includes(id))) {
     renderThread(agent);
     renderTasks(agent);
     renderAgentStatus(agent);
@@ -2364,9 +2738,11 @@ function updatePoolGlow(detailBox, sel) {
     if (poolSeenInit && sel && p.id === sel.id) {
       if (r > seen.r) {
         const last = p.reviews[r - 1];
-        flash = last.error || last.verdict === "差し戻し" ? "err" : last.verdict === "条件付き承認" ? "wait" : "ok";
+        // stopped（権限要求または中断で停止）は成功色にしない
+        flash = last.skipped || last.stopped ? "wait" : last.error || last.verdict === "差し戻し" ? "err" : last.verdict === "条件付き承認" ? "wait" : "ok";
       } else if (f > seen.f) {
-        flash = p.fixes[f - 1].error ? "err" : "ok";
+        const lastFix = p.fixes[f - 1];
+        flash = lastFix.error ? "err" : lastFix.stopped ? "wait" : "ok";
       }
     }
     poolRunSeen[p.id] = { r, f };
@@ -2406,10 +2782,11 @@ function renderTopicDetail(box, t) {
     el("span", { class: "pf-size", text: msgs.length + " メッセージ" }),
     el("span", {
       class: "pf-size",
-      text: "累計 in " + fmtTok(tot.inTok) + " / out " + fmtTok(tot.outTok) + (tot.cost ? " / $" + tot.cost.toFixed(2) + "（Claude分）" : ""),
+      text: "累計 in " + fmtTok(tot.inTok) + " / out " + fmtTok(tot.outTok) + (tot.cost ? " / $" + tot.cost.toFixed(2) + "（実測分）" : ""),
     }),
   ]));
   box.appendChild(projectDetailsEl(t.projectId));
+  for (const id of participantsOf(t)) box.appendChild(el("div", { class: "p-file", text: NAMES[id] + ": " + (t.agents?.[id]?.sessionId || "セッション未開始") }));
   if (t.mirrorFile) {
     const url = "/api/pool/file/" + encodeURIComponent(t.mirrorFile);
     box.appendChild(el("div", { class: "p-file" }, [
@@ -2498,7 +2875,12 @@ function renderPoolDetail(box, p) {
     kids.push(poolPreviewEl(p));
     const history = poolHistoryState(p);
     kids.push(poolHistoryEl(p, history));
+    if (Array.isArray(p.reviewers)) kids.push(el("div", { class: "project-hint", text: "保存された依頼先: " + (p.reviewers.map((id) => NAMES[id] || id).join("・") || "なし") }));
     for (const r of p.reviews || []) {
+      if (r.skipped) {
+        kids.push(el("div", { class: "review history-warning", text: (NAMES[r.reviewer] || r.reviewer) + " — 未実施: " + (r.reason || "理由未記録") + " ／ " + fmtTime(r.ts) }));
+        continue;
+      }
       const rOpen = openReviews.has(r.id);
       const rHead = el("div", {
         class: "r-head",
@@ -2569,29 +2951,16 @@ function renderPoolDetail(box, p) {
     }
 
     const actions = el("div", { class: "actions" });
-    for (const agent of ["claude", "codex"]) {
-      if (!pending.includes(agent)) {
-        actions.appendChild(el("button", {
-          class: "small",
-          text: NAMES[agent] + " にレビュー依頼",
-          ...(fixer ? { disabled: "", title: "修正が完了してからレビューできます" } : {}),
-          onclick: () => poolAction("/api/pool/" + p.id + "/review", "POST", { reviewer: agent }),
-        }));
-      }
-    }
-    if (p.file) {
-      // レビューボタンと同じく、実行中は非表示でなく無効化で理由を示す
-      const fixBlock = fixer ? "修正が完了してから修正できます"
-        : pending.length ? "レビューが完了してから修正できます" : null;
-      for (const agent of ["claude", "codex"]) {
-        actions.appendChild(el("button", {
-          class: "small",
-          text: NAMES[agent] + " に修正依頼",
-          ...(fixBlock ? { disabled: "", title: fixBlock } : {}),
-          onclick: () => poolAction("/api/pool/" + p.id + "/fix", "POST", { agent }, NAMES[agent] + " が修正を開始しました（完了後、自動で再レビュー）"),
-        }));
-      }
-    }
+    actions.appendChild(el("button", {
+      class: "small", text: "レビューを依頼…",
+      ...(fixer ? { disabled: "", title: "修正が完了してからレビューできます" } : {}),
+      onclick: () => openAgentAction(p, "review"),
+    }));
+    if (p.file) actions.appendChild(el("button", {
+      class: "small", text: "修正を依頼…",
+      ...(fixer || pending.length ? { disabled: "", title: "レビュー・修正が完了してから依頼できます" } : {}),
+      onclick: () => openAgentAction(p, "fix"),
+    }));
     if (p.status !== "approved")
       actions.appendChild(el("button", { class: "small", text: "承認", onclick: () => api("/api/pool/" + p.id, "PATCH", { status: "approved" }) }));
     if (p.status !== "rejected")
@@ -2642,6 +3011,11 @@ function fillHealthDialog() {
     "state.json: " + fmtSize(sm.lastBytes || 0) + "　保存 " + (sm.saves || 0) + " 回　直近 " + (sm.lastMs || 0) + "ms　累計 " + (sm.totalMs || 0) + "ms";
   const box = $("#health-events");
   box.replaceChildren();
+  const unknown = [
+    ...state.messages.filter((m) => !provOf(m).source).map((m) => m.meta),
+    ...state.pool.flatMap((p) => [...(p.reviews || []), ...(p.fixes || [])].map((r) => r.meta)),
+  ].filter((meta) => meta?.billing?.mode === "unknown").length;
+  if (unknown) box.appendChild(el("div", { class: "history-warning", text: "費用不明の実行: " + unknown + " 件（保存済み履歴。実測合計に含みません）" }));
   const evs = [...(state.events || [])].reverse();
   if (!evs.length) box.appendChild(el("div", { class: "empty", text: "イベントなし — 静かなのは良い知らせです" }));
   for (const e of evs) {
@@ -2654,15 +3028,20 @@ function fillHealthDialog() {
 }
 
 function renderQaBar() {
-  const r = (currentTopic() || {}).relay || {};
-  const bar = $("#qa-bar");
-  bar.hidden = !r.active;
-  if (r.active) {
-    $("#qa-status").textContent = "🗨 質疑中 — 残り " + r.remaining + " 手";
-    const inp = $("#qa-agenda-edit");
-    inp.placeholder = "今回決めること（先手が起案中…）";
-    if (document.activeElement !== inp) inp.value = r.agenda || "";
-  }
+  const topic = currentTopic(), r = topic?.relay || {};
+  if (r.active) rememberQaStop(topic, false);
+  const dismissed = qaStopDismissed(topic);
+  $("#qa-bar").hidden = !r.active && (!r.stopReason || dismissed);
+  $("#qa-dismiss").hidden = !!r.active || !r.stopReason;
+  $("#qa-status").dataset.reason = r.active ? "" : (r.stopReason || "");
+  $("#qa-status").textContent = r.active
+    ? "🗨 質疑中 — 残り中継 " + r.remaining + " 回 ／ 手番: " + (NAMES[r.participants?.[r.turn]] || "")
+    : "🗨 " + (STOP_LABELS[r.stopReason] || r.stopReason || "");
+  $("#qa-stop").hidden = !r.active;
+  const input = $("#qa-agenda-edit");
+  input.hidden = !r.active;
+  input.placeholder = "今回決めること（先手が起案中…）";
+  if (document.activeElement !== input) input.value = r.agenda || "";
 }
 
 function renderAgentStatus(agent) {
@@ -2699,7 +3078,12 @@ function renderAgentStatus(agent) {
   if (a.model && ![...dl.options].some((o) => o.value === a.model)) {
     dl.appendChild(el("option", { value: a.model }));
   }
-  if (isRunning(agent)) {
+  const error = ta.lastError || a.lastError;
+  if (!agentReady(agent)) {
+    status.dataset.s = a.authed === false ? "error" : "wait";
+    status.textContent = authLabel(agent);
+    status.title = "ヘッダの再確認で認証状態を更新できます";
+  } else if (isRunning(agent)) {
     status.dataset.s = "running";
     status.textContent = "応答中…";
     status.title = "";
@@ -2707,10 +3091,10 @@ function renderAgentStatus(agent) {
     status.dataset.s = "error";
     status.textContent = "上限停止中";
     status.title = state.budgetHalt.reason;
-  } else if (a.lastError) {
+  } else if (error) {
     status.dataset.s = "error";
-    status.textContent = "エラー（ホバーで詳細）";
-    status.title = a.lastError;
+    status.textContent = error.includes("権限") || error.includes("中断") ? error : "エラー（ホバーで詳細）";
+    status.title = error;
   } else {
     status.dataset.s = "";
     status.textContent = a.auto ? "CLI 自動応答" : "手動（貼り付け）";
@@ -2730,8 +3114,9 @@ function applyThreadGlow(agent, a, ta) {
   const unseen = msgs.some((m) => m.author !== agent && m.ts > (ta.lastSeenTs || 0));
   let glow = "";
   if (isRunning(agent)) glow = "run";
-  else if ((topic.relay || {}).active) glow = "relay"; // 質疑リレー中は流線と律動を揃えて明滅
-  else if (a.lastError) glow = "err";
+  else if (topic.relay?.active && (topic.relay.participants || participantsOf(topic)).includes(agent)) glow = "relay"; // 質疑リレー中は流線と律動を揃えて明滅
+  else if (!agentReady(agent)) glow = a.authed === false ? "err" : "wait";
+  else if (ta.lastError || a.lastError) glow = "err";
   else if ((state.budgetHalt && a.auto) || ta.interruptedSessionId || (last && last.cancelled)) glow = "wait";
   else if (unseen && !a.auto) glow = "wait";
   else if (last && last.author === agent && last.meta && last.meta.status === "completed") glow = "ok";
@@ -2772,6 +3157,7 @@ function renderThread(agent) {
     if (pv.delivery === "qa-relay") meta.appendChild(el("span", { text: "（質疑）" }));
     if (pv.ingress === "cli-sync") meta.appendChild(el("span", { text: "（外部セッションから同期）" }));
     if (m.cancelled) meta.appendChild(el("span", { text: "（キャンセル）" }));
+    if (m.author === "grok" && m.meta?.status === "stopped") meta.appendChild(el("span", { class: "stopped-note", text: "権限要求または中断で停止" }));
 
     const isRaw = rawView.has(m.id);
     const actions = el("div", { class: "actions" }, [
@@ -2786,8 +3172,9 @@ function renderThread(agent) {
       el("button", { class: "small", text: "タスク化", onclick: () => openTaskDialog(agent, m) }),
       el("button", {
         class: "small",
-        text: NAMES[OTHER[agent]] + " へ転送",
-        onclick: () => relay(agent, m),
+        text: participantsOf().length === 2 ? NAMES[participantsOf().find((id) => id !== agent)] + " へ転送" : "転送先…",
+        ...(participantsOf().length < 2 ? { disabled: "" } : {}),
+        onclick: (event) => chooseDestination("relay", agent, m, event),
       }),
       el("button", { class: "small", text: "コピー", onclick: () => copy(m.text) }),
       el("button", { class: "small", text: "プールへ", onclick: () => openPoolDialog(m.author, m.text, m.id) }),
@@ -2878,7 +3265,7 @@ function taskPrompt(t) {
 }
 
 // タスクキューの開閉。null = 自動（未完了タスクがあれば開く）
-const taskZoneOpen = { claude: null, codex: null };
+const taskZoneOpen = Object.create(null);
 
 function renderTasks(agent) {
   const box = $("#tasks-" + agent);
@@ -2942,12 +3329,6 @@ async function copy(text) {
   }
 }
 
-async function relay(fromAgent, m) {
-  // サーバー側で元メッセージを検証して複製する（relayedFrom/sourceId はサーバーのみが設定）
-  await api("/api/relay", "POST", { messageId: m.id });
-  toast(NAMES[OTHER[fromAgent]] + " スレッドへ転送しました");
-}
-
 async function patchTask(id, status) {
   await api("/api/tasks/" + id, "PATCH", { status });
 }
@@ -2956,33 +3337,48 @@ async function delTask(t) {
   await api("/api/tasks/" + t.id, "DELETE");
 }
 
-function sendUser() {
-  const text = $("#user-text").value.trim();
-  if (!text) return;
-  const target = $("#user-target").value;
-  const topicId = (currentTopic() || {}).id;
-  const req = target.startsWith("qa-")
-    ? api("/api/qa/start", "POST", {
-        first: target.slice(3),
-        text,
-        hops: Number($("#qa-hops").value) || 6,
-        agenda: $("#qa-agenda").value,
-        topicId,
-      })
-    : api("/api/messages", "POST", { thread: target, author: "user", text, topicId, test: $("#test-mark").checked });
-  req.then(() => {
-    $("#user-text").value = "";
-    $("#qa-agenda").value = "";
-    $("#test-mark").checked = false;
-  });
+async function sendUser() {
+  const input = $("#user-text"), original = input.value, text = original.trim();
+  if (!text || $("#user-send").disabled) return;
+  const target = $("#user-target").value, topicId = currentTopic()?.id;
+  const isQa = target.startsWith("qa-");
+  const recipients = isQa ? [...qaChoice.order] : target === "all" ? participantsOf() : [target];
+  if (!topicId || recipients.some((id) => !participantsOf().includes(id))) return toast("送信先を選択してください");
+  const unavailable = recipients.find((id) => !agentReady(id));
+  if (unavailable) return toast(NAMES[unavailable] + " は" + authLabel(unavailable));
+  if (isQa && (recipients.length < 2 || recipients[0] !== target.slice(3))) return toast("質疑は先手を含む2名以上を選択してください");
+  if (isQa && recipients.some((id) => !state.agents[id]?.auto)) return toast("質疑の参加者全員の自動応答をONにしてください");
+  // 旧2名への「両方」は旧サーバとも互換。その他の組み合わせは新APIの all。
+  const thread = target === "all" && recipients.length === 2 && recipients.includes("claude") && recipients.includes("codex") ? "both" : target;
+  const agenda = $("#qa-agenda").value;
+  $("#user-send").disabled = true;
+  try {
+    await (isQa ? api("/api/qa/start", "POST", {
+      first: recipients[0], participants: recipients, text, hops: Number($("#qa-hops").value) || 6, agenda, topicId,
+    }) : api("/api/messages", "POST", { thread, author: "user", text, topicId, test: $("#test-mark").checked }));
+    if (currentTopic()?.id === topicId && input.value === original) {
+      input.value = "";
+      if ($("#qa-agenda").value === agenda) $("#qa-agenda").value = "";
+      $("#test-mark").checked = false;
+    }
+  } catch (e) { toast(e.message); }
+  finally { $("#user-send").disabled = false; }
 }
 
-function sendAgent(agent) {
-  const input = $("#input-" + agent);
-  const text = input.value.trim();
+async function sendAgent(agent) {
+  const input = $("#input-" + agent), topicId = currentTopic()?.id;
+  if (!input || !topicId || input.disabled) return;
+  if (!agentReady(agent)) return toast(NAMES[agent] + " は" + authLabel(agent));
+  const original = input.value, text = original.trim();
   if (!text) return;
-  api("/api/messages", "POST", { thread: agent, author: agent, text, topicId: (currentTopic() || {}).id })
-    .then(() => { input.value = ""; hideAgentInput(agent); });
+  input.disabled = true;
+  try {
+    await api("/api/messages", "POST", { thread: agent, author: agent, text, topicId });
+    if (currentTopic()?.id === topicId && input.isConnected && input.value === original) {
+      input.value = ""; hideAgentInput(agent);
+    }
+  } catch (e) { toast(e.message); }
+  finally { input.disabled = false; }
 }
 
 // 手動貼り付け欄（既定は非表示。右クリック→手動で発言を追加で開き、送信・Esc で閉じる）
@@ -2999,6 +3395,8 @@ function hideAgentInput(agent) {
 let dialogSourceMessage = null;
 function openTaskDialog(agent, m) {
   dialogSourceMessage = m;
+  const topic = state.topics.find((t) => t.id === m.topicId);
+  $("#task-agent").replaceChildren(...(topic ? participantsOf(topic) : []).map((id) => el("option", { value: id, text: NAMES[id] })));
   $("#task-agent").value = agent;
   const firstLine = m.text.split("\n")[0];
   $("#task-title").value = firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
@@ -3014,7 +3412,7 @@ $("#task-create").addEventListener("click", async () => {
     title,
     detail: $("#task-detail").value.trim(),
     fromMessageId: dialogSourceMessage ? dialogSourceMessage.id : null,
-    topicId: (currentTopic() || {}).id,
+    topicId: dialogSourceMessage?.topicId,
   });
   $("#task-dialog").close();
   toast("タスクをキューに追加しました");
@@ -3023,12 +3421,20 @@ $("#task-create").addEventListener("click", async () => {
 let poolSourceMessageId = null;
 function openPoolDialog(origin, text, fromMessageId, title) {
   poolSourceMessageId = fromMessageId || null;
+  const source = state.messages.find((m) => m.id === fromMessageId);
+  poolDialogDir = poolCurrentDir;
+  const pathTopicId = /^topics\/([^/]+)(?:\/|$)/.exec(poolDialogDir)?.[1];
+  poolDialogTopicId = pathTopicId || source?.topicId || currentTopic()?.id || null;
+  const topic = state.topics.find((t) => t.id === poolDialogTopicId);
+  $("#pool-origin").replaceChildren(...["user", ...(topic ? participantsOf(topic) : ["claude", "codex"])].map((id) => el("option", { value: id, text: NAMES[id] })));
   $("#pool-origin").value = origin || "user";
   const firstLine = (title || (text || "").split("\n")[0] || "").trim();
   $("#pool-title").value = firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
-  $("#pool-body").value = text || "";
+  $("#pool-text").value = text || "";
   $("#pool-filename").value = "";
   $("#pool-autoreview").checked = true;
+  $("#pool-file").value = "";
+  syncPoolReviewers(true);
   $("#pool-dialog").showModal();
 }
 
@@ -3047,10 +3453,20 @@ document.addEventListener("click", (e) => {
 });
 $("#pool-add").addEventListener("click", () => openPoolDialog("user", "", null));
 $("#pool-cancel").addEventListener("click", () => $("#pool-dialog").close());
+$("#pool-dialog").addEventListener("cancel", (event) => { if ($("#pool-create").disabled) event.preventDefault(); });
 $("#pool-create").addEventListener("click", async () => {
   const title = $("#pool-title").value.trim();
-  const body = $("#pool-body").value.trim();
+  const body = $("#pool-text").value.trim();
   const file = $("#pool-file").files[0];
+  const button = $("#pool-create");
+  if (button.disabled) return;
+  const reviewers = [...$("#pool-reviewers").querySelectorAll("input:checked")].map((input) => input.value);
+  const origin = $("#pool-origin").value, filename = $("#pool-filename").value.trim();
+  const registration = { topicId: poolDialogTopicId, reviewers, autoReview: $("#pool-autoreview").checked };
+  const fields = [...$("#pool-dialog").querySelectorAll("input, textarea, select, button")];
+  const disabled = fields.map((node) => node.disabled);
+  fields.forEach((node) => { node.disabled = true; });
+  try {
   if (file) {
     // ファイル添付はアップロードとして登録
     const buf = await file.arrayBuffer();
@@ -3060,28 +3476,30 @@ $("#pool-create").addEventListener("click", async () => {
       bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
     }
     await api("/api/pool/upload", "POST", {
-      origin: $("#pool-origin").value,
+      origin,
       title: title || file.name,
       filename: file.name,
       dataBase64: btoa(bin),
-      dir: poolCurrentDir,
-      autoReview: $("#pool-autoreview").checked,
+      dir: poolDialogDir,
+      ...registration,
     });
   } else {
     if (!title || !body) return toast("タイトルと成果物を入力してください");
     await api("/api/pool", "POST", {
-      origin: $("#pool-origin").value,
+      origin,
       title,
       body,
-      dir: poolCurrentDir,
-      filename: $("#pool-filename").value.trim() || undefined,
+      dir: poolDialogDir,
+      filename: filename || undefined,
       fromMessageId: poolSourceMessageId,
-      autoReview: $("#pool-autoreview").checked,
+      ...registration,
     });
   }
   $("#pool-dialog").close();
   $("#pool-file").value = "";
   toast("プールへ登録しました");
+  } catch (e) { toast(e.message); }
+  finally { fields.forEach((node, i) => { node.disabled = disabled[i]; }); }
 });
 function togglePool(collapse) {
   const collapsed = collapse != null ? collapse : !document.body.classList.contains("pool-collapsed");
@@ -3256,10 +3674,7 @@ function ctxItems(t) {
       ["コピー", () => copy(m.text)],
       ["引用して入力欄へ", () => quoteToInput(m.text)],
       ["タスク化", () => openTaskDialog(m.thread, m)],
-      ["🤝 " + NAMES[OTHER[m.thread]] + " へ引き継ぎ", () =>
-        api("/api/handoff", "POST", { messageId: m.id })
-          .then(() => toast(NAMES[OTHER[m.thread]] + " へ引き継ぎました（相手が作業を引き取ります）")),
-      ],
+      ["🤝 引き継ぎ先を選択", () => chooseDestination("handoff", m.thread, m)],
       ["🌿 ここから分岐", () => openProjectChoice("branch", (state.topics || []).find((topic) => topic.id === m.topicId), m.id)],
       ["✍ " + NAMES[m.thread] + " の発言を手動追加", () => showAgentInput(m.thread)],
     ];
@@ -3276,8 +3691,7 @@ function ctxItems(t) {
     if (poolClipboard)
       items.push(["📋 ここへ貼り付け（" + (dir || "ルート") + "）", () => api("/api/pool/copy", "POST", { src: poolClipboard.path, destDir: dir }).then((r) => toast("複製: " + r.dest))]);
     items.push(["パスを入力欄へ挿入", () => insertToInput("u2a2a/pool/" + p.file)]);
-    items.push(["Claude にレビュー依頼", () => poolAction("/api/pool/" + p.id + "/review", "POST", { reviewer: "claude" })]);
-    items.push(["Codex にレビュー依頼", () => poolAction("/api/pool/" + p.id + "/review", "POST", { reviewer: "codex" })]);
+    items.push(["レビューを依頼…", () => openAgentAction(p, "review")]);
     return items;
   }
   if (t.type === "pooldir") {
@@ -3371,12 +3785,14 @@ document.addEventListener("scroll", closeCtxMenu, true);
 
 // ---- wiring ----
 $("#user-send").addEventListener("click", sendUser);
-$("#user-target").addEventListener("change", () => {
-  const isQa = $("#user-target").value.startsWith("qa-");
-  $("#qa-hops").hidden = !isQa;
-  $("#qa-agenda").hidden = !isQa;
-});
+$("#user-target").addEventListener("change", syncQaChoice);
 $("#qa-stop").addEventListener("click", () => api("/api/qa/stop", "POST", { topicId: (currentTopic() || {}).id }));
+$("#qa-dismiss").addEventListener("click", () => {
+  const topic = currentTopic();
+  if (!topic?.relay?.stopReason || topic.relay.active) return;
+  rememberQaStop(topic, true);
+  renderQaBar();
+});
 $("#qa-agenda-edit").addEventListener("change", (e) =>
   api("/api/qa/agenda", "POST", { topicId: (currentTopic() || {}).id, agenda: e.target.value })
     .then(() => toast("論点を更新しました（次の中継から反映）")));
@@ -3417,7 +3833,7 @@ $("#budget-save").addEventListener("click", async () => {
 $("#user-text").addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") sendUser();
 });
-for (const agent of ["claude", "codex"]) {
+function wireAgent(agent) {
   $("#auto-" + agent).addEventListener("change", (e) => {
     api("/api/agents/" + agent, "PATCH", { auto: e.target.checked });
   });
@@ -3452,15 +3868,6 @@ for (const agent of ["claude", "codex"]) {
     openCtxMenu(r.left, r.bottom + 4, items);
   });
 }
-for (const btn of document.querySelectorAll("[data-agent-send]")) {
-  const agent = btn.getAttribute("data-agent-send");
-  btn.addEventListener("click", () => sendAgent(agent));
-  $("#input-" + agent).addEventListener("keydown", (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") sendAgent(agent);
-    if (e.key === "Escape") hideAgentInput(agent);
-  });
-}
-
 // ---- live sync ----
 const es = new EventSource("/api/events");
 es.onmessage = (e) => {

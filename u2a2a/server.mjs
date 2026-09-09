@@ -34,6 +34,19 @@ import {
   summaryOriginNote,
   PROJECT_DIGEST_MAX,
   PROJECT_README_MAX_BYTES,
+  AGENT_DEFS,
+  LEGACY_AGENTS,
+  peersOf,
+  defaultReviewers,
+  nextTurn,
+  canEndRelay,
+  clipBacklog,
+  dedupeRelayCopies,
+  parseGrokStream,
+  grokStepFrom,
+  grokMetaFrom,
+  GROK_STOP_NOTE,
+  isGrokUnauthedError,
 } from "./lib.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -59,15 +72,23 @@ function ensureTopicDir(topicId) {
 }
 const PORT = Number(process.env.U2A2A_PORT || 4742);
 
-const AGENTS = ["claude", "codex"];
-const AUTHORS = ["user", "claude", "codex"];
+// 対応エージェント一覧は lib の AGENT_DEFS（正）から派生。参加者はトピックごと（topic.participants）
+const AGENTS = Object.keys(AGENT_DEFS);
+const AUTHORS = ["user", ...AGENTS];
 const TASK_STATUSES = ["queued", "working", "returned", "done"];
 const AGENT_TIMEOUT_MS = 15 * 60 * 1000; // 大きな成果物のレビューは5分では足りない
 const MAX_BACKLOG = 10;
 
 // エージェントのグローバル設定（トピック横断）
-function defaultAgent() {
-  return { auto: true, lastError: "", model: "", modelOverride: "" };
+function defaultAgent(agentId = "claude") {
+  // authed: grok のみ判定する（null = 確認中）。claude / codex は従来どおり true 扱い
+  return { auto: true, lastError: "", model: "", modelOverride: "", authed: agentId === "grok" ? null : true, authCheckedTs: 0 };
+}
+
+// 参加・宛先として選べるか（自動応答 ON かつ認証済み）
+function agentReady(agent) {
+  const a = state.agents[agent];
+  return !!a && a.auto && a.authed === true && !state.budgetHalt;
 }
 
 // トピック内のエージェント別セッション状態
@@ -76,16 +97,29 @@ function topicAgent() {
 }
 
 function defaultRelay() {
-  return { active: false, remaining: 0, hopsDone: 0 };
+  return { active: false, remaining: 0, hopsDone: 0, id: null, participants: [], turn: 0, seq: 0, spoken: {}, stopReason: null };
 }
 
-function defaultTopic(title) {
+// リレーを止めて理由を残す（合意成立 agreed と打ち切りを区別する）
+function stopRelay(topic, reason) {
+  const r = topic.relay;
+  if (!r.active) return;
+  r.active = false;
+  r.stopReason = reason;
+}
+
+// トピックの参加者のうち自分以外（OTHER の置き換え）
+const peers = (topic, agent) => peersOf(topic.participants, agent);
+
+function defaultTopic(title, participants = LEGACY_AGENTS) {
+  const list = [...new Set(participants.filter((a) => AGENTS.includes(a)))];
   return {
     id: crypto.randomBytes(8).toString("hex"),
     title,
     ts: Date.now(),
     relay: defaultRelay(),
-    agents: { claude: topicAgent(), codex: topicAgent() },
+    participants: list.length ? list : LEGACY_AGENTS.slice(), // 順序付き。作成時に固定
+    agents: Object.fromEntries((list.length ? list : LEGACY_AGENTS).map((a) => [a, topicAgent()])),
     projectId: null, // 対象プロジェクト（null = 未紐付け = Kometa リポジトリ）
     projectLocked: false, // 初回実行で立つ。以後は対象を変更できない（仕様: 実行後の変更は新規トピック）
   };
@@ -102,7 +136,7 @@ function emptyState() {
     pool: [],
     topics: [defaultTopic("メイン")],
     projects: [],
-    agents: { claude: defaultAgent(), codex: defaultAgent() },
+    agents: Object.fromEntries(AGENTS.map((a) => [a, defaultAgent(a)])),
     budgets: defaultBudgets(),
     usageDay: null,
     budgetHalt: null,
@@ -153,7 +187,7 @@ function loadState() {
       // 旧形式（単一スレッド）→ トピック制へ移行
       if (!Array.isArray(parsed.topics) || !parsed.topics.length) {
         const main = defaultTopic("メイン");
-        for (const a of AGENTS) {
+        for (const a of LEGACY_AGENTS) {
           const old = parsed.agents[a] || {};
           main.agents[a] = {
             sessionId: old.sessionId || null,
@@ -167,11 +201,24 @@ function loadState() {
       }
       for (const a of AGENTS) {
         const old = parsed.agents[a] || {};
-        parsed.agents[a] = { ...defaultAgent(), auto: old.auto !== false, lastError: "", model: old.model || "", modelOverride: old.modelOverride || "" };
+        parsed.agents[a] = {
+          ...defaultAgent(a),
+          auto: old.auto !== false,
+          lastError: "",
+          model: old.model || "",
+          modelOverride: old.modelOverride || "",
+          // schemaVersion 7: grok の認証状態は起動時に再判定する（保存値は「確認中」に戻す）
+          authed: a === "grok" ? null : true,
+          authCheckedTs: 0,
+        };
       }
       for (const t of parsed.topics) {
         t.relay = defaultRelay(); // 再起動後にリレーが勝手に再開しないよう常に解除
-        for (const a of AGENTS) t.agents[a] = { ...topicAgent(), ...t.agents[a] };
+        // schemaVersion 7: 参加者。旧トピックは claude / codex の 2 名（grok のセッション・未読は作らない）
+        if (!Array.isArray(t.participants) || !t.participants.length) t.participants = LEGACY_AGENTS.slice();
+        t.participants = [...new Set(t.participants.filter((a) => AGENTS.includes(a)))];
+        t.agents = t.agents || {};
+        for (const a of t.participants) t.agents[a] = { ...topicAgent(), ...t.agents[a] };
       }
       delete parsed.relay;
       parsed.budgets = { ...defaultBudgets(), ...(parsed.budgets || {}) };
@@ -285,7 +332,7 @@ function persistState() {
   const t0 = Date.now();
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    state.schemaVersion = 6;
+    state.schemaVersion = 7;
     const jsonStr = JSON.stringify(state, null, 2);
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, jsonStr);
@@ -307,6 +354,9 @@ function persistState() {
 // 実行中フラグは永続化しない（クラッシュ後に張り付くのを防ぐ）。キー: "<topicId>:<agent>"
 const running = {};
 const needsRun = {};
+// needsRun の世代。実行中に届いた新しい起動要求（新リレー開始など）を、
+// 旧実行のキャンセル終了処理が needsRun[key] = false で消してしまわないよう区別する
+const needsRunGen = {};
 const runKey = (topicId, agent) => topicId + ":" + agent;
 // 合意事項: auto はユーザーの意思、budgetHalt はシステムの安全ラッチ。実効値は両者のAND
 const agentAutoOn = (agent) => state.agents[agent].auto && !state.budgetHalt;
@@ -336,8 +386,8 @@ function buildThreadMirror(t, msgs) {
     `updated: ${msgs.length ? new Date(msgs[msgs.length - 1].ts).toISOString() : new Date(t.ts).toISOString()}\n` +
     `messages: ${msgs.length}\n` +
     `qaSessions: ${qaSessions}\n` +
-    `claudeSession: ${t.agents.claude.sessionId || "(未開始)"}\n` +
-    `codexSession: ${t.agents.codex.sessionId || "(未開始)"}\n` +
+    `participants: ${(t.participants || LEGACY_AGENTS).join(", ")}\n` +
+    (t.participants || LEGACY_AGENTS).map((a) => `${a}Session: ${(t.agents[a] && t.agents[a].sessionId) || "(未開始)"}\n`).join("") +
     (t.branchedFrom
       ? `branchedFrom: ${(findTopic(t.branchedFrom.topicId) || {}).title || t.branchedFrom.topicId}（message ${t.branchedFrom.messageId}）\n`
       : "") +
@@ -501,7 +551,7 @@ function budgetStatus(topicId) {
 function triggerBudgetHalt(topicId, agent, reason) {
   if (state.budgetHalt) return;
   state.budgetHalt = { reason, ts: Date.now() }; // 安全ラッチ（ユーザーの auto 設定には触れない）
-  for (const t of state.topics) t.relay = defaultRelay();
+  for (const t of state.topics) stopRelay(t, "budget");
   state.messages.push({
     id: id(),
     topicId,
@@ -543,7 +593,7 @@ function actEnd(key) {
 
 function publicState() {
   // running / reviewPending / fixPending は互換用の派生値。正は runs レジストリ
-  return { ...state, running, reviewPending, fixPending, activity, poolDirs, runs: publicRuns(), events, storageMetrics };
+  return { ...state, agentDefs: AGENT_DEFS, running, reviewPending, fixPending, activity, poolDirs, runs: publicRuns(), events, storageMetrics };
 }
 
 function broadcast() {
@@ -592,12 +642,12 @@ function readBody(req, limit = 1_000_000) {
 const RULES_FILE = path.join(POOL_DIR, "U2A2A_RULES.md");
 const DEFAULT_RULES = `# U2A2A 共通ルール
 
-このファイルは U2A2A オーケストレーションの全エージェント（Claude Code / Codex）に、
+このファイルは U2A2A オーケストレーションの全エージェント（Claude Code / Codex / Grok）に、
 通常応答・レビュー・修正のすべての実行で自動的に読み込まれます。編集すれば次の実行から反映されます。
 
 ## 役割（実行種別ごと）
 
-- **通常応答**: 三者の対話。簡潔に。実装作業の提案はするが、大きな作業はタスク化をユーザーに委ねる
+- **通常応答**: 参加者の対話。簡潔に。実装作業の提案はするが、大きな作業はタスク化をユーザーに委ねる
 - **レビュー**: 忖度なく具体的に。リポジトリの実態と突き合わせ、行番号や数値の根拠を示す
 - **修正**: レビューの妥当な指摘に対応し、誤った指摘には従わず理由を述べる
 
@@ -612,6 +662,11 @@ const DEFAULT_RULES = `# U2A2A 共通ルール
 
 - 保存したら本文にパスを列挙する（何をどこに置いたか）
 - 実行可能なもの（スクリプト等）は再実行方法を一行添える
+
+## 外部情報
+
+- web 検索や外部資料を使った場合は、出典（URL）を本文に示す
+- 「オフライン」指定の依頼では検索を使わず、リポジトリと成果物の内容だけで判断する
 `;
 let rulesCache = { mtime: 0, text: "" };
 
@@ -868,8 +923,8 @@ function fileChangeNote(prev, cur) {
 }
 
 // ---- agent CLI runners ----
-const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
-const OTHER = { claude: "codex", codex: "claude" };
+const NAMES = { user: "ユーザー", ...Object.fromEntries(AGENTS.map((a) => [a, AGENT_DEFS[a].name])) };
+// OTHER（2 者の相互参照）は廃止。相手は peers(topic, agent) で参加者から求める
 const QA_END_MARK = "【質疑終了】";
 
 function spawnEnv() {
@@ -945,17 +1000,20 @@ function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = nul
   });
 }
 
-function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo = null) {
-  const other = agent === "claude" ? "codex" : "claude";
+function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo = null, extra = {}) {
+  const participants = topic.participants || LEGACY_AGENTS;
+  const peerNames = peersOf(participants, agent).map((a) => NAMES[a]);
+  const rootCwd = agent !== "codex"; // claude / grok は cwd=リポジトリルート（書き込みは pool のみ）、codex は cwd=pool
   const project = projectInfo && projectInfo.project ? projectInfo.project : null;
   // 対象プロジェクトの 1 行（name・path・branch・HEAD・未コミット数、または確認不可）。probe は毎回取り直すので初回に限らず毎回添える
   const projectLine = project ? projectPromptLine(project, projectInfo.probe) : "";
   // 作業範囲の説明: 紐付けありなら対象プロジェクト（閲覧のみ）、未紐付けは従来どおり Kometa リポジトリ
   const workNote = project
-    ? (agent === "claude" ? "" : `作業ディレクトリは u2a2a/pool（成果物置き場・書き込み可）。`) + projectLine
-    : agent === "claude"
-      ? `作業ディレクトリは Kometa リポジトリ（閲覧のみ、変更は不可）。`
+    ? (rootCwd ? "" : `作業ディレクトリは u2a2a/pool（成果物置き場・書き込み可）。`) + projectLine
+    : rootCwd
+      ? `作業ディレクトリは Kometa リポジトリ（閲覧のみ、変更は不可）。` // 書き込み先（u2a2a/pool/ 配下のみ）は artifactNote で示す。文言は既存テストが照合している
       : `作業ディレクトリは u2a2a/pool（成果物置き場・書き込み可）。Kometa リポジトリ本体（${REPO_ROOT}）は閲覧のみ。`;
+  const activeRelayId = topic.relay.active ? topic.relay.id : null;
   const lines = msgs
     .map((m) => {
       const pv = m.provenance || {};
@@ -974,13 +1032,21 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo 
           `[${NAMES[m.author]}] ${m.text}`
         );
       }
+      // 終了・中止した質疑の配送コピーは経緯として渡すだけ（返信を求めず、起動理由にもならない）
+      if (pv.delivery === "qa-relay" && (!activeRelayId || !pv.source || pv.source.relayId !== activeRelayId)) {
+        return `【終了した質疑の経緯・返信不要】\n[${NAMES[m.author]}] ${m.text}`;
+      }
       return `[${NAMES[m.author]}] ${m.text}`;
     })
     .join("\n\n");
+  // 未読を切り詰めた場合は捨てずに件数とミラーの参照先を示す
+  const mirrorRefText = topic.mirrorFile ? ` u2a2a/pool/${topic.mirrorFile} ` : "スレッド履歴ミラー";
+  const backlogNote = extra.dropped ? `（これ以前の未読 ${extra.dropped} 件は${mirrorRefText}を参照）\n\n` : "";
+  const participantList = participants.map((a) => NAMES[a] + (a === agent ? "（あなた）" : "")).join("・");
   const preamble = isFirst
     ? `あなたは「U2A2Aオーケストレーション」アプリの ${NAMES[agent]} 側スレッドの担当エージェントです。` +
       `このスレッドのトピックは「${topic.title}」です。` +
-      `参加者はユーザー・${NAMES[agent]}（あなた）・${NAMES[other]} の三者です。` +
+      `参加者はユーザー・${participantList} です。` +
       workNote +
       `新着メッセージに ${NAMES[agent]} として日本語で簡潔に返答してください。` +
       `実装作業が必要な場合は作業内容を提案し、タスク化はユーザーに委ねてください。\n\n--- 新着メッセージ ---\n`
@@ -1000,14 +1066,15 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo 
         `）`;
     }
   }
+  const relayOrder = (topic.relay.participants || []).map((a) => NAMES[a]).join(" → ");
   const qaNote = topic.relay.active
-    ? `\n\n（現在 ${NAMES[other]} との質疑応答モードです。議論が浅いうちは結論に飛びつかず、質問・反論・検討を返してください。` +
-      `${QA_END_MARK} は、相手の見解を少なくとも一度聞いた上で合意・結論に達した場合のみ、応答の末尾に書いてください。` +
-      `相手がまだ発言していない段階での終了宣言は無効です。残り自動中継 ${topic.relay.remaining} 手）`
+    ? `\n\n（現在 ${peerNames.join("・")} との質疑応答モードです${relayOrder ? `（手番順: ${relayOrder}）` : ""}。議論が浅いうちは結論に飛びつかず、質問・反論・検討を返してください。` +
+      `${QA_END_MARK} は、参加者全員の見解を少なくとも一度聞いた上で合意・結論に達した場合のみ、応答の末尾に書いてください。` +
+      `まだ発言していない参加者がいる段階での終了宣言は無効です。残り自動中継 ${topic.relay.remaining} 手）`
     : "";
   const saveDir = `u2a2a/pool/${topicDirRel(topic.id)}`;
   const artifactNote =
-    agent === "claude"
+    rootCwd
       ? `\n\n（成果物ファイルの保存先は ${saveDir}/ です（書き込みは u2a2a/pool/ 配下のみ許可）。` +
         `中間生成物は ${saveDir}/.work/ へ。画像・音声・動画は python3 / ffmpeg で生成できます。` +
         `保存したら本文にそのパスを書いてください — アプリがインライン表示します）`
@@ -1027,43 +1094,59 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo 
         : "";
   // 紐付けありの初回のみ、対象プロジェクトの概要（README 冒頭＋直下エントリ名、4,000 文字まで）
   const digestNote = isFirst && project && projectInfo.digest ? `\n\n--- 対象プロジェクトの概要（初回のみ） ---\n${projectInfo.digest}\n` : "";
-  return preamble + contextNote + digestNote + qaJoinNote + lines + qaNote + changesNote + artifactNote + commonRulesBlock("通常応答");
+  return preamble + contextNote + digestNote + qaJoinNote + backlogNote + lines + qaNote + changesNote + artifactNote + commonRulesBlock("通常応答");
 }
 
-// 質疑モード: エージェントの応答完了を待って相手スレッドへ中継する（トピック単位）
+// 質疑モード（仕様: SPEC-Grok参戦.md「リレー機構」）: 応答者以外の参加者全員へ配送し、手番の 1 名だけを起動する。
+// 2 名でも 3 名でも同じ機構。配送は常に先（終了宣言・最終手の発言も他の参加者へ届く）
 function qaHop(topic, agent, replyText, sourceMsgId) {
   const r = topic.relay;
   if (!r.active) return;
-  // 終了宣言は相手が一度でも発言した後（=中継が1回以上済み）のみ有効。
-  // 先手が初手で終了宣言しても、相手に見せるまではリレーを続ける。
-  if (replyText.includes(QA_END_MARK) && r.hopsDone > 0) {
-    r.active = false;
+  const parts = r.participants && r.participants.length ? r.participants : LEGACY_AGENTS;
+  if (parts[r.turn] !== agent) return; // 手番外の応答は中継しない
+  r.spoken = r.spoken || {};
+  r.spoken[agent] = (r.spoken[agent] || 0) + 1;
+  r.seq = (r.seq || 0) + 1;
+  for (const to of peersOf(parts, agent)) {
+    state.messages.push({
+      topicId: topic.id,
+      id: id(),
+      thread: to,
+      author: agent,
+      text: replyText,
+      provenance: {
+        ingress: "agent-loop",
+        delivery: "qa-relay",
+        trigger: "auto",
+        source: { topicId: topic.id, messageId: sourceMsgId || null, agent, relayId: r.id, seq: r.seq, turn: r.turn },
+      },
+      ts: Date.now(),
+    });
+  }
+  // 終了宣言は参加者全員が 1 回以上発言した後のみ有効（現行「相手が未発言なら無効」の一般化）
+  if (canEndRelay(r, replyText, QA_END_MARK)) {
+    stopRelay(topic, "agreed");
     summarizeTopic(topic.id); // 質疑の決着は要約の節目
     return;
   }
   if (r.remaining <= 0) {
-    r.active = false;
+    stopRelay(topic, "hops");
     return;
   }
   r.remaining--;
   r.hopsDone++;
-  const other = OTHER[agent];
-  state.messages.push({
-    topicId: topic.id,
-    id: id(),
-    thread: other,
-    author: agent,
-    text: replyText,
-    provenance: {
-      ingress: "agent-loop",
-      delivery: "qa-relay",
-      trigger: "auto",
-      source: { topicId: topic.id, messageId: sourceMsgId || null, agent },
-    },
-    ts: Date.now(),
-  });
-  if (r.remaining <= 0) r.active = false; // 最終手: 相手は応答するがそれ以上は中継しない
-  if (agentAutoOn(other)) agentLoop(topic.id, other);
+  r.turn = nextTurn(r);
+  const next = parts[r.turn];
+  if (!agentAutoOn(next)) {
+    stopRelay(topic, "auto-off");
+    return;
+  }
+  if (next === "grok" && state.agents.grok.authed !== true) {
+    stopRelay(topic, "unauthed");
+    return;
+  }
+  // 最終手（remaining が 0）でも次の参加者を起動する。その応答は配送された後に「hops」で停止する
+  agentLoop(topic.id, next);
 }
 
 // stream-json イベント → 実況用の1行テキスト
@@ -1092,6 +1175,8 @@ async function callClaude(prompt, sessionId, modelOverride, onStep, opts = {}) {
   if (sessionId) args.push("--resume", sessionId);
   if (modelOverride) args.push("--model", modelOverride);
   if (opts.extraArgs) args.push(...opts.extraArgs);
+  // オフライン指定: プロンプトの指示に加えて web ツールを CLI 側でも拒否する（末尾に置く。可変長引数が後続を吸わないように）
+  if (opts.offline) args.push("--disallowedTools", "WebSearch", "WebFetch");
   let result = null;
   const onLine = (line) => {
     if (!line.trim()) return;
@@ -1252,6 +1337,109 @@ async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
   };
   return { text: text || "(空の応答)", sessionId: newSessionId, model, meta };
 }
+
+// ---- Grok Build CLI アダプタ（仕様: SPEC-Grok参戦.md、実測: smoke-Grok工程0.md）----
+// 権限は毎回渡す（--resume は権限を継承しない）。プロンプトは一時ファイル経由（--prompt-file）。
+// 書き込みは claude 互換の allow 規則で pool に限定し、spawn_subagent は除外する
+// Grok はシェルを与えない（実測: 冒頭に git status && ls 等の複合コマンドで状況把握する流儀のため、
+// Bash(python3:*) のような個別 allow では複合コマンドが拒否され、その場で cancelled 停止してしまう。
+// run_terminal_command ごと外せば read_file / list_dir / grep で探索して完走する。メディア生成は当面 claude/codex 担当）
+const GROK_WRITE_ARGS = ["--allow", "Edit(u2a2a/pool/**)", "--disallowed-tools", "spawn_subagent,run_terminal_command"];
+const GROK_READ_ARGS = ["--sandbox", "read-only", "--disallowed-tools", "spawn_subagent,run_terminal_command"];
+const GROK_AUTH_FILE = path.join(os.homedir(), ".grok", "auth.json");
+
+async function callGrok(prompt, sessionId, modelOverride, onStep, opts = {}) {
+  const t0 = Date.now();
+  const promptFile = path.join(os.tmpdir(), `u2a2a-grok-${id()}.md`);
+  fs.writeFileSync(promptFile, prompt);
+  const args = ["--prompt-file", promptFile, "--output-format", "streaming-json"];
+  if (sessionId) args.push("--resume", sessionId);
+  if (modelOverride) args.push("-m", modelOverride);
+  if (opts.extraArgs) args.push(...opts.extraArgs);
+  if (opts.offline) args.push("--disable-web-search");
+  const onLine = (line) => {
+    if (!line.trim()) return;
+    let ev;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (ev.type === "end" && ev.sessionId && opts.onSessionId) opts.onSessionId(ev.sessionId);
+    if (onStep) {
+      const st = grokStepFrom(ev);
+      if (st) onStep(st);
+    }
+  };
+  const { code, out, err, cancelled } = await runCli("grok", args, "", AGENT_TIMEOUT_MS, onLine, opts.cwd, opts.ctl);
+  try {
+    fs.unlinkSync(promptFile);
+  } catch {
+    // 既に無ければ無視
+  }
+  if (cancelled)
+    throw Object.assign(new Error("キャンセルされました"), {
+      cancelled: true,
+      meta: { status: "cancelled", model: modelOverride || "", durationMs: Date.now() - t0, usage: { inTok: 0, outTok: 0, cacheTok: 0 }, billing: { mode: "unknown" } },
+    });
+  const parsed = parseGrokStream(out.split("\n"));
+  if (parsed.error) {
+    if (isGrokUnauthedError(parsed.error)) {
+      state.agents.grok.authed = false;
+      state.agents.grok.authCheckedTs = Date.now();
+    }
+    throw new Error("grok: " + parsed.error.slice(0, 500));
+  }
+  if (!parsed.end && code !== 0) throw new Error((err || out || "grok CLI エラー").trim().slice(0, 500));
+  if (!parsed.end) throw new Error("grok: end イベントを受信できませんでした");
+  const meta = grokMetaFrom(parsed.end, Date.now() - t0, modelOverride);
+  if (meta.billing.mode === "unknown") logEvent("billing", "Grok の費用を取得できませんでした（不明として扱い、0 円とはみなしません）", "warn");
+  // stopReason: cancelled は成功扱いにしない。本文・usage・費用は保持し、呼び出し側が「権限要求または中断で停止」を表示する
+  return { text: parsed.text || (meta.status === "stopped" ? "(応答なし)" : "(空の応答)"), sessionId: parsed.end.sessionId || sessionId, model: meta.model, meta };
+}
+
+// 認証判定: ~/.grok/auth.json の存在＋軽量プローブ（起動時と再確認時のみ。実行のたびには判定しない）
+async function checkGrokAuth() {
+  const g = state.agents.grok;
+  if (!g) return null;
+  let ok = false;
+  let message = "";
+  if (!fs.existsSync(GROK_AUTH_FILE)) {
+    message = "未認証（grok login が必要）";
+  } else {
+    const r = await runCli("grok", ["-p", "ping", "--output-format", "json", "--max-turns", "1"], "", 20_000);
+    const parsed = parseGrokStream(r.out.split("\n"));
+    ok = r.code === 0 && !parsed.error && !isGrokUnauthedError(r.out + r.err);
+    message = ok ? "" : String(parsed.error || r.err || "プローブに失敗").slice(0, 200);
+  }
+  g.authed = ok;
+  g.authCheckedTs = Date.now();
+  g.lastError = ok ? g.lastError : message;
+  touch();
+  return ok;
+}
+
+// runner テーブル: 通常応答・レビュー・修正の起動オプションをエージェントごとに集約（agent === "claude" 型の分岐を置換）
+const RUNNERS = {
+  claude: {
+    call: callClaude,
+    threadOpts: (topic, ta, project) => ({ extraArgs: claudeToolArgs(project) }),
+    reviewOpts: (project) => (project ? { extraArgs: ["--add-dir", project.path] } : {}),
+    fixOpts: (project) => ({ extraArgs: claudeToolArgs(project) }),
+  },
+  codex: {
+    call: callCodex,
+    threadOpts: (topic, ta) => ({ writeDir: ensureTopicDir(topic.id), resumeWritable: !!ta.codexPoolCwd }),
+    reviewOpts: () => ({}),
+    fixOpts: () => ({ writeDir: POOL_DIR }),
+  },
+  grok: {
+    call: callGrok,
+    threadOpts: () => ({ extraArgs: GROK_WRITE_ARGS }),
+    reviewOpts: () => ({ extraArgs: GROK_READ_ARGS }),
+    fixOpts: () => ({ extraArgs: GROK_WRITE_ARGS }),
+  },
+};
 
 // ---- 共有タスクプール: 相互レビュー ----
 // レビューはスレッドとは独立した使い捨てセッションで実行する
@@ -1600,6 +1788,21 @@ function migratePoolItems() {
 let poolDirs = [];
 
 // 応答本文のパス宣言に基づく確定登録（合意事項C: 帰属の一次経路。規約に基づく宣言の読み取り）
+// 成果物のレビュー依頼先: 指定があればそれ（参加者内・作者以外）、無ければ既定（作者以外の参加者。ユーザー作者は全員）
+function participantsOfTopic(topicId) {
+  const t = topicId ? findTopic(topicId) : null;
+  return t ? t.participants || LEGACY_AGENTS : LEGACY_AGENTS;
+}
+function reviewersFor(topicId, origin, requested) {
+  const parts = participantsOfTopic(topicId);
+  if (Array.isArray(requested)) {
+    const bad = requested.find((r) => !parts.includes(r) || r === origin);
+    if (bad) return { error: `レビュアー ${bad} は参加者でないか作者本人です` };
+    return { reviewers: [...new Set(requested)] };
+  }
+  return { reviewers: defaultReviewers(parts, origin) };
+}
+
 function registerDeclaredArtifacts(text, agent, topicId, msgId) {
   let changed = false;
   for (const rel of extractDeclaredPaths(text)) {
@@ -1621,6 +1824,7 @@ function registerDeclaredArtifacts(text, agent, topicId, msgId) {
         via: "declared",
         topicId: topicIdFromPath(rel) || topicId || null,
         projectId: projectIdOfTopic(topicIdFromPath(rel) || topicId || null),
+        reviewers: reviewersFor(topicIdFromPath(rel) || topicId || null, agent).reviewers,
         status: "submitted",
         reviews: [],
         fromMessageId: msgId,
@@ -1685,6 +1889,7 @@ function scanPoolDir() {
         via: inf.origin ? "inferred" : inf.candidates === 0 ? "folder" : "unknown",
         topicId: tid,
         projectId: projectIdOfTopic(tid),
+        reviewers: reviewersFor(tid, origin).reviewers,
         status: "submitted",
         reviews: [],
         ...statPoolFile(name),
@@ -1732,8 +1937,9 @@ function targetLine(pc) {
   return pc && pc.project ? projectPromptLine(pc.project, pc.probe) + "\n" : "";
 }
 
-function buildReviewPrompt(item, reviewer, history = null, pc = null) {
+function buildReviewPrompt(item, reviewer, history = null, pc = null, offline = false) {
   const rel = item.file ? `u2a2a/pool/${item.file}` : null;
+  const offlineNote = offline ? `\n（オフライン指定: web 検索や外部資料は使わず、リポジトリと成果物の内容だけで判断してください）` : "";
   const origin = NAMES[item.origin] || "作者未確定";
   let contentPart;
   if (history) {
@@ -1777,18 +1983,30 @@ function buildReviewPrompt(item, reviewer, history = null, pc = null) {
     `- 最後に必ず1行、次の形式で判定を書く: 【判定】承認 / 条件付き承認 / 差し戻し\n\n` +
     contentPart +
     historyPart +
+    offlineNote +
     commonRulesBlock("レビュー")
   );
 }
 
-async function runReview(itemId, reviewer) {
+async function runReview(itemId, reviewer, ropts = {}) {
   const item = state.pool.find((p) => p.id === itemId);
   if (!item) return;
   if (fixPending[itemId]) return; // 修正実行中は書き込み途中のファイルをレビューしない（API は 409、ここは二重防御）
   if ((reviewPending[itemId] || []).includes(reviewer)) return; // 同一レビュアーの多重起動防止
+  // 自動依頼で実行できない相手（未認証・自動応答 OFF）は skipped として記録し、レビュー済みに数えない（手動依頼は API が 400）
+  if (reviewer === "grok" && state.agents.grok.authed !== true) {
+    item.reviews.push({ id: id(), reviewer, text: "（未実施: Grok が未認証のためスキップ）", verdict: "", skipped: true, reason: "未認証", ts: Date.now() });
+    touch();
+    return;
+  }
+  if (ropts.auto && !state.agents[reviewer].auto) {
+    item.reviews.push({ id: id(), reviewer, text: "（未実施: 自動応答 OFF のためスキップ）", verdict: "", skipped: true, reason: "自動応答OFF", ts: Date.now() });
+    touch();
+    return;
+  }
   const overBudget = budgetStatus(null); // レビューは回数/時間の全体枠で判定
   if (overBudget) {
-    item.reviews.push({ id: id(), reviewer, text: "（上限到達のためスキップ: " + overBudget + "）", verdict: "", error: true, ts: Date.now() });
+    item.reviews.push({ id: id(), reviewer, text: "（上限到達のためスキップ: " + overBudget + "）", verdict: "", error: true, skipped: true, reason: "上限到達", ts: Date.now() });
     touch();
     return;
   }
@@ -1848,11 +2066,13 @@ async function runReview(itemId, reviewer) {
     return;
   }
   try {
-    const call = reviewer === "claude" ? callClaude : callCodex;
-    // Claude は対象プロジェクトを読むために --add-dir を足す（読み取りのみ。書き込み規則は付けない）
-    const callOpts = reviewer === "claude" && pc.project ? { extraArgs: ["--add-dir", pc.project.path] } : {};
-    const { text, meta } = await call(buildReviewPrompt(item, reviewer, history, pc), null, state.agents[reviewer].modelOverride, (s) => actStep(actKey, s), callOpts);
-    item.reviews.push({ id: id(), reviewer, text, verdict: verdictFrom(text), meta, ts: Date.now(), ...reviewVersionFields(item, history) });
+    const runner = RUNNERS[reviewer];
+    // 読み取りのみのオプション（claude: --add-dir、codex: read-only、grok: --sandbox read-only）。offline は検索を使わない指示
+    const callOpts = { ...runner.reviewOpts(pc.project), offline: !!ropts.offline };
+    const { text, meta } = await runner.call(buildReviewPrompt(item, reviewer, history, pc, !!ropts.offline), null, state.agents[reviewer].modelOverride, (s) => actStep(actKey, s), callOpts);
+    // 権限要求・中断で止まった応答（meta.status === "stopped"）は本文・費用を残すが、判定は抽出しない（途中の文言を判定として扱わない）
+    const stopped = !!(meta && meta.status === "stopped");
+    item.reviews.push({ id: id(), reviewer, text, verdict: stopped ? "" : verdictFrom(text), meta, ts: Date.now(), ...(stopped ? { stopped: true } : {}), ...reviewVersionFields(item, history) });
   } catch (e) {
     item.reviews.push({
       id: id(),
@@ -1870,13 +2090,15 @@ async function runReview(itemId, reviewer) {
 
 // ---- レビュー後の修正: 担当エージェントがプールフォルダ限定の書き込み権限でファイルを直す ----
 
-function buildFixPrompt(item, agent, pc = null) {
+function buildFixPrompt(item, agent, pc = null, offline = false) {
+  // 未実施（skipped）のレビューは本文がないので渡さない。中断したレビューは途中までの内容として明示する
   const reviews = (item.reviews || [])
-    .filter((r) => !r.error)
-    .map((r) => `--- ${NAMES[r.reviewer]} のレビュー（判定: ${r.verdict || "なし"}） ---\n${r.text}`)
+    .filter((r) => !r.error && !r.skipped)
+    .map((r) => `--- ${NAMES[r.reviewer]} のレビュー（判定: ${r.verdict || "なし"}${r.stopped ? "・途中で中断" : ""}） ---\n${r.text}`)
     .join("\n\n");
+  const offlineNote = offline ? `\n（オフライン指定: web 検索や外部資料は使わず、リポジトリと成果物の内容だけで修正してください）` : "";
   // Claude は cwd=リポジトリルート（書き込み規則 Edit(u2a2a/pool/**) が効く配置）、Codex は cwd=pool
-  const fileRef = agent === "claude" ? `u2a2a/pool/${item.file}（リポジトリルートからの相対パス）` : `${item.file}（カレントディレクトリ＝ u2a2a/pool）`;
+  const fileRef = agent !== "codex" ? `u2a2a/pool/${item.file}（リポジトリルートからの相対パス）` : `${item.file}（カレントディレクトリ＝ u2a2a/pool）`;
   return (
     `あなたは U2A2A 共有タスクプールの成果物を修正する担当（${NAMES[agent]}）です。` +
     `成果物ファイル ${fileRef} を、以下のレビューを踏まえて修正し、` +
@@ -1887,11 +2109,12 @@ function buildFixPrompt(item, agent, pc = null) {
     `- 誤っている・過剰な指摘には従わず、応答で理由を述べる\n` +
     `- ファイル保存を済ませてから、応答として「何をどう直したか／直さなかったか」の要約を簡潔に書く\n\n` +
     (reviews || "（レビューはまだありません。成果物の品質を自己点検して改善してください）") +
+    offlineNote +
     commonRulesBlock("修正")
   );
 }
 
-async function runFix(itemId, agent) {
+async function runFix(itemId, agent, fopts = {}) {
   const item = state.pool.find((p) => p.id === itemId);
   if (!item || !item.file || fixPending[itemId] || reviewPending[itemId]) return; // レビュー中の修正は API が 409。ここは二重防御
   const overBudget = budgetStatus(null);
@@ -1949,24 +2172,29 @@ async function runFix(itemId, agent) {
   }
   let cliOk = false;
   try {
-    const prompt = buildFixPrompt(item, agent, pc);
+    const prompt = buildFixPrompt(item, agent, pc, !!fopts.offline);
     const onStep = (s) => actStep(actKey, s);
     const override = state.agents[agent].modelOverride;
     // Claude: acceptEdits は --add-dir 先の編集まで自動承認するため使わない。通常応答と同じ
     // cwd=リポジトリルート＋ Edit(u2a2a/pool/**) 規則（工程 0 で読み取り可・外部への書き込み拒否を実測済み）
-    const { text, meta } =
-      agent === "claude"
-        ? await callClaude(prompt, null, override, onStep, { extraArgs: claudeToolArgs(pc.project) })
-        : await callCodex(prompt, null, override, onStep, { writeDir: POOL_DIR });
-    Object.assign(fix, { text, meta });
-    cliOk = true;
-    const st = statPoolFile(item.file);
+    const runner = RUNNERS[agent];
+    const { text, meta } = await runner.call(prompt, null, override, onStep, { ...runner.fixOpts(pc.project), offline: !!fopts.offline });
+    const stopped = !!(meta && meta.status === "stopped");
+    Object.assign(fix, { text, meta }, stopped ? { stopped: true } : {});
+    const st = statPoolFile(item.file); // 中断でもファイルは途中まで書かれ得るので stat は更新する
     if (st) Object.assign(item, st);
-    item.status = "submitted";
+    if (stopped) {
+      // 権限要求・中断で止まった修正は正常完了として扱わない: 本文・費用は残し、修正後の版は partial で保存し、
+      // 状態は動かさず自動再レビューも起動しない（ユーザーが内容を確認して再修正・手動レビューを選ぶ）
+      logEvent("cli", `${NAMES[agent]} の修正が途中で停止しました（${item.file}）: ` + GROK_STOP_NOTE, "warn");
+    } else {
+      cliOk = true;
+      item.status = "submitted";
+    }
   } catch (e) {
     Object.assign(fix, { text: "（修正失敗: " + String(e.message || e).slice(0, 300) + "）", error: true });
   }
-  // 修正後の版を成否問わず保存（失敗時は partial）→ ロック解除 → 履歴保存に成功したときだけ自動再レビュー
+  // 修正後の版を成否問わず保存（失敗・中断時は partial）→ ロック解除 → 正常完了かつ履歴保存に成功したときだけ自動再レビュー
   let historyOk = true;
   if (tracked) {
     try {
@@ -1986,9 +2214,10 @@ async function runFix(itemId, agent) {
   item.fixes.push(fix);
   finish();
   if (cliOk && historyOk) {
-    // 元レビュアー（修正者以外）が自動で再レビュー（ロック解除後に開始する）
-    const reviewers = [...new Set((item.reviews || []).filter((r) => !r.error).map((r) => r.reviewer))].filter((r) => r !== agent);
-    for (const r of reviewers.length ? reviewers : [OTHER[agent]]) runReview(item.id, r);
+    // 実際にレビューした人（修正者以外）が自動で再レビュー。無ければ保存済みの依頼先（旧成果物は既定から導出）
+    const done = [...new Set((item.reviews || []).filter((r) => !r.error && !r.skipped).map((r) => r.reviewer))].filter((r) => r !== agent);
+    const saved = (item.reviewers || defaultReviewers(participantsOfTopic(item.topicId), item.origin)).filter((r) => r !== agent);
+    for (const r of done.length ? done : saved) runReview(item.id, r, { auto: true });
   }
 }
 
@@ -2064,11 +2293,18 @@ function checkSummaries() {
   }
 }
 
-function unseenFor(topic, agent) {
+// 未読: 末尾 MAX_BACKLOG 件を渡し、落とした件数も返す（プロンプトで参照先を示す）。質疑の配送コピーは relayId+seq で重複排除
+function unseenInfo(topic, agent) {
   const ta = topic.agents[agent];
-  return state.messages
-    .filter((m) => m.topicId === topic.id && m.thread === agent && m.author !== agent && !(m.provenance && m.provenance.ingress === "cli-sync") && m.ts > ta.lastSeenTs)
-    .slice(-MAX_BACKLOG);
+  if (!ta) return { msgs: [], dropped: 0 };
+  const all = dedupeRelayCopies(
+    state.messages.filter((m) => m.topicId === topic.id && m.thread === agent && m.author !== agent && !(m.provenance && m.provenance.ingress === "cli-sync") && m.ts > ta.lastSeenTs)
+  );
+  return clipBacklog(all, MAX_BACKLOG);
+}
+
+function unseenFor(topic, agent) {
+  return unseenInfo(topic, agent).msgs;
 }
 
 // ---- 外部セッション同期 ----
@@ -2076,6 +2312,7 @@ function unseenFor(topic, agent) {
 
 function transcriptPath(agent, sessionId) {
   if (!sessionId) return null;
+  if (agent === "grok") return null; // Grok の transcript の所在は未確認（次フェーズ）
   if (agent === "claude") {
     const proj = REPO_ROOT.replace(/[^a-zA-Z0-9]/g, "-");
     const f = path.join(os.homedir(), ".claude", "projects", proj, sessionId + ".jsonl");
@@ -2192,7 +2429,7 @@ function syncExternal(topic, agent) {
 setInterval(() => {
   let changed = false;
   for (const topic of state.topics) {
-    for (const agent of AGENTS) {
+    for (const agent of topic.participants || LEGACY_AGENTS) {
       if (running[runKey(topic.id, agent)]) continue; // 自分の応答書き込み中は増分を読まない
       try {
         if (syncExternal(topic, agent)) changed = true;
@@ -2218,6 +2455,7 @@ async function agentLoop(topicId, agent) {
   const key = runKey(topicId, agent);
   if (running[key]) {
     needsRun[key] = true;
+    needsRunGen[key] = (needsRunGen[key] || 0) + 1;
     return;
   }
   running[key] = true;
@@ -2232,6 +2470,7 @@ async function agentLoop(topicId, agent) {
       needsRun[key] = false;
       const topic = findTopic(topicId);
       if (!topic) break;
+      if (!(topic.participants || LEGACY_AGENTS).includes(agent)) break; // 参加者でないエージェントは動かない（セッション状態もない）
       const a = state.agents[agent];
       const ta = topic.agents[agent];
       try {
@@ -2239,15 +2478,33 @@ async function agentLoop(topicId, agent) {
       } catch {
         // 同期失敗しても応答は続行
       }
-      const msgs = unseenFor(topic, agent);
+      const { msgs, dropped } = unseenInfo(topic, agent);
       if (!agentAutoOn(agent) || !msgs.length) break;
+      // 質疑リレー中は手番の参加者だけが実行する（手番外は未読を残して終了。手番で qaHop が起動する）
+      const r0 = topic.relay;
+      const relayParts = r0.active ? r0.participants || LEGACY_AGENTS : null;
+      if (relayParts && relayParts.includes(agent) && relayParts[r0.turn] !== agent) break;
+      // この実行がどのリレーの手番として始まったか（リレー外の応答は null）。CLI 完了後にも照合し、
+      // 応答待ちの間に停止・別リレー開始があれば、旧実行の成否が新しいリレーを変更しないようにする
+      const relayIdAtStart = relayParts && relayParts.includes(agent) ? r0.id : null;
+      const sameRelay = () => topic.relay.active && !!relayIdAtStart && topic.relay.id === relayIdAtStart;
       // 対象プロジェクトの確認（Git 実行を含む、起動前で唯一の await）。
       // missing / unreadable / unregistered なら実行せず理由を残す。unavailable は続行
       const pc = await projectContext(topic.projectId);
       // 確認待ちの間に自動応答 OFF・上限停止・トピック削除が起きていれば起動しない
       if (!agentAutoOn(agent) || findTopic(topicId) !== topic) break;
+      // リレー起動は、確認待ちの間にリレーが終了・別リレーになっていたら中止する（通常応答として扱い直さない）。
+      // ただし待機中に新しい起動要求（停止→同じ先手で新規開始など）が needsRun に入っていれば、旧起動を捨てた上で
+      // 先頭から再評価する（break で終えると新リレーが active のまま誰も走らない）
+      const r1 = topic.relay;
+      const parts1 = r1.active ? r1.participants || LEGACY_AGENTS : null;
+      const relayIdNow = parts1 && parts1.includes(agent) ? r1.id : null;
+      if (relayIdNow !== relayIdAtStart || (parts1 && parts1.includes(agent) && parts1[r1.turn] !== agent)) {
+        if (needsRun[key]) continue;
+        break;
+      }
       if (pc.blockReason) {
-        topic.relay.active = false;
+        if (sameRelay()) stopRelay(topic, "error");
         a.lastError = pc.blockReason;
         state.messages.push({
           id: id(),
@@ -2274,20 +2531,19 @@ async function agentLoop(topicId, agent) {
       const curSnapshot = takeFileSnapshot(topicId, { poolOnly: !!pc.project });
       const changesNote = fileChangeNote(ta.fileSnapshot, curSnapshot) + (pc.project ? projectChangeNote(pc.probe) : "");
       const projectInfo = pc.project ? { ...pc, digest: !ta.sessionId ? projectDigestFor(pc.project) : "" } : null;
-      const prompt = buildPrompt(topic, agent, msgs, !ta.sessionId, changesNote, projectInfo);
+      const prompt = buildPrompt(topic, agent, msgs, !ta.sessionId, changesNote, projectInfo, { dropped });
       const actKey = "thread:" + topicId + ":" + agent;
       const run = startRun("thread", agent, { topicId });
       run.sessionId = ta.sessionId || null;
+      // この実行の開始時点の起動要求世代（キャンセル終了処理で、実行中に届いた新要求を消さないため）
+      const genAtRunStart = needsRunGen[key] || 0;
       actStart(actKey, NAMES[agent] + " 応答", run.runId);
       try {
-        const call = agent === "claude" ? callClaude : callCodex;
-        // claude はプール配下のファイル保存に加え、メディア生成用に python3 / ffmpeg の実行を許可。
-        // codex は cwd=pool の workspace-write で起動（書き込みはプール限定・リポジトリは閲覧のみ）
+        // 起動オプションは runner テーブルから（claude: pool 限定の Edit 規則＋python3/ffmpeg、codex: cwd=pool の workspace-write、grok: allow 規則）
+        const runner = RUNNERS[agent];
+        const call = runner.call;
         const hadSession = !!ta.sessionId;
-        const opts =
-          agent === "claude"
-            ? { extraArgs: claudeToolArgs(pc.project) }
-            : { writeDir: ensureTopicDir(topicId), resumeWritable: !!ta.codexPoolCwd };
+        const opts = runner.threadOpts(topic, ta, pc.project);
         opts.ctl = run.ctl;
         opts.onSessionId = (sid) => (run.sessionId = sid); // 早期捕捉（キャンセル時に interrupted として保持）
         const { text, sessionId, model, meta } = await call(prompt, ta.sessionId, a.modelOverride, (s) => actStep(actKey, s), opts);
@@ -2295,7 +2551,11 @@ async function agentLoop(topicId, agent) {
         if (agent === "codex" && !hadSession) ta.codexPoolCwd = true; // 新方式（cwd=pool）で作られた印
         if (model) a.model = model;
         ta.lastSeenTs = msgs[msgs.length - 1].ts;
-        a.lastError = "";
+        const stopped = !!(meta && meta.status === "stopped");
+        a.lastError = stopped ? GROK_STOP_NOTE : ""; // 権限要求または中断で停止した応答は赤字で示す
+        // 応答待ちの間にリレーが停止・別リレーになっていたら、この応答は旧リレーの発言。記録はするが中継・議題採用はしない
+        const relayLive = sameRelay();
+        const stale = !!relayIdAtStart && !relayLive;
         const replyMsg = {
           id: id(),
           topicId,
@@ -2304,11 +2564,13 @@ async function agentLoop(topicId, agent) {
           text,
           provenance: { ingress: "agent-loop", delivery: "direct", trigger: "auto", source: null },
           meta,
+          ...(stopped ? { stopped: true } : {}),
+          ...(stale ? { staleRelayId: relayIdAtStart } : {}),
           ts: Date.now(),
         };
         state.messages.push(replyMsg);
-        // 質疑の論点が未定なら、先手の応答冒頭の起案を採用（ユーザーは qa バーで修正可能）
-        if (topic.relay.active && !topic.relay.agenda) {
+        // 質疑の論点が未定なら、先手の応答冒頭の起案を採用（ユーザーは qa バーで修正可能）。同じリレーの手番の応答に限る
+        if (relayLive && !stopped && !topic.relay.agenda) {
           // 「今回決めること: 〜」形式にも「## 今回決めること」見出し＋次行にも対応
           const am = text.match(/今回決めること[:：]?[ \t]*\n*[-*\s]*([^\n]+)/);
           if (am) {
@@ -2319,13 +2581,23 @@ async function agentLoop(topicId, agent) {
         registerDeclaredArtifacts(text, agent, topicId, replyMsg.id); // 宣言に基づく成果物の確定登録
         ta.fileSnapshot = curSnapshot; // 変更通知の基準を今回時点へ進める
         markTranscriptSynced(topic, agent); // 自分の応答分は外部同期の対象外にする
-        qaHop(topic, agent, text, replyMsg.id);
+        if (stale) {
+          logEvent("qa", `${NAMES[agent]} の応答は停止済みの質疑（${relayIdAtStart}）宛てのため中継しません`, "warn");
+        } else if (stopped) {
+          // 中断した応答は正常完了ではない: 相手へ中継せず、自分の手番のリレーなら止める（次の手番を空回りさせない）。
+          // 停止理由は lib の RELAY_STOP_REASONS / UI の表示名にある "cancelled"（実行を中断）を共用する（独自の理由は増やさない）
+          if (relayLive) stopRelay(topic, "cancelled");
+        } else if (relayLive) {
+          qaHop(topic, agent, text, replyMsg.id);
+        }
       } catch (e) {
-        topic.relay.active = false; // エラー/キャンセルで質疑が空回りしないよう停止
+        // エラー/キャンセルで質疑が空回りしないよう停止（この実行の手番のリレーに限る。別リレーは触らない）
+        if (sameRelay()) stopRelay(topic, e.cancelled ? "cancelled" : "error");
         ta.lastSeenTs = msgs[msgs.length - 1].ts; // 同じメッセージで無限リトライしない
         if (e.cancelled) {
           // キャンセル: エラーではなく cancelled として記録し、セッションは interrupted 扱いに
-          needsRun[key] = false;
+          // （この実行の開始後に新しい起動要求（新リレー開始など）が届いていれば needsRun は残す）
+          if ((needsRunGen[key] || 0) === genAtRunStart) needsRun[key] = false;
           const interruptedId = run.sessionId || e.sessionId || ta.sessionId;
           if (interruptedId) {
             ta.interruptedSessionId = interruptedId;
@@ -2363,7 +2635,9 @@ async function agentLoop(topicId, agent) {
 function maybeTrigger(messages) {
   for (const m of messages) {
     if (!AGENTS.includes(m.thread) || m.author === m.thread) continue;
-    if (agentAutoOn(m.thread) && findTopic(m.topicId)) agentLoop(m.topicId, m.thread);
+    const t = findTopic(m.topicId);
+    if (!t || !(t.participants || LEGACY_AGENTS).includes(m.thread)) continue; // 参加者でない宛先は起動しない
+    if (agentAutoOn(m.thread)) agentLoop(m.topicId, m.thread);
   }
 }
 
@@ -2378,9 +2652,10 @@ function collectModels() {
   // エイリアス＋この環境で指定が通ることを検証済みのモデルをベースラインに
   const claude = new Set(["opus", "sonnet", "haiku", "fable"]);
   const codex = new Set(["gpt-6-astra"]);
+  const grok = new Set(["grok-4.6-build"]); // 工程 0 の実測既定モデル
   const harvest = (meta) => {
     if (!meta || !meta.model) return;
-    (meta.model.startsWith("claude") ? claude : codex).add(meta.model);
+    (meta.model.startsWith("claude") ? claude : meta.model.startsWith("grok") ? grok : codex).add(meta.model);
   };
   for (const m of state.messages) harvest(m.meta);
   for (const p of state.pool) {
@@ -2413,9 +2688,24 @@ function collectModels() {
   } catch (e) {
     logEvent("cli", "codex rollout のモデル走査に失敗: " + (e.message || e), "warn");
   }
-  modelsCache = { claude: [...claude], codex: [...codex].sort() };
+  modelsCache = { claude: [...claude], codex: [...codex].sort(), grok: [...grok].sort() };
   modelsCacheTs = Date.now();
   return modelsCache;
+}
+
+// 参加者指定の検証: 省略時は「自動応答 ON かつ認証済み」の全員。grok は authed === true のときだけ選べる
+function validateParticipants(requested) {
+  if (requested === undefined || requested === null) {
+    const ready = AGENTS.filter((a) => state.agents[a] && state.agents[a].auto && state.agents[a].authed === true);
+    return { participants: ready.length ? ready : LEGACY_AGENTS.slice() };
+  }
+  if (!Array.isArray(requested) || !requested.length) return { error: "participants は 1 名以上の配列で指定してください" };
+  const unknown = requested.find((a) => !AGENTS.includes(a));
+  if (unknown) return { error: `不明なエージェント: ${unknown}` };
+  if (requested.includes("grok") && state.agents.grok.authed !== true) {
+    return { error: state.agents.grok.authed === null ? "Grok の認証を確認中です（「再確認」の後に選べます）" : "Grok が未認証です（grok login の後に「再確認」してください）", reason: "unauthed" };
+  }
+  return { participants: [...new Set(requested)] };
 }
 
 // ---- API ----
@@ -2446,9 +2736,18 @@ async function handleApi(req, res, url) {
     const topic = findTopic(body.topicId) || state.topics[0];
     if (!author || !text) return json(res, 400, { error: "author と text は必須です" });
     if (!topic) return json(res, 400, { error: "トピックがありません" });
-    // user は thread:"both" で両スレッドに同報できる
-    const threads = thread ? [thread] : body.thread === "both" && author === "user" ? AGENTS : null;
-    if (!threads) return json(res, 400, { error: "thread は claude / codex / both(userのみ)" });
+    const parts = topic.participants || LEGACY_AGENTS;
+    // 宛先: 参加者のいずれか／"both"（claude＋codex。両方が参加者のときのみ）／"all"（参加者全員）
+    let threads = null;
+    if (thread) threads = parts.includes(thread) ? [thread] : null;
+    else if (body.thread === "both" && author === "user" && LEGACY_AGENTS.every((a) => parts.includes(a))) threads = LEGACY_AGENTS.slice();
+    else if (body.thread === "all" && author === "user") threads = parts.slice();
+    if (!threads) return json(res, 400, { error: `thread はこのトピックの参加者（${parts.join(" / ")}）/ both / all(userのみ)` });
+    // 送信前に全宛先を検証し、一部だけ届く状態を作らない（未認証・確認中の Grok 宛ては理由付きで拒否）
+    if (threads.includes("grok") && state.agents.grok.authed !== true) {
+      const why = state.agents.grok.authed === null ? "Grok の認証を確認中です（ヘッダの「再確認」で判定できます）" : "Grok が未認証です（grok login の後に「再確認」してください）";
+      return json(res, 400, { error: why, reason: "unauthed", agent: "grok" });
+    }
     const created = threads.map((t) => ({
       id: id(),
       topicId: topic.id,
@@ -2472,7 +2771,8 @@ async function handleApi(req, res, url) {
     if (run.kind !== "thread" && run.kind !== "summary")
       return json(res, 400, { error: "キャンセルできるのはスレッド応答と要約のみです" });
     const topic = findTopic(run.topicId);
-    if (topic) topic.relay = defaultRelay(); // 質疑リレーも止める
+    // 質疑リレーも止める。defaultRelay() での全消去はせず、停止理由・進行記録（id/spoken）を保持する
+    if (topic && topic.relay && topic.relay.active) stopRelay(topic, "cancelled");
     needsRun[runKey(run.topicId, run.agent)] = false;
     if (run.ctl.cancel) run.ctl.cancel();
     touch();
@@ -2516,10 +2816,16 @@ async function handleApi(req, res, url) {
     const body = await readBody(req);
     const src = state.messages.find((m) => m.id === body.messageId);
     if (!src || !AGENTS.includes(src.thread)) return json(res, 404, { error: "元メッセージが見つかりません" });
+    // 宛先は明示（候補が 1 名のときだけ省略可）。送信元・宛先とも参加者であること
+    const srcTopic = findTopic(src.topicId);
+    const candidates = srcTopic ? peers(srcTopic, src.thread) : [];
+    const toAgent = typeof body.toAgent === "string" ? body.toAgent : candidates.length === 1 ? candidates[0] : null;
+    if (!toAgent || !candidates.includes(toAgent)) return json(res, 400, { error: `toAgent を指定してください（候補: ${candidates.join(" / ") || "なし"}）` });
+    if (toAgent === "grok" && state.agents.grok.authed !== true) return json(res, 400, { error: "Grok が未認証（または確認中）です", reason: "unauthed", agent: "grok" });
     const copy = {
       id: id(),
       topicId: src.topicId,
-      thread: OTHER[src.thread],
+      thread: toAgent,
       author: src.author,
       text: src.text,
       provenance: {
@@ -2541,10 +2847,16 @@ async function handleApi(req, res, url) {
     const body = await readBody(req);
     const src = state.messages.find((m) => m.id === body.messageId);
     if (!src || !AGENTS.includes(src.thread)) return json(res, 404, { error: "元メッセージが見つかりません" });
+    // 宛先は明示（候補が 1 名のときだけ省略可）。送信元・宛先とも参加者であること
+    const srcTopic = findTopic(src.topicId);
+    const candidates = srcTopic ? peers(srcTopic, src.thread) : [];
+    const toAgent = typeof body.toAgent === "string" ? body.toAgent : candidates.length === 1 ? candidates[0] : null;
+    if (!toAgent || !candidates.includes(toAgent)) return json(res, 400, { error: `toAgent を指定してください（候補: ${candidates.join(" / ") || "なし"}）` });
+    if (toAgent === "grok" && state.agents.grok.authed !== true) return json(res, 400, { error: "Grok が未認証（または確認中）です", reason: "unauthed", agent: "grok" });
     const copy = {
       id: id(),
       topicId: src.topicId,
-      thread: OTHER[src.thread],
+      thread: toAgent,
       author: src.author,
       text: src.text,
       provenance: {
@@ -2604,7 +2916,10 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/topics") {
     const body = await readBody(req);
     const title = typeof body.title === "string" && body.title.trim() ? body.title.trim().slice(0, 60) : "新しいスレッド";
-    const topic = defaultTopic(title);
+    // 参加者: 指定があればそれ（1 名以上・対応エージェント・grok は認証済み）。省略時は自動応答 ON かつ認証済みの全員
+    const pv = validateParticipants(body.participants);
+    if (pv.error) return json(res, 400, { error: pv.error, reason: pv.reason });
+    const topic = defaultTopic(title, pv.participants);
     if (body.projectId) {
       if (!findProject(body.projectId)) return json(res, 400, { error: "未登録の projectId です" });
       topic.projectId = body.projectId;
@@ -2642,7 +2957,10 @@ async function handleApi(req, res, url) {
       const body = await readBody(req);
       const at = state.messages.find((m) => m.id === body.messageId && m.topicId === topic.id);
       if (!at) return json(res, 404, { error: "分岐点のメッセージが見つかりません" });
-      const branched = defaultTopic(topic.title.slice(0, 50) + "＃分岐");
+      // 参加者: 省略時は分岐元を継承（招待の代替: 新セッション＋要約から参加し、過去発言を再処理しない）。継承分も明示指定と同じ検証を通す（未認証 Grok を含む分岐は拒否）
+      const bpv = validateParticipants(body.participants === undefined ? (topic.participants || LEGACY_AGENTS).slice() : body.participants);
+      if (bpv.error) return json(res, 400, { error: bpv.error, reason: bpv.reason });
+      const branched = defaultTopic(topic.title.slice(0, 50) + "＃分岐", bpv.participants);
       branched.branchedFrom = { topicId: topic.id, messageId: at.id };
       // 対象プロジェクト: 省略時は継承
       if (body.projectId !== undefined && body.projectId !== null && !findProject(body.projectId)) return json(res, 400, { error: "未登録の projectId です" });
@@ -2668,7 +2986,7 @@ async function handleApi(req, res, url) {
         }));
       branched.summaryAt = copies.length;
       // 分岐直後に旧履歴へ自動応答が走らないよう、既読位置を分岐時点に合わせる
-      for (const a of AGENTS) branched.agents[a].lastSeenTs = Date.now();
+      for (const a of branched.participants) branched.agents[a].lastSeenTs = Date.now();
       state.topics.push(branched);
       state.messages.push(...copies);
       touch();
@@ -2687,7 +3005,7 @@ async function handleApi(req, res, url) {
       // 要約の出所（summaryProjectId）は触らない — 現在の対象と違えば初回プロンプトで注記される
       if (setProject) topic.projectId = body.projectId;
       // CLI セッションのリセット（次の応答から新セッション。codex は新方式 cwd=pool で始まる）
-      if (AGENTS.includes(body.resetAgent)) {
+      if (AGENTS.includes(body.resetAgent) && topic.agents[body.resetAgent]) {
         const ta = topic.agents[body.resetAgent];
         ta.sessionId = null;
         ta.transcriptOffset = null;
@@ -2696,7 +3014,7 @@ async function handleApi(req, res, url) {
         delete ta.interruptedPoolCwd;
       }
       // 中断（キャンセル）したセッションの明示的な再開
-      if (AGENTS.includes(body.resumeInterrupted)) {
+      if (AGENTS.includes(body.resumeInterrupted) && topic.agents[body.resumeInterrupted]) {
         const ta = topic.agents[body.resumeInterrupted];
         if (ta.interruptedSessionId) {
           ta.sessionId = ta.interruptedSessionId;
@@ -2806,6 +3124,7 @@ async function handleApi(req, res, url) {
       origin: "user",
       topicId: topicIdFromPath(name),
       projectId: projectIdOfTopic(topicIdFromPath(name)),
+      reviewers: reviewersFor(topicIdFromPath(name), "user").reviewers,
       via: "created",
       status: "submitted",
       reviews: [],
@@ -2831,6 +3150,8 @@ async function handleApi(req, res, url) {
       ensureTopicDir(bodyTopic.id);
     }
     if (!origin || !title || !text) return json(res, 400, { error: "origin / title / body は必須です" });
+    const rv = reviewersFor(bodyTopic ? bodyTopic.id : null, origin, body.reviewers);
+    if (rv.error) return json(res, 400, { error: rv.error });
     // filename 指定があれば拡張子ごと尊重（コードブロック保存用）。なければ .md
     const fname =
       typeof body.filename === "string" && body.filename.trim() ? sanitizeSegment(body.filename.trim()) : title + ".md";
@@ -2846,6 +3167,7 @@ async function handleApi(req, res, url) {
       origin,
       topicId: topicIdFromPath(name) || (bodyTopic ? bodyTopic.id : null),
       projectId: projectIdOfTopic(topicIdFromPath(name) || (bodyTopic ? bodyTopic.id : null)),
+      reviewers: rv.reviewers,
       status: "submitted",
       reviews: [],
       fromMessageId: typeof body.fromMessageId === "string" ? body.fromMessageId : null,
@@ -2854,9 +3176,8 @@ async function handleApi(req, res, url) {
     };
     state.pool.push(item);
     touch();
-    // 持ち込み元でない側が自動レビュー（ユーザー持ち込みは両エージェント）
-    const reviewers = origin === "user" ? AGENTS : [OTHER[origin]];
-    if (body.autoReview !== false) for (const r of reviewers) runReview(item.id, r);
+    // 依頼先（既定: 作者以外の参加者。ユーザー持ち込みは参加者全員）へ自動レビュー。実行できない相手は skipped で記録
+    if (body.autoReview !== false) for (const r of item.reviewers) runReview(item.id, r, { auto: true });
     return json(res, 201, item);
   }
 
@@ -2868,6 +3189,8 @@ async function handleApi(req, res, url) {
     if (typeof body.dataBase64 !== "string") return json(res, 400, { error: "dataBase64 は必須です" });
     const data = Buffer.from(body.dataBase64, "base64");
     const upTopic = findTopic(body.topicId) || state.topics[0];
+    const urv = reviewersFor(upTopic ? upTopic.id : null, origin, body.reviewers);
+    if (urv.error) return json(res, 400, { error: urv.error });
     let upDir = typeof body.dir === "string" ? body.dir : "";
     if (!upDir && upTopic) {
       upDir = topicDirRel(upTopic.id);
@@ -2885,6 +3208,7 @@ async function handleApi(req, res, url) {
       origin,
       topicId: topicIdFromPath(name) || (upTopic ? upTopic.id : null),
       projectId: projectIdOfTopic(topicIdFromPath(name) || (upTopic ? upTopic.id : null)),
+      reviewers: urv.reviewers,
       via: "upload",
       status: "submitted",
       reviews: [],
@@ -2894,7 +3218,7 @@ async function handleApi(req, res, url) {
     state.pool.push(item);
     touch();
     if (body.autoReview === true) {
-      for (const r of origin === "user" ? AGENTS : [OTHER[origin]]) runReview(item.id, r);
+      for (const r of item.reviewers) runReview(item.id, r, { auto: true });
     }
     return json(res, 201, item);
   }
@@ -2968,9 +3292,11 @@ async function handleApi(req, res, url) {
     if (req.method === "POST" && parts[3] === "review") {
       const body = await readBody(req);
       const reviewer = AGENTS.includes(body.reviewer) ? body.reviewer : null;
-      if (!reviewer) return json(res, 400, { error: "reviewer は claude / codex" });
+      if (!reviewer) return json(res, 400, { error: "reviewer は " + AGENTS.join(" / ") });
+      if (!participantsOfTopic(item.topicId).includes(reviewer)) return json(res, 400, { error: `${NAMES[reviewer]} はこの成果物のトピックの参加者ではありません` });
+      if (reviewer === "grok" && state.agents.grok.authed !== true) return json(res, 400, { error: "Grok が未認証（または確認中）です", reason: "unauthed", agent: "grok" });
       if (fixPending[item.id]) return json(res, 409, { error: "このアイテムは修正実行中です（完了後にレビューしてください）" });
-      runReview(item.id, reviewer);
+      runReview(item.id, reviewer, { offline: body.offline === true });
       return json(res, 202, { ok: true });
     }
 
@@ -2978,11 +3304,13 @@ async function handleApi(req, res, url) {
     if (req.method === "POST" && parts[3] === "fix") {
       const body = await readBody(req);
       const agent = AGENTS.includes(body.agent) ? body.agent : null;
-      if (!agent) return json(res, 400, { error: "agent は claude / codex" });
+      if (!agent) return json(res, 400, { error: "agent は " + AGENTS.join(" / ") });
+      if (!participantsOfTopic(item.topicId).includes(agent)) return json(res, 400, { error: `${NAMES[agent]} はこの成果物のトピックの参加者ではありません` });
+      if (agent === "grok" && state.agents.grok.authed !== true) return json(res, 400, { error: "Grok が未認証（または確認中）です", reason: "unauthed", agent: "grok" });
       if (!item.file) return json(res, 400, { error: "ファイル実体のない旧形式アイテムは修正できません" });
       if (fixPending[item.id]) return json(res, 409, { error: "このアイテムは修正実行中です" });
       if (reviewPending[item.id]) return json(res, 409, { error: "このアイテムはレビュー実行中です（完了後に修正してください）" });
-      runFix(item.id, agent);
+      runFix(item.id, agent, { offline: body.offline === true });
       return json(res, 202, { ok: true });
     }
 
@@ -3017,16 +3345,32 @@ async function handleApi(req, res, url) {
     const hops = Math.min(20, Math.max(1, Number(body.hops) || 6));
     if (!first || !text) return json(res, 400, { error: "first と text は必須です" });
     if (state.budgetHalt) return json(res, 400, { error: "上限停止中です（バナーから解除してください）" });
-    if (!state.agents.claude.auto || !state.agents.codex.auto)
-      return json(res, 400, { error: "質疑モードには両スレッドの自動応答をONにしてください" });
     const qaTopic = findTopic(body.topicId) || state.topics[0];
     if (!qaTopic) return json(res, 400, { error: "トピックがありません" });
+    // 参加者（順序付き）: 省略時はトピック参加者全員を first から始まる順に。指定時は first を先頭に置く
+    const tparts = qaTopic.participants || LEGACY_AGENTS;
+    let order = Array.isArray(body.participants) && body.participants.length ? [...new Set(body.participants)] : tparts.slice();
+    if (!order.includes(first)) return json(res, 400, { error: "first は参加者に含めてください" });
+    order = [first, ...order.filter((a) => a !== first)];
+    if (order.length < 2) return json(res, 400, { error: "質疑には 2 名以上の参加者が必要です" });
+    const outsider = order.find((a) => !tparts.includes(a));
+    if (outsider) return json(res, 400, { error: `${NAMES[outsider] || outsider} はこのトピックの参加者ではありません` });
+    const off = order.find((a) => !state.agents[a].auto);
+    if (off) return json(res, 400, { error: `質疑モードには参加者全員の自動応答を ON にしてください（${NAMES[off]} が OFF）` });
+    if (order.includes("grok") && state.agents.grok.authed !== true) return json(res, 400, { error: "Grok が未認証（または確認中）のため質疑を開始できません", reason: "unauthed", agent: "grok" });
     qaTopic.relay = {
+      ...defaultRelay(),
       active: true,
       remaining: hops,
       hopsDone: 0,
       startMessageId: null,
       agenda: typeof body.agenda === "string" ? body.agenda.trim().slice(0, 120) : "",
+      id: "r_" + id(),
+      participants: order,
+      turn: 0,
+      seq: 0,
+      spoken: Object.fromEntries(order.map((a) => [a, 0])),
+      stopReason: null,
     };
     qaTopic.qaCount = (qaTopic.qaCount || 0) + 1;
     qaTopic.projectLocked = true; // 質疑の開始も実行の開始
@@ -3059,7 +3403,7 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/qa/stop") {
     const body = await readBody(req);
     const qaTopic = findTopic(body.topicId) || state.topics[0];
-    if (qaTopic) qaTopic.relay = defaultRelay();
+    if (qaTopic) stopRelay(qaTopic, "manual");
     touch();
     return json(res, 200, { relay: qaTopic ? qaTopic.relay : defaultRelay() });
   }
@@ -3069,7 +3413,8 @@ async function handleApi(req, res, url) {
     const a = state.agents[parts[2]];
     if (typeof body.auto === "boolean") {
       a.auto = body.auto;
-      if (body.auto) for (const t of state.topics) t.agents[parts[2]].lastSeenTs = Date.now(); // ON にした時点から先の新着のみ拾う
+      // ON にした時点から先の新着のみ拾う。参加しているトピックだけ（旧トピックには grok のセッション状態がない）
+      if (body.auto) for (const t of state.topics) if (t.agents[parts[2]]) t.agents[parts[2]].lastSeenTs = Date.now();
       a.lastError = "";
     }
     if (typeof body.model === "string") {
@@ -3078,6 +3423,13 @@ async function handleApi(req, res, url) {
     }
     touch();
     return json(res, 200, a);
+  }
+
+  // Grok の認証再判定（~/.grok/auth.json の存在＋軽量プローブ）
+  if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" && parts[2] === "grok" && parts[3] === "check-auth") {
+    const ok = await checkGrokAuth();
+    const g = state.agents.grok;
+    return json(res, 200, { authed: ok, checkedTs: g ? g.authCheckedTs : 0, message: ok ? "" : (g && g.lastError) || "未認証" });
   }
 
   if (req.method === "POST" && url.pathname === "/api/tasks") {
@@ -3194,5 +3546,6 @@ saveState();
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`U2A2A Orchestration: http://127.0.0.1:${PORT}`);
-  logEvent("system", "サーバー起動（schemaVersion 6）", "info");
+  logEvent("system", "サーバー起動（schemaVersion 7）", "info");
+  if (state.agents.grok) checkGrokAuth().catch((e) => logEvent("cli", "Grok の認証確認に失敗: " + (e.message || e), "warn"));
 });

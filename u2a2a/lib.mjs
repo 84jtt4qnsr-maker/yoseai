@@ -339,3 +339,115 @@ export function summaryOriginNote(topic, label) {
     notes.push("（注意: 引き継いだ会話には対象「" + label(carried) + "」の時点の内容が含まれます。現在の対象は「" + label(now) + "」です）");
   return notes.length ? notes.join("\n") + "\n" : "";
 }
+
+// ---- 多者構成（Grok 参戦。仕様: SPEC-Grok参戦.md。純関数のみ、I/O は server 側）----
+
+// エージェント定義（正）。AGENTS / AUTHORS / NAMES はここから派生する
+export const AGENT_DEFS = {
+  claude: { name: "Claude Code", cssVar: "--claude" },
+  codex: { name: "Codex", cssVar: "--codex" },
+  grok: { name: "Grok", cssVar: "--grok", color: "#b99aff" },
+};
+export const LEGACY_AGENTS = ["claude", "codex"]; // 旧トピックの参加者・thread:"both" の意味
+export const RELAY_STOP_REASONS = ["agreed", "hops", "budget", "error", "cancelled", "auto-off", "unauthed", "manual"];
+
+// 参加者のうち自分以外
+export function peersOf(participants, agent) {
+  return (participants || []).filter((a) => a !== agent);
+}
+
+// レビュー依頼先の既定: 作者以外の参加者。ユーザー作者は参加者全員。参加者が無ければ旧来の 2 名
+export function defaultReviewers(participants, origin) {
+  const base = participants && participants.length ? participants : LEGACY_AGENTS;
+  return origin === "user" || !origin ? base.slice() : peersOf(base, origin);
+}
+
+// 次の手番（参加者数で循環）
+export function nextTurn(relay) {
+  const n = (relay.participants || []).length;
+  return n ? (relay.turn + 1) % n : 0;
+}
+
+// 終了宣言の有効判定: マーカーがあり、かつ参加者全員が開始以降に 1 回以上発言している
+export function canEndRelay(relay, text, mark) {
+  if (!text || !text.includes(mark)) return false;
+  const spoken = relay.spoken || {};
+  return (relay.participants || []).every((a) => (spoken[a] || 0) >= 1);
+}
+
+// 未読の切り詰め: 末尾 max 件と、落とした件数
+export function clipBacklog(msgs, max) {
+  const list = msgs || [];
+  if (list.length <= max) return { msgs: list, dropped: 0 };
+  return { msgs: list.slice(-max), dropped: list.length - max };
+}
+
+// 質疑の配送コピーを relayId + seq で重複排除（turn は循環するのでキーにしない）
+export function dedupeRelayCopies(msgs) {
+  const seen = new Set();
+  return (msgs || []).filter((m) => {
+    const s = m.provenance && m.provenance.delivery === "qa-relay" ? m.provenance.source : null;
+    if (!s || s.relayId == null || s.seq == null) return true;
+    const key = s.relayId + ":" + s.seq;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// Grok streaming-json（NDJSON）の解析。text デルタの連結・end の最終メタ・error 行・実況ステップ
+// 実測（smoke-Grok工程0.md）: thought / text（デルタ）/ usage / tool_call / tool_call_update / end
+export function parseGrokStream(lines) {
+  let text = "";
+  let end = null;
+  let error = null;
+  const steps = [];
+  for (const raw of lines || []) {
+    const line = String(raw || "").trim();
+    if (!line) continue;
+    let ev;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!ev || typeof ev !== "object") continue;
+    if (ev.type === "text") text += String(ev.data ?? ev.delta ?? ev.text ?? ev.content ?? ""); // 実測: デルタは data フィールド（thought と同形）
+    else if (ev.type === "end") end = ev;
+    else if (ev.type === "error") error = String(ev.message || ev.error || "grok エラー");
+    const s = grokStepFrom(ev);
+    if (s) steps.push(s);
+  }
+  // end に本文が含まれる形式（json 形式の text）にも対応
+  if (!text && end && typeof end.text === "string") text = end.text;
+  return { text, end, error, steps };
+}
+
+export function grokStepFrom(ev) {
+  if (!ev) return null;
+  if (ev.type === "thought") return "🧠 思考中";
+  if (ev.type === "tool_call") return "🔧 " + String(ev.title || ev.toolName || "tool").slice(0, 70);
+  if (ev.type === "text") return "✍ 応答を作成中";
+  return null;
+}
+
+// end イベント → 共通 meta。cancelled は「権限要求または中断で停止」（成功扱いにしない）。費用が無ければ unknown（0 円とみなさない）
+export function grokMetaFrom(end, durationMs, modelOverride) {
+  const e = end || {};
+  const u = e.usage || {};
+  const model = Object.keys(e.modelUsage || {})[0] || modelOverride || "";
+  return {
+    status: e.stopReason === "cancelled" ? "stopped" : "completed",
+    model,
+    durationMs,
+    usage: { inTok: u.input_tokens || 0, outTok: u.output_tokens || 0, cacheTok: u.cache_read_input_tokens || 0 },
+    billing: typeof e.total_cost_usd === "number" ? { mode: "metered", usd: e.total_cost_usd } : { mode: "unknown" },
+  };
+}
+
+export const GROK_STOP_NOTE = "Grok が権限要求または中断で停止しました（許可されていない操作の可能性）";
+
+// 未認証のエラー文かどうか
+export function isGrokUnauthedError(text) {
+  return /not signed in|unauthenticated|please (log|sign) ?in/i.test(String(text || ""));
+}

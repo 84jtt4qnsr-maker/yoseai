@@ -4,6 +4,6 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test --test-concurrency=1 test/*.test.mjs"
   }
 }

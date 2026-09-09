@@ -1,7 +1,7 @@
 # U2A2A Orchestration
 
 Canvas「U2A2A app イメージ」を実装したローカルアプリ。
-ユーザー ⇄ Claude Code ⇄ Codex の三者テキストオーケストレーション＋タスクキュー。
+ユーザー ⇄ Claude Code ⇄ Codex ⇄ Grok のテキストオーケストレーション＋タスクキュー（参加者はトピックごとに選ぶ）。
 
 ## 起動
 
@@ -161,6 +161,31 @@ node u2a2a/server.mjs
   サーバが通常応答・レビュー・修正の全プロンプトに注入する。DAS 内にあるので
   ユーザーはプールから閲覧でき、編集すれば次の実行から反映される（初回起動時に既定内容を自動生成）
 - 既存ファイルは移動しない（topicId / origin の情報補完のみ。移動は今後ユーザー判断で）
+
+## 第 3 のエージェント Grok と参加者制
+
+xAI Grok（Grok Build CLI）を加え、**トピックごとに参加者を選ぶ**多者構成にした。既存の 2 名トピックは挙動を変えない。
+
+- **参加者**: 新規スレッド作成・🌿分岐で選ぶ（既定: 自動応答 ON かつ認証済みの全員）。作成後は固定。
+  旧トピックは claude / codex の 2 名のまま。Grok は新規参加で、過去には遡らない（途中招待は分岐で代替）
+- **Grok の起動**: `grok --prompt-file <一時ファイル> --output-format streaming-json [--resume <id>]`。
+  書き込みは `--allow "Edit(u2a2a/pool/**)"`（claude 互換書式）で pool に限定し、`--disallowed-tools spawn_subagent`。
+  レビューは `--sandbox read-only`。権限は resume でも毎回渡す（継承されない）。`stopReason: "cancelled"` は
+  「権限要求または中断で停止」として赤字表示し、本文・トークン・費用は保持する
+- **認証**: `~/.grok/auth.json` の存在＋軽量プローブで判定（起動時と「再確認」）。未認証・確認中の Grok は
+  参加者・宛先として選べず、Grok 宛ての送信・依頼は送信前に理由付きで拒否される
+- **質疑リレー**: 2 名でも 3 名でも同じ機構。開始時に手番順を固定し、各応答を他の参加者全員へ配送、手番の 1 名だけを起動する。
+  `【質疑終了】` は参加者全員が 1 回以上発言した後のみ有効。停止理由（`agreed`／`hops`／`budget`／`error`／`cancelled`／
+  `auto-off`／`unauthed`／`manual`）を記録する。終了後に残った配送コピーは「終了した質疑の経緯・返信不要」として次の応答に渡す。
+  未読が 10 件を超えた分は捨てず、件数とミラーの参照先をプロンプトに添える
+- **レビュー依頼先**: 既定は「作者以外の参加者」（ユーザー持ち込みは参加者全員）。持ち込み時に変更でき、成果物に保存される。
+  実行できない相手（未認証・自動応答 OFF・上限）は「未実施」として記録し、レビュー済みに数えない。修正後は実際にレビューした人へ再依頼
+- **転送・引き継ぎ**: 3 名時は宛先（`toAgent`）を明示。候補が 1 名なら省略可
+- **オフライン指定**: レビュー・修正依頼の `offline: true` で Grok は `--disable-web-search`、他は「検索を使わない」注記。
+  検索を使った場合は出典を本文に示す（共通ルール）
+- **API**: `POST /api/topics { participants? }`、`POST /api/topics/:id/branch { participants? }`、`POST /api/messages { thread: <参加者> | "both" | "all" }`、
+  `POST /api/relay|handoff { toAgent? }`、`POST /api/qa/start { participants? }`、`POST /api/pool { reviewers? }`、
+  `POST /api/pool/:id/review|fix { offline? }`、`POST /api/agents/grok/check-auth`。`GET /api/state` に `agentDefs`（名前・色）を同梱
 
 ## ローカルプロジェクト登録とトピック紐付け
 
