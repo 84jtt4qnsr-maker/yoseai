@@ -369,8 +369,51 @@ export function nextTurn(relay) {
 }
 
 // 終了宣言の有効判定: マーカーがあり、かつ参加者全員が開始以降に 1 回以上発言している
+// 終了マーカーの有効判定: 空行を除いた最終行の末尾にマーカーがそのまま書かれている場合のみ有効
+// （文末直結「賛成です【質疑終了】」・単独行・箇条書き「- 【質疑終了】」は可）。
+// 受理しない形: 文中・否定文（実例:「ここではまだ【質疑終了】しません」）、マーカー後に本文が続く、
+// 引用行（>）、鉤括弧・括弧・インラインコード・取消線で包んだ言及、コードブロック内
+// （``` と ~~~ のフェンスを種類・長さ・開閉で追跡。CommonMark 同様、開いたフェンスは同種・同長以上でのみ閉じる）、
+// 4 スペース以上のインデント行（コード表記とみなす）。
+// 末尾に許容するのは空白・Markdown 強調（* _）・句読点（。．.!！）のみ。閉じ括弧・バッククォート・~ は不可
+const END_MARK_TAIL = /[\s*_。．.!！]*$/;
+const END_MARK_WRAP = /[「『（(［\[｢"'“‘`~]$/; // マーカー直前にあれば「包んだ言及」
+export function hasEndMark(text, mark) {
+  if (!text || !mark) return false;
+  const rawLines = String(text).split(/\r?\n/);
+  let fence = null; // 開いているフェンス { ch, len } | null
+  let lastIdx = -1;
+  let lastInCode = false;
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i];
+    const m = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (m) {
+      const ch = m[1][0];
+      const len = m[1].length;
+      if (!fence) fence = { ch, len };
+      else if (ch === fence.ch && len >= fence.len) fence = null;
+      if (line.trim()) {
+        lastIdx = i;
+        lastInCode = true; // フェンス行自体は終了宣言の行にならない
+      }
+      continue;
+    }
+    if (line.trim()) {
+      lastIdx = i;
+      lastInCode = !!fence || /^( {4}|\t)/.test(line);
+    }
+  }
+  if (lastIdx < 0 || lastInCode) return false;
+  const last = rawLines[lastIdx].trim();
+  if (last.startsWith(">")) return false;
+  const body = last.replace(END_MARK_TAIL, "");
+  if (!body.endsWith(mark)) return false;
+  return !END_MARK_WRAP.test(body.slice(0, -mark.length));
+}
+
+// 終了宣言の有効判定: 最終行末尾のマーカー（hasEndMark）があり、かつ参加者全員が開始以降に 1 回以上発言している
 export function canEndRelay(relay, text, mark) {
-  if (!text || !text.includes(mark)) return false;
+  if (!hasEndMark(text, mark)) return false;
   const spoken = relay.spoken || {};
   return (relay.participants || []).every((a) => (spoken[a] || 0) >= 1);
 }

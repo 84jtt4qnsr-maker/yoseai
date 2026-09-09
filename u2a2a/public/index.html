@@ -636,6 +636,7 @@
   /* 狭い画面では従来の上下配置に戻す */
   @media (max-width: 1100px) {
     #content { display: flex; flex-direction: column; }
+    #pool-widen { display: none; } /* 縦積みでは幅比が効かないため列の「広げる」と同様に隠す */
     main { flex: 1; }
     #pool-zone { border-left: none; border-top: 2px solid var(--line); flex: none; max-height: 40vh; }
     #pool-list-wrap { width: 210px; }
@@ -816,7 +817,11 @@
   main { grid-template-columns: var(--thread-tracks, 1fr 1fr); }
   body.three-agents #content { grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr); }
   body.three-agents.pool-collapsed #content { grid-template-columns: minmax(0, 1fr) auto; }
+  /* プール拡幅（列の「広げる」と同じ流儀: 手動・折りたたみで解除・記憶はメモリのみ）。2名/3名共通で最後に勝つ */
+  body.pool-widened:not(.pool-collapsed) #content { grid-template-columns: minmax(0, 1fr) minmax(300px, 2fr); }
   .thread-head { flex-wrap: wrap; }
+  .widen-column { display: none; }
+  body.three-agents .widen-column { display: inline-block; }
   .thread-col .thread-head .role-dot, .thread-rail .role-dot { background: var(--agent-color); }
   .thread-rail { flex: 1; display: flex; align-items: center; flex-direction: column; gap: 12px; border-radius: 0; padding: 10px 4px; min-height: 0; }
   .thread-rail[hidden] { display: none; }
@@ -841,6 +846,7 @@
   #qa-status[data-reason]:not([data-reason="agreed"]):not([data-reason=""]) { color: var(--danger); }
   .stopped-note { color: var(--danger); }
   @media (max-width: 1100px) {
+    body.three-agents .widen-column { display: none; }
     body.three-agents main { display: flex; flex-direction: column; overflow-y: auto; }
     body.three-agents main .thread-col { flex: 1 0 260px; min-height: 260px; border-left: none; border-top: 1px solid var(--line); }
     body.three-agents main .thread-col.is-folded { flex: 0 0 44px; min-height: 44px; }
@@ -901,6 +907,7 @@
     共有タスクプール
     <span class="sub" id="pool-count"></span>
     <button id="pool-add">＋ 持ち込み</button>
+    <button id="pool-widen" class="small">広げる</button>
     <button id="pool-toggle" class="small">折りたたむ</button>
   </div>
   <div id="pool-body">
@@ -1507,6 +1514,8 @@ const agentColor = (id) => /^--[a-z][a-z0-9-]*$/.test(agentDefs()[id]?.cssVar ||
 let columnTopic = null;
 const columnDrafts = new Map();
 const foldedColumns = new Map();
+const widenedColumns = new Map(); // topicId -> agent。表示だけの指定で、リロード時に消える。
+const narrowColumnLayout = matchMedia("(max-width: 1100px)"); // 縦積みCSSの境界と揃える。
 let qaChoice = { topicId: null, order: [] };
 let poolDialogTopicId = null;
 let poolDialogDir = "";
@@ -1584,6 +1593,7 @@ function createThreadColumn(agent) {
     el("span", { class: "agent-status", id: "status-" + agent }),
     el("button", { class: "small", id: "reset-" + agent, text: "⟳", title: "CLIセッションをリセット" }),
     el("label", { class: "auto-ctl" }, [el("input", { type: "checkbox", id: "auto-" + agent }), document.createTextNode("自動応答")]),
+    el("button", { type: "button", class: "small widen-column", text: "広げる", onclick: () => toggleWideColumn(agent) }),
     el("button", { class: "small fold-column", text: "折りたたむ", onclick: () => toggleColumn(agent) }),
   ]);
   const rail = el("button", { class: "thread-rail", hidden: "", onclick: () => toggleColumn(agent) }, [
@@ -1635,23 +1645,61 @@ function ensureAgentColumns() {
   applyColumnLayout();
 }
 
+// 幅が変わる前の末尾追従だけを保存する。別トピック・隠れた列は引き継がない。
+function captureThreadBottoms() {
+  const bottoms = new Map();
+  if (participantsOf().length < 3 || narrowColumnLayout.matches || columnTopic !== currentTopic()?.id) return bottoms;
+  for (const col of document.querySelectorAll(".thread-col:not(.is-folded)")) {
+    const box = col.querySelector(".messages");
+    if (!box) continue;
+    bottoms.set(col.dataset.agent, box.scrollHeight - box.scrollTop - box.clientHeight < 60);
+  }
+  return bottoms;
+}
+
+function restoreThreadBottoms(bottoms) {
+  for (const [agent, atBottom] of bottoms) {
+    if (!atBottom) continue;
+    const col = document.querySelector('.thread-col[data-agent="' + agent + '"]');
+    if (!col || col.classList.contains("is-folded")) continue;
+    const box = col.querySelector(".messages");
+    if (box) box.scrollTop = box.scrollHeight;
+  }
+}
+
+function toggleWideColumn(agent) {
+  const topic = currentTopic();
+  if (!topic || participantsOf(topic).length < 3 || !participantsOf(topic).includes(agent) || narrowColumnLayout.matches || foldedColumns.get(topic.id)?.has(agent)) return;
+  const bottoms = captureThreadBottoms();
+  if (widenedColumns.get(topic.id) === agent) widenedColumns.delete(topic.id);
+  else widenedColumns.set(topic.id, agent);
+  applyColumnLayout();
+  restoreThreadBottoms(bottoms);
+  scheduleLinks();
+}
+
 function toggleColumn(agent) {
   const key = currentTopic()?.id || "";
   const folded = foldedColumns.get(key) || new Set();
+  const bottoms = captureThreadBottoms();
   if (folded.has(agent)) folded.delete(agent);
   else {
     if (participantsOf().filter((id) => !folded.has(id)).length <= 1) return toast("少なくとも1列は開いておきます");
     folded.add(agent);
+    if (widenedColumns.get(key) === agent) widenedColumns.delete(key);
   }
   foldedColumns.set(key, folded);
   applyColumnLayout();
   const col = document.querySelector('.thread-col[data-agent="' + agent + '"]');
   col?.querySelector(folded.has(agent) ? ".thread-rail" : ".fold-column")?.focus();
+  restoreThreadBottoms(bottoms);
   scheduleLinks();
 }
 
 function applyColumnLayout() {
   const topic = currentTopic(), folded = foldedColumns.get(topic?.id || "") || new Set();
+  const threeAgents = participantsOf(topic).length >= 3;
+  const widened = threeAgents ? widenedColumns.get(topic?.id || "") : null;
   const tracks = [];
   for (const col of document.querySelectorAll(".thread-col")) {
     const id = col.dataset.agent, closed = folded.has(id);
@@ -1662,10 +1710,12 @@ function applyColumnLayout() {
     rail.querySelector(".rail-unread").textContent = "未読 " + unseen;
     rail.setAttribute("aria-label", NAMES[id] + " を展開・未読 " + unseen);
     col.querySelector(".fold-column").setAttribute("aria-expanded", String(!closed));
-    tracks.push(closed ? "44px" : "minmax(0, 1fr)");
+    const wideButton = col.querySelector(".widen-column");
+    if (wideButton) wideButton.textContent = widened === id ? "等幅に戻す" : "広げる";
+    tracks.push(closed ? "44px" : widened === id ? "minmax(0, 2fr)" : "minmax(0, 1fr)");
   }
   $("main").style.setProperty("--thread-tracks", tracks.join(" ") || "1fr");
-  document.body.classList.toggle("three-agents", participantsOf().length >= 3);
+  document.body.classList.toggle("three-agents", threeAgents);
 }
 
 function syncSendTargets() {
@@ -2221,6 +2271,7 @@ $("#project-choice-dialog").addEventListener("cancel", (event) => { if (projectC
 $("#project-choice-dialog").addEventListener("close", () => { projectChoice = null; });
 // ---- render ----
 function render() {
+  const bottoms = captureThreadBottoms();
   ensureTopic();
   syncAgentDefinitions();
   ensureAgentColumns();
@@ -2231,7 +2282,7 @@ function render() {
   renderTopicBar();
   renderProjectUI();
   for (const agent of participantsOf().filter((id) => agentIds().includes(id))) {
-    renderThread(agent);
+    renderThread(agent, bottoms.get(agent));
     renderTasks(agent);
     renderAgentStatus(agent);
   }
@@ -2239,6 +2290,8 @@ function render() {
   renderBudgetBar();
   renderHealth();
   renderPool();
+  // renderThread内の復元後もタスク欄・プールで高さが変わるため、描画完了後に再度末尾へ戻す。
+  restoreThreadBottoms(bottoms);
   scheduleLinks();
 }
 
@@ -3123,9 +3176,9 @@ function applyThreadGlow(agent, a, ta) {
   col.dataset.glow = glow;
 }
 
-function renderThread(agent) {
+function renderThread(agent, savedAtBottom) {
   const box = $("#messages-" + agent);
-  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+  const atBottom = savedAtBottom ?? (box.scrollHeight - box.scrollTop - box.clientHeight < 60);
   const topic = currentTopic();
   const msgs = state.messages.filter((m) => m.thread === agent && topic && m.topicId === topic.id);
   $("#count-" + agent).textContent = msgs.length ? msgs.length + " 件" : "";
@@ -3504,9 +3557,17 @@ $("#pool-create").addEventListener("click", async () => {
 function togglePool(collapse) {
   const collapsed = collapse != null ? collapse : !document.body.classList.contains("pool-collapsed");
   document.body.classList.toggle("pool-collapsed", collapsed);
+  if (collapsed) togglePoolWiden(false); // 列と同じ規則: 折りたたんだら拡幅は解除
   $("#pool-toggle").textContent = collapsed ? "展開する" : "折りたたむ";
 }
 $("#pool-toggle").addEventListener("click", () => togglePool());
+// プール拡幅（列の「広げる」と同じ流儀。記憶はメモリのみ＝リロードで等幅に戻る）
+function togglePoolWiden(widen) {
+  const on = widen != null ? widen : !document.body.classList.contains("pool-widened");
+  document.body.classList.toggle("pool-widened", on);
+  $("#pool-widen").textContent = on ? "等幅に戻す" : "広げる";
+}
+$("#pool-widen").addEventListener("click", () => togglePoolWiden());
 $("#pool-search").addEventListener("input", () => renderPool());
 $("#pool-cwd").addEventListener("click", () => { poolCurrentDir = ""; renderPool(); });
 // prompt()/confirm() はアプリ内ブラウザ等で無効化されることがあるため、インライン UI で作成する

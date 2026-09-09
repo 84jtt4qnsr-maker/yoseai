@@ -118,3 +118,29 @@ test("grokMetaFrom: 共通 meta への正規化。cancelled は stopped、費用
   assert.deepEqual(unknown.billing, { mode: "unknown" });
   assert.equal(unknown.usage.inTok, 0);
 });
+
+test("hasEndMark: 最終行末尾の素のマーカーのみ有効（否定・引用・コード・包んだ言及は無効）", async () => {
+  const { hasEndMark } = await import("../lib.mjs");
+  const M = "【質疑終了】";
+  // 有効な形
+  assert.equal(hasEndMark("合意です【質疑終了】", M), true, "文末直結");
+  assert.equal(hasEndMark("合意しました。\n\n【質疑終了】", M), true, "単独行");
+  assert.equal(hasEndMark("- 【質疑終了】", M), true, "箇条書き");
+  assert.equal(hasEndMark("締めます **【質疑終了】**", M), true, "強調は許容");
+  assert.equal(hasEndMark("```\ncode\n```\n合意です【質疑終了】", M), true, "閉じたフェンスの後は有効");
+  assert.equal(hasEndMark("````text\n```\n````\n合意です【質疑終了】", M), true, "4連フェンス内の3連を閉じと誤認しない（誤拒否側の回帰）");
+  // 実際に起きた事故
+  assert.equal(hasEndMark("確認が出揃ったら締めてください。ここではまだ 【質疑終了】 しません。", M), false, "否定文（実事故）");
+  // 無効な形
+  assert.equal(hasEndMark("引用です。\n> 【質疑終了】", M), false, "引用行");
+  assert.equal(hasEndMark("記載しないでください：「【質疑終了】」", M), false, "鉤括弧で包む");
+  assert.equal(hasEndMark("使用例：`【質疑終了】`", M), false, "インラインコード");
+  assert.equal(hasEndMark("~~【質疑終了】~~", M), false, "取消線");
+  assert.equal(hasEndMark("例:\n```\n【質疑終了】", M), false, "閉じていない```フェンス内");
+  assert.equal(hasEndMark("例:\n~~~text\n【質疑終了】", M), false, "~~~フェンス内");
+  assert.equal(hasEndMark("例:\n\n    【質疑終了】", M), false, "4スペースインデントのコード表記");
+  assert.equal(hasEndMark("````text\n```\n【質疑終了】", M), false, "4連フェンスは3連で閉じない");
+  assert.equal(hasEndMark("【質疑終了】と書けば終わります", M), false, "後に本文が続く");
+  assert.equal(hasEndMark("```【質疑終了】", M), false, "フェンス行自体");
+  assert.equal(hasEndMark("", M), false);
+});

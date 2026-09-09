@@ -1069,7 +1069,7 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo 
   const relayOrder = (topic.relay.participants || []).map((a) => NAMES[a]).join(" → ");
   const qaNote = topic.relay.active
     ? `\n\n（現在 ${peerNames.join("・")} との質疑応答モードです${relayOrder ? `（手番順: ${relayOrder}）` : ""}。議論が浅いうちは結論に飛びつかず、質問・反論・検討を返してください。` +
-      `${QA_END_MARK} は、参加者全員の見解を少なくとも一度聞いた上で合意・結論に達した場合のみ、応答の末尾に書いてください。` +
+      `${QA_END_MARK} は、参加者全員の見解を少なくとも一度聞いた上で合意・結論に達した場合のみ、応答の最終行の末尾にそのまま書いてください（文中・否定文での言及や、引用行・鉤括弧・コード・取消線で包んだ言及は終了宣言になりません）。` +
       `まだ発言していない参加者がいる段階での終了宣言は無効です。残り自動中継 ${topic.relay.remaining} 手）`
     : "";
   const saveDir = `u2a2a/pool/${topicDirRel(topic.id)}`;
@@ -1123,7 +1123,7 @@ function qaHop(topic, agent, replyText, sourceMsgId) {
       ts: Date.now(),
     });
   }
-  // 終了宣言は参加者全員が 1 回以上発言した後のみ有効（現行「相手が未発言なら無効」の一般化）
+  // 終了宣言は最終行末尾にそのまま書かれたマーカーのみ有効（lib.hasEndMark: 文中・否定文・引用・コードで包んだ言及では発火しない）、かつ参加者全員が 1 回以上発言した後のみ
   if (canEndRelay(r, replyText, QA_END_MARK)) {
     stopRelay(topic, "agreed");
     summarizeTopic(topic.id); // 質疑の決着は要約の節目
@@ -1345,7 +1345,10 @@ async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
 // Bash(python3:*) のような個別 allow では複合コマンドが拒否され、その場で cancelled 停止してしまう。
 // run_terminal_command ごと外せば read_file / list_dir / grep で探索して完走する。メディア生成は当面 claude/codex 担当）
 const GROK_WRITE_ARGS = ["--allow", "Edit(u2a2a/pool/**)", "--disallowed-tools", "spawn_subagent,run_terminal_command"];
-const GROK_READ_ARGS = ["--sandbox", "read-only", "--disallowed-tools", "spawn_subagent,run_terminal_command"];
+// レビューは読み取りツールの正のホワイトリストで絞る。Grok は権限拒否で実行全体が停止するため、
+// read-only サンドボックス下で拒否され得る書き込み系ツール（search_replace 等）を持たせない
+// （web 検索 search_tool は --tools の対象外で残る。実測: whitelist 下でも呼べて完走する）
+const GROK_READ_ARGS = ["--sandbox", "read-only", "--tools", "read_file,list_dir,grep", "--disallowed-tools", "spawn_subagent,run_terminal_command"];
 const GROK_AUTH_FILE = path.join(os.homedir(), ".grok", "auth.json");
 
 async function callGrok(prompt, sessionId, modelOverride, onStep, opts = {}) {
