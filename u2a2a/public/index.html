@@ -32,6 +32,7 @@
   *::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
   *::-webkit-scrollbar-track { background: transparent; }
   header {
+    flex-wrap: wrap;
     padding: 6px 18px;
     border-bottom: 1px solid var(--line);
     display: flex;
@@ -777,6 +778,26 @@
   dialog textarea { min-height: 90px; resize: vertical; }
   dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 
+  /* プロジェクトの登録・対象選択 */
+  #project-context { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 6px 14px; border-bottom: 1px solid var(--line); }
+  #project-context[hidden], #project-stop[hidden], #project-topic-title-field[hidden] { display: none; }
+  .project-chip { display: inline-block; border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; font-size: 12px; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+  .project-unregistered { color: var(--dim); }
+  .project-hint, .project-probe { color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
+  .project-error, #project-stop { color: var(--danger); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #project-stop { padding: 7px 14px; border-bottom: 1px solid #ff7b7b55; }
+  #projects-dialog { width: min(720px, 92vw); max-height: 85vh; overflow-y: auto; }
+  #projects-list { max-height: 40vh; overflow-y: auto; margin: 10px 0; }
+  .project-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin: 8px 0; }
+  .project-card-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .project-card-head input { flex: 1 1 150px; width: auto; min-width: 0; padding: 4px 8px; }
+  .project-path { font: 12px ui-monospace, monospace; overflow-wrap: anywhere; margin: 6px 0; }
+  .project-details { border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin: 8px 0; }
+  .project-details button { margin-left: 8px; }
+  #projects-add-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+  #project-choice-select { width: 100%; min-width: 0; }
+  #projects-dialog button:disabled, #project-choice-dialog button:disabled { opacity: 0.45; cursor: not-allowed; }
+
   #toast {
     position: fixed;
     bottom: 18px; left: 50%;
@@ -798,11 +819,14 @@
   <h1>U2A2A Orchestration</h1>
   <span class="sub">ユーザー ⇄ Claude Code ⇄ Codex ／ やり取りから生まれたタスクを各アプリで作業し、結果を再入力する</span>
   <button id="budget-btn" class="small" style="margin-left:auto" title="実行の上限設定（コスト・回数・時間）">⚙ 上限</button>
+  <button id="projects-btn" class="small">📁 プロジェクト</button>
   <button id="health-btn" class="small" title="運用イベント（失敗ログ）とストレージ計測">🩺</button>
 </header>
 
 <!-- トピック（スレッド）タブ -->
 <div id="topic-bar"></div>
+<div id="project-context" hidden></div>
+<div id="project-stop" role="status" hidden></div>
 
 <!-- ユーザー側（閲覧・回答・質問） -->
 <div id="user-band">
@@ -905,6 +929,36 @@
 </div>
 
 <!-- ヘルス（イベントログ・ストレージ計測）ダイアログ -->
+<dialog id="projects-dialog" aria-labelledby="projects-heading">
+  <h3 id="projects-heading">📁 プロジェクト</h3>
+  <p class="project-hint">既存のローカルフォルダを参照先として登録します。トピックの対象は実行前に選択できます。</p>
+  <button id="projects-reload" class="small" type="button">一覧・状態を再取得</button>
+  <div id="projects-list-state" class="project-hint" role="status"></div>
+  <div id="projects-list"></div>
+  <form id="projects-add-form">
+    <fieldset id="projects-add-fields">
+      <legend>プロジェクトを追加</legend>
+      <div class="field"><label for="projects-path">フォルダの絶対パス</label><input id="projects-path" required placeholder="/Users/your-name/projects/example" autocomplete="off" /></div>
+      <div class="field"><label for="projects-name">表示名（任意・60文字以内）</label><input id="projects-name" maxlength="60" autocomplete="off" /></div>
+      <button id="projects-add" type="submit">登録</button>
+    </fieldset>
+    <div id="projects-error" class="project-error" role="status"></div>
+  </form>
+  <div class="buttons"><button id="projects-close" type="button">閉じる</button></div>
+</dialog>
+
+<dialog id="project-choice-dialog" aria-labelledby="project-choice-title">
+  <h3 id="project-choice-title">対象プロジェクトを選択</h3>
+  <form id="project-choice-form">
+    <div id="project-topic-title-field" class="field"><label for="project-topic-title">スレッド名（任意）</label><input id="project-topic-title" maxlength="60" autocomplete="off" /></div>
+    <div class="field"><label for="project-choice-select">プロジェクト</label><select id="project-choice-select"></select></div>
+    <div id="project-choice-preview"></div>
+    <p id="project-choice-note" class="project-hint"></p>
+    <div id="project-choice-error" class="project-error" role="status"></div>
+    <div class="buttons"><button id="project-choice-cancel" type="button">キャンセル</button><button id="project-choice-save" type="submit">保存</button></div>
+  </form>
+</dialog>
+
 <dialog id="health-dialog">
   <h3>🩺 運用イベント</h3>
   <div class="field"><label id="health-storage"></label></div>
@@ -1018,7 +1072,7 @@
 const NAMES = { user: "ユーザー", claude: "Claude Code", codex: "Codex" };
 const OTHER = { claude: "codex", codex: "claude" };
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
-let state = { messages: [], tasks: [], pool: [], topics: [], agents: {}, running: {}, reviewPending: {}, fixPending: {}, activity: {}, runs: [], events: [], storageMetrics: {} };
+let state = { messages: [], tasks: [], pool: [], topics: [], projects: [], agents: {}, running: {}, reviewPending: {}, fixPending: {}, activity: {}, runs: [], events: [], storageMetrics: {} };
 
 // ---- トピック（スレッド）----
 let currentTopicId = localStorage.getItem("u2a2a-topic") || null;
@@ -1115,7 +1169,7 @@ function renderTopicBar() {
   }
   bar.appendChild(el("button", {
     id: "topic-add", text: "＋ 新規スレッド",
-    onclick: () => api("/api/topics", "POST", {}).then((t) => { switchTopic(t.id); renamingTopicId = t.id; render(); }),
+    onclick: () => openProjectChoice("new"),
   }));
 }
 const POOL_STATUS_LABEL = { submitted: "持ち込み", reviewing: "レビュー", approved: "承認", rejected: "差し戻し" };
@@ -1130,18 +1184,19 @@ function toast(text) {
   el._t = setTimeout(() => el.classList.remove("show"), 1800);
 }
 
-async function api(path, method = "GET", body) {
+async function api(path, method = "GET", body, { silent = false } = {}) {
   const res = await fetch(path, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
+    ...(silent ? { cache: "no-store" } : {}),
+    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    toast(err.error || "エラーが発生しました");
-    throw new Error(err.error || res.status);
+    if (!silent) toast(err.error || "エラーが発生しました");
+    throw Object.assign(new Error(err.error || "取得に失敗しました（HTTP " + res.status + "）"), { status: res.status, data: err });
   }
-  return res.json();
+  return silent ? res.json().catch(() => ({})) : res.json();
 }
 
 function fmtTime(ts) {
@@ -1428,10 +1483,379 @@ function el(tag, attrs = {}, children = []) {
   return node;
 }
 
+// ---- ローカルプロジェクト（実体は移動せず、参照先だけを登録）----
+const projectProbes = new Map();
+const projectProbeQueue = [];
+let projectProbeRunning = 0;
+let projectCatalogKey = "";
+let projectCatalogEpoch = 0;
+let projectListRequest = 0;
+let projectListLoading = false;
+let projectContextKey = "";
+let projectExecutionErrorKey = "";
+let projectChoice = null;
+const projectNameDrafts = new Map();
+const projectMutating = new Set();
+
+const findProject = (id) => (state.projects || []).find((p) => p.id === id);
+const projectName = (id) => !id ? "Kometa（既定）" : findProject(id)?.name || "登録解除済み";
+const projectUrl = (id) => "/api/projects/" + encodeURIComponent(id);
+
+const projectRequest = (url, method = "GET", body) => api(url, method, body, { silent: true });
+
+function projectErrorText(error) {
+  let text = error.message || "通信に失敗しました";
+  for (const [key, label, collection] of [["topics", "参照トピック", state.topics], ["items", "参照成果物", state.pool]]) {
+    const ids = error.data?.[key];
+    if (Array.isArray(ids) && ids.length) {
+      const names = ids.slice(0, 8).map((id) => (collection || []).find((x) => x.id === id)?.title || id);
+      text += "\n" + label + ": " + names.join("、") + (ids.length > 8 ? " 他 " + (ids.length - 8) + " 件" : "");
+    }
+  }
+  return text;
+}
+
+function projectProbeLabel(id) {
+  if (!id) return { text: "既定の参照先", blocked: false };
+  if (!findProject(id)) return { text: "登録解除済み — 対象を確認できません（実行不可）", blocked: true };
+  const entry = projectProbes.get(id);
+  if (!entry || entry.pending) return { text: "確認中…", blocked: false };
+  if (entry.error) return { text: "確認不可: " + entry.error, blocked: false };
+  const probe = entry.data;
+  const notes = { missing: "フォルダが見つかりません", unreadable: "フォルダを読み取れません", unregistered: "登録解除済み" };
+  if (notes[probe.status]) return { text: notes[probe.status] + "（実行不可）" + (probe.note ? " — " + probe.note : ""), blocked: true };
+  if (probe.status === "not-git") return { text: "通常フォルダ（Git情報なし）", blocked: false };
+  if (probe.status !== "ok") return { text: "確認不可" + (probe.note ? ": " + probe.note : ""), blocked: false };
+  return { text: (probe.branch || "ブランチ不明") + "@" + (probe.head || "HEAD不明") + "・変更 " + (probe.dirty ?? "不明") + " 件", blocked: false };
+}
+
+function pumpProjectProbes() {
+  // 管理一覧を開いても、登録件数分のGit確認を一斉に起動しない。
+  while (projectProbeRunning < 3 && projectProbeQueue.length) {
+    const { id, entry } = projectProbeQueue.shift();
+    if (projectProbes.get(id) !== entry || findProject(id)?.path !== entry.path) continue;
+    projectProbeRunning++;
+    projectRequest(projectUrl(id) + "/probe")
+      .then((data) => {
+        if (typeof data.status !== "string") throw new Error("確認結果の形式が不正です");
+        entry.data = data;
+      })
+      .catch((e) => { entry.error = e.message; })
+      .finally(() => {
+        entry.pending = false;
+        projectProbeRunning--;
+        if (projectProbes.get(id) === entry) {
+          if (entry.recheck) ensureProjectProbe(id, true);
+          refreshProjectProbeViews();
+        }
+        pumpProjectProbes();
+      });
+  }
+}
+
+function ensureProjectProbe(id, force = false) {
+  const project = findProject(id);
+  if (!project) return;
+  const old = projectProbes.get(id);
+  if (old?.path === project.path) {
+    if (!force) return;
+    // 実行状態が取得中に変わった場合も、完了後に最新の状態を確認する。
+    if (old.pending) { old.recheck = true; return; }
+  }
+  const entry = { path: project.path, pending: true };
+  projectProbes.set(id, entry);
+  projectProbeQueue.push({ id, entry });
+  pumpProjectProbes();
+}
+
+function projectProbeEl(id) {
+  ensureProjectProbe(id);
+  const label = projectProbeLabel(id);
+  return el("span", { class: "project-probe" + (label.blocked ? " project-error" : ""), "data-project-probe": id || "", text: label.text });
+}
+
+function refreshProjectProbeViews() {
+  for (const node of document.querySelectorAll("[data-project-probe]")) {
+    const label = projectProbeLabel(node.dataset.projectProbe);
+    node.textContent = label.text;
+    node.classList.toggle("project-error", label.blocked);
+  }
+  renderProjectContext();
+}
+
+function projectBadge(id) {
+  return el("span", {
+    class: "project-chip" + (id && !findProject(id) ? " project-unregistered" : ""),
+    text: "📁 " + projectName(id), title: findProject(id)?.path || (id ? "登録ID: " + id : "従来のKometaリポジトリ"),
+  });
+}
+
+function projectRecheckButton(id) {
+  return el("button", { class: "small", text: "再確認", onclick: () => { ensureProjectProbe(id, true); refreshProjectProbeViews(); } });
+}
+
+function projectDetailsEl(id) {
+  const box = el("div", { class: "project-details" }, [projectBadge(id)]);
+  if (findProject(id)) box.appendChild(el("div", { class: "project-path", text: findProject(id).path }));
+  box.appendChild(projectProbeEl(id));
+  if (findProject(id)) box.appendChild(projectRecheckButton(id));
+  return box;
+}
+
+function renderProjectContext() {
+  const topic = currentTopic();
+  const row = $("#project-context");
+  row.hidden = !topic || (!topic.projectId && !(state.projects || []).length);
+  row.replaceChildren();
+  const banner = $("#project-stop");
+  banner.hidden = true;
+  banner.textContent = "";
+  if (row.hidden) { projectContextKey = ""; return; }
+  const key = JSON.stringify([topic.id, topic.projectId]);
+  if (projectContextKey !== key) { projectContextKey = key; ensureProjectProbe(topic.projectId, true); }
+  const chip = el("button", {
+    class: "small project-chip", text: "📁 " + projectName(topic.projectId),
+    title: "対象プロジェクトを選択" + (findProject(topic.projectId) ? " — " + findProject(topic.projectId).path : ""),
+    onclick: () => openProjectChoice("bind", topic),
+  });
+  row.append(chip, projectProbeEl(topic.projectId), el("span", { class: "project-hint", text: topic.projectLocked ? "🔒 実行済み・対象固定" : "閲覧のみ・実行前は対象変更可" }));
+  if (topic.projectId) row.appendChild(projectRecheckButton(topic.projectId));
+  const label = projectProbeLabel(topic.projectId);
+  if (label.blocked) {
+    banner.textContent = "対象プロジェクト「" + projectName(topic.projectId) + "」: " + label.text + "。参照先を確認してください。";
+    banner.hidden = false;
+  }
+}
+
+function renderProjectUI() {
+  const key = JSON.stringify(state.projects || []);
+  if (projectCatalogKey !== key) {
+    projectCatalogKey = key;
+    projectCatalogEpoch++;
+    for (const [id, entry] of projectProbes) if (findProject(id)?.path !== entry.path) projectProbes.delete(id);
+    if ($("#projects-dialog").open) renderProjectList();
+  }
+  const topic = currentTopic();
+  const errors = ["claude", "codex"].map((agent) => topic?.agents?.[agent]?.lastError ?? state.agents?.[agent]?.lastError ?? "");
+  const blockedMessage = (state.messages || []).findLast((m) => m.topicId === topic?.id && m.blocked);
+  const errorKey = JSON.stringify([topic?.id, topic?.projectId, errors, blockedMessage?.id]);
+  if (projectExecutionErrorKey !== errorKey) {
+    projectExecutionErrorKey = errorKey;
+    // 停止通知とエラー解消のどちらでも更新する。サーバの文言には依存しない。
+    // トピック切替時の確認は renderProjectContext に任せる。
+    const project = findProject(topic?.projectId);
+    if (project && projectContextKey === JSON.stringify([topic.id, topic.projectId])) ensureProjectProbe(project.id, true);
+  }
+  renderProjectContext();
+  syncProjectChoice();
+}
+
+async function loadProjectList(forceProbe = false) {
+  const request = ++projectListRequest, epoch = projectCatalogEpoch;
+  projectListLoading = true;
+  $("#projects-list-state").classList.remove("project-error");
+  $("#projects-list-state").textContent = "登録一覧を読み込み中…";
+  $("#projects-reload").disabled = true;
+  try {
+    const data = await projectRequest("/api/projects");
+    if (!Array.isArray(data.projects)) throw new Error("登録一覧の形式が不正です");
+    if (request !== projectListRequest) return;
+    // 後から届いた一覧で、SSEや登録操作による新しい一覧を巻き戻さない。
+    if (epoch === projectCatalogEpoch) { state.projects = data.projects; render(); }
+    for (const p of state.projects || []) ensureProjectProbe(p.id, forceProbe);
+    $("#projects-list-state").textContent = "";
+    renderProjectList();
+  } catch (e) {
+    if (request === projectListRequest) {
+      $("#projects-list-state").classList.add("project-error");
+      $("#projects-list-state").textContent = "一覧の取得失敗: " + projectErrorText(e);
+    }
+  } finally {
+    if (request === projectListRequest) { projectListLoading = false; $("#projects-reload").disabled = false; }
+  }
+}
+
+function openProjects() {
+  projectNameDrafts.clear();
+  $("#projects-error").textContent = "";
+  $("#projects-path").value = "";
+  $("#projects-name").value = "";
+  renderProjectList();
+  $("#projects-dialog").showModal();
+  void loadProjectList();
+}
+
+function renderProjectList() {
+  const list = $("#projects-list");
+  list.replaceChildren();
+  if (!(state.projects || []).length) list.appendChild(el("p", { class: "project-hint", text: "登録プロジェクトはありません。下のフォームから追加できます。" }));
+  for (const p of state.projects || []) {
+    const input = el("input", { value: projectNameDrafts.get(p.id) ?? p.name, maxlength: "60", required: "", "aria-label": p.name + " の表示名", oninput: (e) => projectNameDrafts.set(p.id, e.target.value) });
+    const error = el("div", { class: "project-error", role: "status", "data-project-row-error": p.id });
+    const save = el("button", { class: "small", type: "button", text: "名前を保存", onclick: () => {
+      if (!input.reportValidity()) return;
+      const name = input.value.trim();
+      if (!name) { error.textContent = "表示名を入力してください"; return; }
+      void mutateProject(p, "PATCH", { name });
+    } });
+    const remove = el("button", { class: "small", type: "button", text: "登録解除", title: "ローカルのファイルは削除しません。参照中の登録は解除できません。", onclick: (e) => armedDelete(e.currentTarget, () => mutateProject(p, "DELETE")) });
+    input.disabled = save.disabled = remove.disabled = projectMutating.has(p.id);
+    list.appendChild(el("article", { class: "project-card" }, [
+      el("div", { class: "project-card-head" }, [input, save, remove]),
+      el("div", { class: "project-path", text: p.path }),
+      el("span", { class: "project-hint", text: p.kind === "git" ? "Gitリポジトリ · " : "通常フォルダ · " }), projectProbeEl(p.id), error,
+    ]));
+  }
+}
+
+async function mutateProject(project, method, body) {
+  if (projectMutating.has(project.id)) return;
+  projectMutating.add(project.id);
+  projectCatalogEpoch++;
+  renderProjectList();
+  let error;
+  try {
+    await projectRequest(projectUrl(project.id), method, body);
+    if (method === "DELETE") state.projects = (state.projects || []).filter((p) => p.id !== project.id);
+    else state.projects = (state.projects || []).map((p) => p.id === project.id ? { ...p, name: body.name } : p);
+    projectNameDrafts.delete(project.id);
+    toast(method === "DELETE" ? "登録を解除しました（ファイルは保持）" : "表示名を保存しました");
+  } catch (e) { error = e; }
+  finally { projectMutating.delete(project.id); projectCatalogEpoch++; render(); renderProjectList(); }
+  if (error) {
+    const row = [...$("#projects-list").querySelectorAll("[data-project-row-error]")].find((node) => node.dataset.projectRowError === project.id);
+    if ($("#projects-dialog").open && row) row.textContent = projectErrorText(error);
+    else toast(projectErrorText(error));
+  }
+}
+
+async function openProjectChoice(mode, topic, messageId = null) {
+  if (mode === "new" && topic === undefined) topic = currentTopic();
+  if (mode === "bind" && topic?.projectLocked) return toast("実行後は変更できません。🌿 分岐で別プロジェクトのトピックを作れます");
+  if (mode !== "new" && !topic) return toast("対象トピックが見つかりません");
+  // 登録ゼロ・未紐付けなら従来の1クリック作成を維持する。
+  // 未登録IDが残るトピックは、勝手に既定へ戻さず選択を求める。
+  if (mode !== "bind" && !(state.projects || []).length && !topic?.projectId) {
+    try {
+      const path = mode === "new" ? "/api/topics" : "/api/topics/" + encodeURIComponent(topic.id) + "/branch";
+      const created = await projectRequest(path, "POST", mode === "new" ? {} : { messageId });
+      if (!created.id) throw new Error("トピックの応答形式が不正です。再操作前に一覧を確認してください。");
+      state.topics = [...(state.topics || []).filter((t) => t.id !== created.id), created];
+      switchTopic(created.id);
+      renamingTopicId = created.id;
+      render();
+      if (mode === "branch") toast("この地点までの履歴で分岐しました（セッションは新規・要約を引き継ぎ）");
+    } catch (e) { toast(projectErrorText(e)); }
+    return;
+  }
+  projectChoice = { mode, topicId: topic?.id, messageId, selected: topic?.projectId || "", busy: false };
+  $("#project-choice-title").textContent = mode === "new" ? "新規スレッド" : mode === "branch" ? "この地点から分岐" : "対象プロジェクトを選択";
+  $("#project-topic-title-field").hidden = mode !== "new";
+  $("#project-topic-title").value = "";
+  $("#project-choice-error").textContent = "";
+  $("#project-choice-save").textContent = mode === "new" ? "作成" : mode === "branch" ? "分岐を作成" : "対象を保存";
+  $("#project-choice-dialog").showModal();
+  syncProjectChoice();
+}
+
+function syncProjectChoice() {
+  const choice = projectChoice;
+  if (!choice || !$("#project-choice-dialog").open) return;
+  const topic = (state.topics || []).find((t) => t.id === choice.topicId);
+  const select = $("#project-choice-select");
+  const key = JSON.stringify([(state.projects || []).map((p) => [p.id, p.name]), choice.selected]);
+  if (choice.optionsKey !== key) {
+    choice.optionsKey = key;
+    select.replaceChildren(el("option", { value: "", text: "Kometa（既定）" }));
+    for (const p of state.projects || []) select.appendChild(el("option", { value: p.id, text: p.name }));
+    if (choice.selected && !findProject(choice.selected)) select.appendChild(el("option", { value: choice.selected, text: "登録解除済み（別の対象を選択してください）", disabled: "" }));
+    select.value = choice.selected;
+  }
+  const locked = choice.mode === "bind" && topic?.projectLocked;
+  const missingTopic = choice.mode !== "new" && !topic;
+  const invalidProject = choice.selected && !findProject(choice.selected);
+  $("#project-choice-save").disabled = !!(choice.busy || locked || missingTopic || invalidProject);
+  select.disabled = choice.busy || !!locked;
+  $("#project-topic-title").disabled = choice.busy;
+  $("#project-choice-cancel").disabled = choice.busy;
+  const note = locked ? "実行後は変更できません。新規スレッドまたは分岐を作成してください。"
+    : missingTopic ? "対象トピックが削除されました。"
+    : choice.mode === "branch" ? "この地点までの履歴と要約を引き継ぎ、CLIセッションは新規で開始します。" + ((topic.projectId || "") !== choice.selected ? " 引き継ぐ履歴・要約は「" + projectName(topic.projectId) + "」を対象にした内容です。" : "")
+    : "プロジェクトは閲覧のみです。最初の実行後は対象を変更できません。";
+  $("#project-choice-note").textContent = note;
+  const preview = $("#project-choice-preview");
+  preview.replaceChildren();
+  if (findProject(choice.selected)) preview.appendChild(el("div", { class: "project-path", text: findProject(choice.selected).path }));
+  preview.appendChild(projectProbeEl(choice.selected));
+}
+
+async function submitProjectChoice(event) {
+  event.preventDefault();
+  const choice = projectChoice;
+  if (!choice || choice.busy || $("#project-choice-save").disabled) return;
+  choice.busy = true;
+  $("#project-choice-error").textContent = "";
+  syncProjectChoice();
+  try {
+    const projectId = choice.selected || null;
+    const path = choice.mode === "new" ? "/api/topics" : "/api/topics/" + encodeURIComponent(choice.topicId) + (choice.mode === "branch" ? "/branch" : "");
+    const body = choice.mode === "new" ? { title: $("#project-topic-title").value.trim() || undefined, projectId }
+      : choice.mode === "branch" ? { messageId: choice.messageId, projectId } : { projectId };
+    const topic = await projectRequest(path, choice.mode === "bind" ? "PATCH" : "POST", body);
+    if (!topic.id) throw new Error("トピックの応答形式が不正です。再操作前に一覧を確認してください。");
+    const old = (state.topics || []).find((t) => t.id === topic.id);
+    state.topics = old ? state.topics.map((t) => t.id === topic.id ? { ...t, ...topic } : t) : [...(state.topics || []), topic];
+    if (projectChoice === choice) {
+      $("#project-choice-dialog").close();
+      projectChoice = null;
+      switchTopic(topic.id);
+      if (choice.mode === "branch" || (choice.mode === "new" && !body.title)) {
+        renamingTopicId = topic.id;
+        render();
+      }
+    } else render();
+    toast(choice.mode === "branch" ? "選択したプロジェクトで分岐しました" : choice.mode === "new" ? "スレッドを作成しました" : "対象プロジェクトを保存しました");
+  } catch (e) {
+    if (e.status === 409 && e.data?.reason === "locked") {
+      const topic = (state.topics || []).find((t) => t.id === choice.topicId);
+      if (topic) topic.projectLocked = true;
+    }
+    if (projectChoice === choice) $("#project-choice-error").textContent = projectErrorText(e);
+    else toast(projectErrorText(e));
+  } finally { choice.busy = false; renderProjectUI(); }
+}
+
+$("#projects-btn").addEventListener("click", openProjects);
+$("#projects-close").addEventListener("click", () => $("#projects-dialog").close());
+$("#projects-reload").addEventListener("click", () => { if (!projectListLoading) void loadProjectList(true); });
+$("#projects-add-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const fields = $("#projects-add-fields");
+  if (fields.disabled) return;
+  const path = $("#projects-path").value.trim(), name = $("#projects-name").value.trim();
+  if (!path.startsWith("/")) { $("#projects-error").textContent = "絶対パスを入力してください"; return; }
+  fields.disabled = true;
+  projectCatalogEpoch++;
+  $("#projects-error").textContent = "";
+  try {
+    const data = await projectRequest("/api/projects", "POST", { path, ...(name ? { name } : {}) });
+    if (!data.project?.id) throw new Error("登録の応答形式が不正です。再操作前に一覧を再取得してください。");
+    state.projects = [...(state.projects || []).filter((p) => p.id !== data.project.id), data.project];
+    $("#projects-path").value = ""; $("#projects-name").value = "";
+    toast(data.existing ? "登録済みのプロジェクトです" : "プロジェクトを登録しました");
+  } catch (e) { $("#projects-error").textContent = projectErrorText(e); }
+  finally { fields.disabled = false; projectCatalogEpoch++; render(); renderProjectList(); }
+});
+$("#project-choice-form").addEventListener("submit", submitProjectChoice);
+$("#project-choice-select").addEventListener("change", (event) => { if (projectChoice) { projectChoice.selected = event.target.value; syncProjectChoice(); } });
+$("#project-choice-cancel").addEventListener("click", () => { if (!projectChoice?.busy) $("#project-choice-dialog").close(); });
+$("#project-choice-dialog").addEventListener("cancel", (event) => { if (projectChoice?.busy) event.preventDefault(); });
+$("#project-choice-dialog").addEventListener("close", () => { projectChoice = null; });
 // ---- render ----
 function render() {
   ensureTopic();
   renderTopicBar();
+  renderProjectUI();
   for (const agent of ["claude", "codex"]) {
     renderThread(agent);
     renderTasks(agent);
@@ -1985,6 +2409,7 @@ function renderTopicDetail(box, t) {
       text: "累計 in " + fmtTok(tot.inTok) + " / out " + fmtTok(tot.outTok) + (tot.cost ? " / $" + tot.cost.toFixed(2) + "（Claude分）" : ""),
     }),
   ]));
+  box.appendChild(projectDetailsEl(t.projectId));
   if (t.mirrorFile) {
     const url = "/api/pool/file/" + encodeURIComponent(t.mirrorFile);
     box.appendChild(el("div", { class: "p-file" }, [
@@ -2061,6 +2486,7 @@ function renderPoolDetail(box, p) {
     if (VIA_LABEL[p.via]) head.appendChild(el("span", { class: "origin", text: VIA_LABEL[p.via] }));
 
     const kids = [head];
+    if (p.projectId) kids.push(projectBadge(p.projectId));
     if (p.file) {
       const fileUrl = "/api/pool/file/" + encodeURIComponent(p.file);
       const fileRow = el("div", { class: "p-file" }, [
@@ -2834,14 +3260,7 @@ function ctxItems(t) {
         api("/api/handoff", "POST", { messageId: m.id })
           .then(() => toast(NAMES[OTHER[m.thread]] + " へ引き継ぎました（相手が作業を引き取ります）")),
       ],
-      ["🌿 ここから分岐", () =>
-        api("/api/topics/" + m.topicId + "/branch", "POST", { messageId: m.id }).then((nt) => {
-          switchTopic(nt.id);
-          renamingTopicId = nt.id;
-          render();
-          toast("この地点までの履歴で分岐しました（セッションは新規・要約を引き継ぎ）");
-        }),
-      ],
+      ["🌿 ここから分岐", () => openProjectChoice("branch", (state.topics || []).find((topic) => topic.id === m.topicId), m.id)],
       ["✍ " + NAMES[m.thread] + " の発言を手動追加", () => showAgentInput(m.thread)],
     ];
   }

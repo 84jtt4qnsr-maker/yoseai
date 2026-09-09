@@ -247,3 +247,95 @@ export function truncateUtf8(text, maxBytes = DIFF_MAX_BYTES) {
 export function safeVersionFileName(name) {
   return typeof name === "string" && /^v\d+\.[A-Za-z0-9._-]{1,32}$/.test(name) && !name.includes("/") && !name.includes("\\") && !name.includes("..");
 }
+
+// ---- ローカルプロジェクト登録とトピック紐付け（仕様: SPEC-プロジェクト紐付け.md。純関数のみ、I/O は server 側）----
+
+export const PROJECT_DIGEST_MAX = 4000; // 初回プロンプトに添える要約の上限（文字）
+export const PROJECT_README_MAX_BYTES = PROJECT_DIGEST_MAX * 4; // README の読み取り上限（バイト。UTF-8 は最大 4 バイト/文字）
+export const PROJECT_ENTRIES_MAX = 50; // 直下エントリ名の上限
+export const PROJECT_DIRTY_LIST_MAX = 12; // 未コミット変更パスの表示上限
+
+// child が parent と同じか配下か（両方とも realpath 済みの絶対パスを渡す）
+export function isInsidePath(child, parent) {
+  const c = String(child || "").replace(/\/+$/, "");
+  const p = String(parent || "").replace(/\/+$/, "");
+  return !!p && (c === p || c.startsWith(p + "/"));
+}
+
+// probe の正規化。入力: { unregistered?, exists, readable, isGit, git: { branch, head, status } }（各 { ok, out } | { ok:false, err }）
+// 出力: { status, branch, head, dirty, dirtyPaths, note }。status: ok | not-git | unavailable | missing | unreadable | unregistered
+export function normalizeProbe(input) {
+  const base = { status: "ok", branch: null, head: null, dirty: null, dirtyPaths: [], note: null };
+  if (!input || input.unregistered) return { ...base, status: "unregistered", note: "登録 id が解決できません" };
+  if (!input.exists) return { ...base, status: "missing", note: "パスが存在しないかディレクトリではありません" };
+  if (!input.readable) return { ...base, status: "unreadable", note: "読み取り権限がありません" };
+  if (!input.isGit) return { ...base, status: "not-git", note: null };
+  const g = input.git || {};
+  const failed = ["branch", "head", "status"].find((k) => !g[k] || !g[k].ok);
+  if (failed) return { ...base, status: "unavailable", note: "確認不可: " + ((g[failed] && g[failed].err) || "git を実行できません") };
+  const lines = String(g.status.out || "").split("\n").filter((l) => l.trim());
+  const paths = lines.map((l) => l.slice(3).trim()).filter(Boolean);
+  return {
+    status: "ok",
+    branch: String(g.branch.out || "").trim() || null,
+    head: String(g.head.out || "").trim() || null,
+    dirty: lines.length,
+    dirtyPaths: paths.slice(0, PROJECT_DIRTY_LIST_MAX),
+    note: null,
+  };
+}
+
+// 移行用: 旧 state のトピックが「実行済み」かを一度だけ推定する（以後は projectLocked フラグが正）
+export function topicHasRunLegacy(topic, messages) {
+  const agents = (topic && topic.agents) || {};
+  if (Object.values(agents).some((a) => a && a.sessionId)) return true;
+  return (messages || []).some((m) => m.topicId === topic.id && m.author !== "user");
+}
+
+// 初回プロンプト用の要約。README 冒頭＋直下エントリ名を合計 limit 文字で打ち切る。読めなければ理由の 1 行
+export function projectDigest({ readmeName, readmeText, entries, error }, limit = PROJECT_DIGEST_MAX) {
+  if (error) return "（プロジェクト要約は取得できませんでした: " + error + "）";
+  const names = (entries || [])
+    .filter((e) => e.name !== ".git" && e.name !== "node_modules")
+    .map((e) => e.name + (e.dir ? "/" : ""))
+    .sort((a, b) => a.localeCompare(b));
+  const shown = names.slice(0, PROJECT_ENTRIES_MAX);
+  let out = "直下のエントリ（" + names.length + " 件）: " + shown.join(", ") + (names.length > shown.length ? " 他 " + (names.length - shown.length) + " 件" : "") + "\n";
+  if (readmeName && readmeText) out += "--- " + readmeName + " 冒頭 ---\n" + readmeText;
+  else out += "（README は見つかりませんでした）";
+  if (out.length > limit) out = out.slice(0, limit) + "\n…（要約は " + limit + " 文字で打ち切り）";
+  return out;
+}
+
+// プロンプトに入れる対象プロジェクトの 1 行
+export function projectPromptLine(project, probe) {
+  const p = probe || { status: "unavailable", note: "確認不可" };
+  let git;
+  if (p.status === "ok") git = "Git: " + (p.branch || "?") + "@" + (p.head || "?") + "、未コミット変更 " + p.dirty + " 件";
+  else if (p.status === "not-git") git = "Git 管理外のフォルダ";
+  else git = "Git 情報は" + (p.note && p.note.startsWith("確認不可") ? p.note : "確認不可（" + (p.note || p.status) + "）");
+  return "対象プロジェクトは「" + project.name + "」（" + project.path + "、閲覧のみ・変更不可）。" + git + "。";
+}
+
+// 紐付けありトピックの変更通知（Kometa の監視リストは使わず、対象の未コミット変更を注記する）
+export function projectChangeNote(probe) {
+  if (!probe || probe.status !== "ok" || !probe.dirty) return "";
+  const rest = probe.dirty - probe.dirtyPaths.length;
+  return "\n\n（対象プロジェクトの未コミット変更: " + probe.dirtyPaths.join(", ") + (rest > 0 ? " 他 " + rest + " 件" : "") + "）";
+}
+
+// 要約・引き継ぎ履歴の出所注記。要約は生成時の対象（topic.summaryProjectId、null = Kometa）を持ち、分岐で要約と一緒に引き継がれる。
+// 分岐で持ち込んだ会話の出所は topic.carriedProjectId（undefined = 引き継ぎなし）に恒久記録され、再要約しても消えない。
+// 現在の対象（topic.projectId）と違う出所があるときだけ注記を返す。label は id → 表示名
+export function summaryOriginNote(topic, label) {
+  if (!topic) return "";
+  const now = topic.projectId || null;
+  const notes = [];
+  const from = topic.summaryText ? topic.summaryProjectId || null : undefined;
+  if (from !== undefined && from !== now)
+    notes.push("（注意: 以下の要約は対象「" + label(from) + "」の時点のものです。現在の対象は「" + label(now) + "」です）");
+  const carried = topic.carriedProjectId === undefined ? undefined : topic.carriedProjectId || null;
+  if (carried !== undefined && carried !== now && carried !== from)
+    notes.push("（注意: 引き継いだ会話には対象「" + label(carried) + "」の時点の内容が含まれます。現在の対象は「" + label(now) + "」です）");
+  return notes.length ? notes.join("\n") + "\n" : "";
+}

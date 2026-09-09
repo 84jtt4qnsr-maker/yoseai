@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   validateStateShape,
@@ -25,6 +25,15 @@ import {
   HISTORY_MAX_BYTES,
   DIFF_MAX_BYTES,
   safeVersionFileName,
+  isInsidePath,
+  normalizeProbe,
+  topicHasRunLegacy,
+  projectDigest,
+  projectPromptLine,
+  projectChangeNote,
+  summaryOriginNote,
+  PROJECT_DIGEST_MAX,
+  PROJECT_README_MAX_BYTES,
 } from "./lib.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -77,6 +86,8 @@ function defaultTopic(title) {
     ts: Date.now(),
     relay: defaultRelay(),
     agents: { claude: topicAgent(), codex: topicAgent() },
+    projectId: null, // 対象プロジェクト（null = 未紐付け = Kometa リポジトリ）
+    projectLocked: false, // 初回実行で立つ。以後は対象を変更できない（仕様: 実行後の変更は新規トピック）
   };
 }
 
@@ -90,6 +101,7 @@ function emptyState() {
     tasks: [],
     pool: [],
     topics: [defaultTopic("メイン")],
+    projects: [],
     agents: { claude: defaultAgent(), codex: defaultAgent() },
     budgets: defaultBudgets(),
     usageDay: null,
@@ -226,6 +238,15 @@ function loadState() {
         for (const r of p.reviews || []) migrateMeta(r);
         for (const f of p.fixes || []) migrateMeta(f);
       }
+      // schemaVersion 6: プロジェクト登録とトピック紐付け（仕様: SPEC-プロジェクト紐付け.md）
+      // projectLocked は旧トピックについて一度だけ推定し、以後はフラグが正（再計算しない）
+      parsed.projects = Array.isArray(parsed.projects) ? parsed.projects : [];
+      for (const t of parsed.topics) {
+        if (t.projectId === undefined) t.projectId = null;
+        if (typeof t.projectLocked !== "boolean") t.projectLocked = topicHasRunLegacy(t, parsed.messages);
+        // 要約の出所（要約生成時の対象）。未記録なら「現在の対象で作られた要約」とみなす
+        if (t.summaryProjectId === undefined) t.summaryProjectId = t.summaryText ? t.projectId : null;
+      }
       return parsed;
     }
   } catch (e) {
@@ -264,7 +285,7 @@ function persistState() {
   const t0 = Date.now();
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    state.schemaVersion = 5;
+    state.schemaVersion = 6;
     const jsonStr = JSON.stringify(state, null, 2);
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, jsonStr);
@@ -320,6 +341,7 @@ function buildThreadMirror(t, msgs) {
     (t.branchedFrom
       ? `branchedFrom: ${(findTopic(t.branchedFrom.topicId) || {}).title || t.branchedFrom.topicId}（message ${t.branchedFrom.messageId}）\n`
       : "") +
+    (t.projectId ? `project: ${(findProject(t.projectId) || { name: "(登録解除済み)", path: t.projectId }).name} (${(findProject(t.projectId) || { path: "" }).path})\n` : "") +
     `---\n\n`;
 
   // 📦 成果物索引: このスレッドのメッセージ由来のプールアイテム＋本文で言及されたプールファイル
@@ -611,10 +633,177 @@ function commonRulesBlock(kind) {
   }
 }
 
+// ---- ローカルプロジェクト登録とトピック紐付け（仕様: SPEC-プロジェクト紐付け.md）----
+// 書き込み範囲は変えない（Claude は Edit(u2a2a/pool/**)、Codex は -C pool）。対象は絶対パスで読むだけ。
+// Claude はリポジトリ外を読めないので --add-dir <path> を足す（工程 0 で読み取り可・書き込み拒否を確認済み）
+
+const PROJECT_PROBE_TIMEOUT_MS = 3000;
+const findProject = (pid) => (pid ? state.projects.find((p) => p.id === pid) || null : null);
+// 対象の表示名（null = Kometa リポジトリ、解決できない id = 登録解除済み）
+const projectLabel = (pid) => (pid ? (findProject(pid) || { name: "(登録解除済み)" }).name : "Kometa リポジトリ");
+// トピックの対象プロジェクト id（成果物登録時に写す）
+const projectIdOfTopic = (tid) => {
+  const t = tid ? findTopic(tid) : null;
+  return t && t.projectId ? t.projectId : null;
+};
+
+function poolRealPath() {
+  try {
+    return fs.realpathSync(POOL_DIR);
+  } catch {
+    return path.resolve(POOL_DIR);
+  }
+}
+
+// 登録時の検証: 絶対パス → realpath 正規化 → ディレクトリ → プール外。戻り値 { ok, path, kind } or { error, status }
+function validateProjectPath(input) {
+  if (typeof input !== "string" || !input.trim()) return { error: "path は必須です", status: 400 };
+  const raw = input.trim().replace(/^~(?=$|\/)/, os.homedir());
+  if (!path.isAbsolute(raw)) return { error: "絶対パスを指定してください", status: 400 };
+  let real;
+  try {
+    real = fs.realpathSync(raw);
+  } catch {
+    return { error: "パスが存在しません", status: 404 };
+  }
+  let st;
+  try {
+    st = fs.statSync(real);
+  } catch {
+    return { error: "パスが存在しません", status: 404 };
+  }
+  if (!st.isDirectory()) return { error: "ディレクトリではありません", status: 400 };
+  if (isInsidePath(real, poolRealPath())) return { error: "プール（u2a2a/pool/）配下は登録できません", status: 400 };
+  const kind = fs.existsSync(path.join(real, ".git")) ? "git" : "dir";
+  return { ok: true, path: real, kind };
+}
+
+// git を shell を介さず実行する（要件 a）。失敗は例外にせず { ok: false, err } で返す
+function gitExec(cwd, args) {
+  return new Promise((resolve) => {
+    let done = false;
+    const fin = (r) => {
+      if (!done) {
+        done = true;
+        resolve(r);
+      }
+    };
+    try {
+      const child = execFile(
+        "git",
+        args,
+        { cwd, timeout: PROJECT_PROBE_TIMEOUT_MS, env: { ...spawnEnv(), GIT_OPTIONAL_LOCKS: "0" }, maxBuffer: 1024 * 1024 },
+        (err, stdout, stderr) => {
+          if (!err) return fin({ ok: true, out: String(stdout) });
+          const msg = err.killed
+            ? `タイムアウト（${PROJECT_PROBE_TIMEOUT_MS / 1000}秒）`
+            : err.code === "ENOENT"
+              ? "git が見つかりません"
+              : String(stderr || err.message || "").trim().slice(0, 200) || "git エラー";
+          fin({ ok: false, err: msg });
+        }
+      );
+      child.on("error", (e) => fin({ ok: false, err: String(e.message || e) }));
+    } catch (e) {
+      fin({ ok: false, err: String(e.message || e) });
+    }
+  });
+}
+
+// プロジェクトの現況（存在・読み取り・Git 情報）。エラーにせず status で表す（unavailable は実行を止めない）
+async function probeProject(project) {
+  if (!project) return normalizeProbe({ unregistered: true });
+  let exists = false;
+  let readable = false;
+  try {
+    exists = fs.statSync(project.path).isDirectory();
+  } catch {
+    exists = false;
+  }
+  if (exists) {
+    try {
+      fs.accessSync(project.path, fs.constants.R_OK | fs.constants.X_OK);
+      readable = true;
+    } catch {
+      readable = false;
+    }
+  }
+  const isGit = exists && readable && fs.existsSync(path.join(project.path, ".git"));
+  let git = null;
+  if (isGit) {
+    const [branch, head, status] = await Promise.all([
+      gitExec(project.path, ["rev-parse", "--abbrev-ref", "HEAD"]),
+      gitExec(project.path, ["rev-parse", "--short", "HEAD"]),
+      gitExec(project.path, ["status", "--porcelain"]),
+    ]);
+    git = { branch, head, status };
+  }
+  return normalizeProbe({ exists, readable, isGit, git });
+}
+
+// 通常ファイルか（symlink は辿る。FIFO・ソケット・デバイスは除外 — 開くと固まる／読み終わらない）
+function isRegularFile(abs) {
+  try {
+    return fs.statSync(abs).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// ファイル冒頭を maxBytes だけ読む（全読みしない）。末尾で切れた多バイト文字（置換文字 U+FFFD）は落とす
+function readHeadUtf8(abs, maxBytes) {
+  const fd = fs.openSync(abs, "r");
+  try {
+    const buf = Buffer.alloc(maxBytes);
+    const n = fs.readSync(fd, buf, 0, maxBytes, 0);
+    let text = buf.toString("utf8", 0, n);
+    const bad = String.fromCharCode(0xfffd);
+    while (text.endsWith(bad)) text = text.slice(0, -1);
+    return text;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// 初回プロンプト用の要約（README 冒頭＋直下エントリ名、合計 4,000 文字）。読めなくても会話は開始できる。
+// README は通常ファイルに限り、読み取り自体を PROJECT_README_MAX_BYTES で打ち切る（巨大 README で全体を待たせない）
+function projectDigestFor(project) {
+  try {
+    const entries = fs.readdirSync(project.path, { withFileTypes: true }).map((e) => ({ name: e.name, dir: e.isDirectory() }));
+    const readme = entries.find((e) => !e.dir && /^readme(\..+)?$/i.test(e.name) && isRegularFile(path.join(project.path, e.name)));
+    let readmeText = "";
+    if (readme) readmeText = readHeadUtf8(path.join(project.path, readme.name), PROJECT_README_MAX_BYTES).slice(0, PROJECT_DIGEST_MAX);
+    return projectDigest({ readmeName: readme ? readme.name : null, readmeText, entries });
+  } catch (e) {
+    return projectDigest({ error: String(e.message || e).slice(0, 120) });
+  }
+}
+
+// 実行前の対象確認。{ project, probe, blockReason } — blockReason があれば実行しない
+// （missing / unreadable / unregistered は止める。unavailable は「確認不可」として続行。未紐付けは何もしない）
+async function projectContext(projectId) {
+  if (!projectId) return { project: null, probe: null, blockReason: null };
+  const project = findProject(projectId);
+  const probe = await probeProject(project);
+  const blockReason = ["missing", "unreadable", "unregistered"].includes(probe.status)
+    ? `対象プロジェクトを確認できません（${project ? project.path : projectId}: ${probe.status}／${probe.note}）`
+    : null;
+  return { project, probe, blockReason };
+}
+
+// Claude の起動引数（書き込みは pool のみ。Write(path) 規則はファイル権限に作用しないので Edit のみ。対象があれば --add-dir で読み取りを許可）
+function claudeToolArgs(project) {
+  const args = ["--allowedTools", "Edit(u2a2a/pool/**)", "Bash(python3:*)", "Bash(ffmpeg:*)"];
+  if (project) args.push("--add-dir", project.path);
+  return args;
+}
+
 // ---- ファイル変更スナップショット（合意事項: レビュアーの根拠が黙って失効しないように）----
 // 前回プロンプト生成時点のファイル状態（mtime/size）を (topic, agent) ごとに保存し、
 // 次回プロンプトに「変更・追加・削除されたパス」を一行添える。対象は固定リストで有界
-function takeFileSnapshot(topicId) {
+// poolOnly: 紐付けありトピック用。Kometa 側（server.mjs / public / runtime / ルートの .md）は走査せず、
+// プール内（共通ルールとこのトピックの成果物）だけを見る（対象プロジェクト側の変化は probe で注記する）
+function takeFileSnapshot(topicId, { poolOnly = false } = {}) {
   const snap = {};
   const addFile = (abs, rel) => {
     try {
@@ -641,10 +830,13 @@ function takeFileSnapshot(topicId) {
       else addFile(abs, rel);
     }
   };
-  addFile(path.join(REPO_ROOT, "u2a2a/server.mjs"), "u2a2a/server.mjs");
-  walk(path.join(REPO_ROOT, "u2a2a/public"), "u2a2a/public");
+  if (!poolOnly) {
+    addFile(path.join(REPO_ROOT, "u2a2a/server.mjs"), "u2a2a/server.mjs");
+    walk(path.join(REPO_ROOT, "u2a2a/public"), "u2a2a/public");
+  }
   addFile(RULES_FILE, "u2a2a/pool/U2A2A_RULES.md");
   if (topicId) walk(path.join(POOL_DIR, "topics", topicId), "u2a2a/pool/topics/" + topicId);
+  if (poolOnly) return snap;
   walk(path.join(REPO_ROOT, "runtime"), "runtime");
   try {
     for (const e of fs.readdirSync(REPO_ROOT, { withFileTypes: true })) {
@@ -753,8 +945,17 @@ function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = nul
   });
 }
 
-function buildPrompt(topic, agent, msgs, isFirst, changesNote = "") {
+function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo = null) {
   const other = agent === "claude" ? "codex" : "claude";
+  const project = projectInfo && projectInfo.project ? projectInfo.project : null;
+  // 対象プロジェクトの 1 行（name・path・branch・HEAD・未コミット数、または確認不可）。probe は毎回取り直すので初回に限らず毎回添える
+  const projectLine = project ? projectPromptLine(project, projectInfo.probe) : "";
+  // 作業範囲の説明: 紐付けありなら対象プロジェクト（閲覧のみ）、未紐付けは従来どおり Kometa リポジトリ
+  const workNote = project
+    ? (agent === "claude" ? "" : `作業ディレクトリは u2a2a/pool（成果物置き場・書き込み可）。`) + projectLine
+    : agent === "claude"
+      ? `作業ディレクトリは Kometa リポジトリ（閲覧のみ、変更は不可）。`
+      : `作業ディレクトリは u2a2a/pool（成果物置き場・書き込み可）。Kometa リポジトリ本体（${REPO_ROOT}）は閲覧のみ。`;
   const lines = msgs
     .map((m) => {
       const pv = m.provenance || {};
@@ -780,12 +981,10 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "") {
     ? `あなたは「U2A2Aオーケストレーション」アプリの ${NAMES[agent]} 側スレッドの担当エージェントです。` +
       `このスレッドのトピックは「${topic.title}」です。` +
       `参加者はユーザー・${NAMES[agent]}（あなた）・${NAMES[other]} の三者です。` +
-      (agent === "claude"
-        ? `作業ディレクトリは Kometa リポジトリ（閲覧のみ、変更は不可）。`
-        : `作業ディレクトリは u2a2a/pool（成果物置き場・書き込み可）。Kometa リポジトリ本体（${REPO_ROOT}）は閲覧のみ。`) +
+      workNote +
       `新着メッセージに ${NAMES[agent]} として日本語で簡潔に返答してください。` +
       `実装作業が必要な場合は作業内容を提案し、タスク化はユーザーに委ねてください。\n\n--- 新着メッセージ ---\n`
-    : "--- 新着メッセージ ---\n";
+    : (projectLine ? projectLine + "\n\n" : "") + "--- 新着メッセージ ---\n"; // 継続でも最新の Git 情報は毎回渡す（概要だけ初回限定）
   // 質疑の初手（このエージェントがまだ発言しておらず、発端も未見）には論点・発端・ミラー・要約を添える
   let qaJoinNote = "";
   const r = topic.relay;
@@ -814,15 +1013,21 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "") {
         `保存したら本文にそのパスを書いてください — アプリがインライン表示します）`
       : `\n\n（カレントディレクトリ＝ ${saveDir}/ が成果物の保存先です（書き込みはここのみ）。` +
         `中間生成物は .work/ へ。python3 / ffmpeg で画像・音声・動画を生成できます。` +
-        `リポジトリ本体は ${REPO_ROOT} を絶対パスで参照（閲覧のみ）。` +
+        (project ? `対象プロジェクトは ${project.path} を絶対パスで参照（閲覧のみ）。` : `リポジトリ本体は ${REPO_ROOT} を絶対パスで参照（閲覧のみ）。`) +
         `保存したら本文に ${saveDir}/〜 のパスを書いてください — アプリがインライン表示します。` +
         `短い SVG 等は本文のコードブロックでも構いません）`;
   // キャンセル等で新セッションになった場合、保存済み要約で文脈を再注入する
+  // 要約・引き継ぎ会話の出所が現在の対象と違えば注記する（別対象への分岐、分岐後の対象変更、いずれも同じ判定）
+  const originNote = isFirst ? summaryOriginNote(topic, projectLabel) : "";
   const contextNote =
     isFirst && topic.summaryText && state.messages.some((m) => m.topicId === topic.id)
-      ? `\n\n--- これまでのスレッドの要約（新しいセッションのための文脈） ---\n${topic.summaryText}\n`
-      : "";
-  return preamble + contextNote + qaJoinNote + lines + qaNote + changesNote + artifactNote + commonRulesBlock("通常応答");
+      ? `\n\n--- これまでのスレッドの要約（新しいセッションのための文脈） ---\n${originNote}${topic.summaryText}\n`
+      : originNote
+        ? `\n\n${originNote}`
+        : "";
+  // 紐付けありの初回のみ、対象プロジェクトの概要（README 冒頭＋直下エントリ名、4,000 文字まで）
+  const digestNote = isFirst && project && projectInfo.digest ? `\n\n--- 対象プロジェクトの概要（初回のみ） ---\n${projectInfo.digest}\n` : "";
+  return preamble + contextNote + digestNote + qaJoinNote + lines + qaNote + changesNote + artifactNote + commonRulesBlock("通常応答");
 }
 
 // 質疑モード: エージェントの応答完了を待って相手スレッドへ中継する（トピック単位）
@@ -1415,6 +1620,7 @@ function registerDeclaredArtifacts(text, agent, topicId, msgId) {
         origin: agent,
         via: "declared",
         topicId: topicIdFromPath(rel) || topicId || null,
+        projectId: projectIdOfTopic(topicIdFromPath(rel) || topicId || null),
         status: "submitted",
         reviews: [],
         fromMessageId: msgId,
@@ -1478,6 +1684,7 @@ function scanPoolDir() {
         origin,
         via: inf.origin ? "inferred" : inf.candidates === 0 ? "folder" : "unknown",
         topicId: tid,
+        projectId: projectIdOfTopic(tid),
         status: "submitted",
         reviews: [],
         ...statPoolFile(name),
@@ -1514,7 +1721,18 @@ function verdictFrom(text) {
   return m ? m[1] : "";
 }
 
-function buildReviewPrompt(item, reviewer, history = null) {
+// 成果物の対象を表す文言（item.projectId があればそのプロジェクト、なければ従来の Kometa リポジトリ）。
+// Git 情報は文章を再解析して取り出さず（名前に「。」があると崩れる）、probe から整形した 1 行を targetLine で別に添える
+function targetPhrase(pc) {
+  if (!pc || !pc.project) return `Kometa リポジトリ（閲覧のみ可）`;
+  return `対象プロジェクト「${pc.project.name}」（${pc.project.path}、閲覧のみ可）`;
+}
+// 対象プロジェクトの現況 1 行（name・path・branch・HEAD・未コミット数／確認不可）＋改行。未紐付けなら空
+function targetLine(pc) {
+  return pc && pc.project ? projectPromptLine(pc.project, pc.probe) + "\n" : "";
+}
+
+function buildReviewPrompt(item, reviewer, history = null, pc = null) {
   const rel = item.file ? `u2a2a/pool/${item.file}` : null;
   const origin = NAMES[item.origin] || "作者未確定";
   let contentPart;
@@ -1551,7 +1769,8 @@ function buildReviewPrompt(item, reviewer, history = null) {
   }
   return (
     `あなたは「U2A2Aオーケストレーション」の共有タスクプール（u2a2a/pool/ = アプリ専用の成果物置き場）のレビュアー（${NAMES[reviewer]}）です。` +
-    `以下の成果物を、Kometa リポジトリ（閲覧のみ可）の実態と照らして、忖度なく具体的にレビューしてください。\n` +
+    `以下の成果物を、${targetPhrase(pc)}の実態と照らして、忖度なく具体的にレビューしてください。\n` +
+    targetLine(pc) +
     `- 問題点・リスク・改善案を挙げる\n` +
     `- 既存の実装や他タスク・プール内の他成果物との重複、不要な作業の兆候があれば指摘する\n` +
     `- 良い点は簡潔に認める\n` +
@@ -1586,6 +1805,23 @@ async function runReview(itemId, reviewer) {
     if (!reviewPending[itemId].length) delete reviewPending[itemId];
     touch();
   };
+  // 成果物に記録された対象プロジェクトを確認（開いているトピックからは推測しない）
+  const pc = await projectContext(item.projectId);
+  if (pc.blockReason) {
+    item.reviews.push({
+      id: id(),
+      reviewer,
+      text: "（レビュー中止: " + pc.blockReason + "）",
+      verdict: "",
+      error: true,
+      projectError: pc.blockReason,
+      ts: Date.now(),
+      ...reviewVersionFields(item, null),
+    });
+    logEvent("project", pc.blockReason, "warn");
+    finish();
+    return;
+  }
   // レビュー対象の版を保存し、何を見て判定したかを記録する。プロンプトの本文はこの保存版（同一バイト列）から作る。
   // 履歴対象のファイルで保存に失敗したら（読み取り障害・manifest 破損／索引欠損・版ファイル復旧不能）レビューは中止し、
   // error 付きの記録に historyError を残す（修正の「前版が保存できなければ実行しない」と同じ扱い。
@@ -1613,7 +1849,9 @@ async function runReview(itemId, reviewer) {
   }
   try {
     const call = reviewer === "claude" ? callClaude : callCodex;
-    const { text, meta } = await call(buildReviewPrompt(item, reviewer, history), null, state.agents[reviewer].modelOverride, (s) => actStep(actKey, s));
+    // Claude は対象プロジェクトを読むために --add-dir を足す（読み取りのみ。書き込み規則は付けない）
+    const callOpts = reviewer === "claude" && pc.project ? { extraArgs: ["--add-dir", pc.project.path] } : {};
+    const { text, meta } = await call(buildReviewPrompt(item, reviewer, history, pc), null, state.agents[reviewer].modelOverride, (s) => actStep(actKey, s), callOpts);
     item.reviews.push({ id: id(), reviewer, text, verdict: verdictFrom(text), meta, ts: Date.now(), ...reviewVersionFields(item, history) });
   } catch (e) {
     item.reviews.push({
@@ -1632,15 +1870,19 @@ async function runReview(itemId, reviewer) {
 
 // ---- レビュー後の修正: 担当エージェントがプールフォルダ限定の書き込み権限でファイルを直す ----
 
-function buildFixPrompt(item, agent) {
+function buildFixPrompt(item, agent, pc = null) {
   const reviews = (item.reviews || [])
     .filter((r) => !r.error)
     .map((r) => `--- ${NAMES[r.reviewer]} のレビュー（判定: ${r.verdict || "なし"}） ---\n${r.text}`)
     .join("\n\n");
+  // Claude は cwd=リポジトリルート（書き込み規則 Edit(u2a2a/pool/**) が効く配置）、Codex は cwd=pool
+  const fileRef = agent === "claude" ? `u2a2a/pool/${item.file}（リポジトリルートからの相対パス）` : `${item.file}（カレントディレクトリ＝ u2a2a/pool）`;
   return (
     `あなたは U2A2A 共有タスクプールの成果物を修正する担当（${NAMES[agent]}）です。` +
-    `カレントディレクトリにある成果物ファイル「${item.file}」を、以下のレビューを踏まえて修正し、` +
-    `**同じファイル名で上書き保存**してください。新しいファイルは作らないこと。\n` +
+    `成果物ファイル ${fileRef} を、以下のレビューを踏まえて修正し、` +
+    `**同じファイル名で上書き保存**してください。新しいファイルは作らないこと。` +
+    `照合先は${targetPhrase(pc)}。\n` +
+    targetLine(pc) +
     `- 妥当な指摘には対応する\n` +
     `- 誤っている・過剰な指摘には従わず、応答で理由を述べる\n` +
     `- ファイル保存を済ませてから、応答として「何をどう直したか／直さなかったか」の要約を簡潔に書く\n\n` +
@@ -1671,6 +1913,17 @@ async function runFix(itemId, agent) {
     delete fixPending[itemId];
     touch();
   };
+  // 成果物に記録された対象プロジェクトを確認（missing / unreadable / unregistered なら修正しない）
+  const pc = await projectContext(item.projectId);
+  if (pc.blockReason) {
+    fix.projectError = pc.blockReason;
+    fix.text = "（修正中止: " + pc.blockReason + "）";
+    fix.error = true;
+    item.fixes.push(fix);
+    logEvent("project", pc.blockReason, "warn");
+    finish();
+    return;
+  }
   // 修正前の版を保存（仕様: 保存失敗は修正を中止。履歴対象外のファイルは従来どおり .trash へ世代バックアップして続行）
   let tracked = false;
   try {
@@ -1696,15 +1949,14 @@ async function runFix(itemId, agent) {
   }
   let cliOk = false;
   try {
-    const prompt = buildFixPrompt(item, agent);
+    const prompt = buildFixPrompt(item, agent, pc);
     const onStep = (s) => actStep(actKey, s);
     const override = state.agents[agent].modelOverride;
+    // Claude: acceptEdits は --add-dir 先の編集まで自動承認するため使わない。通常応答と同じ
+    // cwd=リポジトリルート＋ Edit(u2a2a/pool/**) 規則（工程 0 で読み取り可・外部への書き込み拒否を実測済み）
     const { text, meta } =
       agent === "claude"
-        ? await callClaude(prompt, null, override, onStep, {
-            cwd: POOL_DIR,
-            extraArgs: ["--permission-mode", "acceptEdits"], // 書き込みは cwd=pool/ 内のみ
-          })
+        ? await callClaude(prompt, null, override, onStep, { extraArgs: claudeToolArgs(pc.project) })
         : await callCodex(prompt, null, override, onStep, { writeDir: POOL_DIR });
     Object.assign(fix, { text, meta });
     cliOk = true;
@@ -1753,6 +2005,17 @@ async function summarizeTopic(topicId) {
   const msgs = state.messages.filter((m) => m.topicId === topicId);
   if (!msgs.length) return;
   summaryPending.add(topicId);
+  // 要約の出所は開始時点の対象で固定する（await の間に PATCH で対象が変わっても、この要約は開始時点の対象の文脈で作られたもの）
+  const originProjectId = topic.projectId || null;
+  // 前回の要約が別の対象（分岐元など）で作られたもの、または分岐で引き継いだ会話の出所（carriedProjectId、
+  // 再要約でも消えない恒久マーク）が現在の対象と違うなら、要約入力にその旨を明示し、旧対象での合意を区別して残すよう指示する
+  const prevOrigin = topic.summaryText ? topic.summaryProjectId || null : null;
+  const carriedSummary = !!topic.summaryText && prevOrigin !== originProjectId;
+  const inheritedOrigin = topic.carriedProjectId === undefined ? undefined : topic.carriedProjectId || null;
+  const carriedConv = inheritedOrigin !== undefined && inheritedOrigin !== originProjectId;
+  const carried = carriedSummary || carriedConv;
+  const prevLabel = projectLabel(carriedSummary ? prevOrigin : carriedConv ? inheritedOrigin : null);
+  const nowLabel = projectLabel(originProjectId);
   const run = startRun("summary", "claude", { topicId });
   const actKey = "summary:" + topicId;
   actStart(actKey, "スレッド要約", run.runId);
@@ -1763,16 +2026,24 @@ async function summarizeTopic(topicId) {
       .join("\n\n");
     const prompt =
       `以下は「U2A2Aオーケストレーション」のスレッド「${topic.title}」の会話です。` +
-      (topic.summaryText ? `\n\n--- 前回までの要約 ---\n${topic.summaryText}\n` : "") +
+      `対象プロジェクトは「${nowLabel}」です。` +
+      (topic.summaryText ? `\n\n--- 前回までの要約${carriedSummary ? `（対象「${projectLabel(prevOrigin)}」の時点のもの）` : ""} ---\n${topic.summaryText}\n` : "") +
+      (carriedConv ? `\n（この会話には、分岐で引き継いだ対象「${projectLabel(inheritedOrigin)}」の時点の内容が含まれます）\n` : "") +
       `\n--- 会話（直近・抜粋） ---\n${lines}\n\n--- 指示 ---\n` +
       `このスレッドの現況要約を日本語・最大12行で書いてください。` +
       `必ず「## 合意済み」「## 未決」の2見出しで構造化し、生成された成果物（u2a2a/pool/ パス）は合意済み側に含める。` +
+      (carried
+        ? `前回までの要約と、対象が「${prevLabel}」だった時点の会話で決まった事項を合意済みに残す場合は、` +
+          `各項目に「（旧対象「${prevLabel}」での合意）」と明記し、現在の対象「${nowLabel}」で改めて確認した事項と区別する。`
+        : "") +
       `前置きなしで要約本文のみを出力。`;
     const { text, meta } = await callClaude(prompt, null, "haiku", (s2) => actStep(actKey, s2), { ctl: run.ctl });
     if (meta && meta.billing && meta.billing.mode === "metered") {
       topic.summaryCostUsd = (topic.summaryCostUsd || 0) + meta.billing.usd; // 計上漏れ防止
     }
-    topic.summaryText = text.trim();
+    // 旧対象の要約を引き継いで更新した場合は、モデルの出力に依らず引き継ぎの注記を先頭に固定で残す
+    topic.summaryText = (carried ? `（この要約は対象「${prevLabel}」の時点の内容を引き継ぎ、対象「${nowLabel}」で更新したものです）\n` : "") + text.trim();
+    topic.summaryProjectId = originProjectId; // 要約の出所（開始時点の対象。分岐で要約と一緒に引き継ぐ）
     topic.summaryAt = msgs.length;
     topic.summaryTs = Date.now();
     topic.summaryLastMsgId = msgs[msgs.length - 1].id; // 「どこまでを対象にした要約か」を固定
@@ -1911,6 +2182,7 @@ function syncExternal(topic, agent) {
       provenance: { ingress: "cli-sync", delivery: "direct", trigger: "manual", source: null },
       ts: Date.now(),
     });
+    if (m.author !== "user") topic.projectLocked = true; // 外部で実行された分も「実行済み」に数える
     added = true;
   }
   return added;
@@ -1949,6 +2221,11 @@ async function agentLoop(topicId, agent) {
     return;
   }
   running[key] = true;
+  {
+    // 対象の固定（仕様: 初回起動の準備より前・await より前に立て、失敗・中断・リセット後も下ろさない）
+    const t0 = findTopic(topicId);
+    if (t0 && !t0.projectLocked) t0.projectLocked = true;
+  }
   broadcast();
   try {
     while (true) {
@@ -1964,14 +2241,40 @@ async function agentLoop(topicId, agent) {
       }
       const msgs = unseenFor(topic, agent);
       if (!agentAutoOn(agent) || !msgs.length) break;
+      // 対象プロジェクトの確認（Git 実行を含む、起動前で唯一の await）。
+      // missing / unreadable / unregistered なら実行せず理由を残す。unavailable は続行
+      const pc = await projectContext(topic.projectId);
+      // 確認待ちの間に自動応答 OFF・上限停止・トピック削除が起きていれば起動しない
+      if (!agentAutoOn(agent) || findTopic(topicId) !== topic) break;
+      if (pc.blockReason) {
+        topic.relay.active = false;
+        a.lastError = pc.blockReason;
+        state.messages.push({
+          id: id(),
+          topicId,
+          thread: agent,
+          author: agent,
+          text: "⛔ " + pc.blockReason + "。登録先を直してから送り直してください",
+          blocked: true,
+          provenance: { ingress: "agent-loop", delivery: "direct", trigger: "auto", source: null },
+          ts: Date.now(),
+        });
+        logEvent("project", pc.blockReason, "warn");
+        touch();
+        break; // 既読位置は進めない（登録先を戻せば同じメッセージから再開できる）
+      }
+      // 予算判定は確認の後、実行登録（startRun）の直前。ここから startRun までは同期処理だけで await を挟まない
+      // （同時送信でも、先に登録された run が走行中件数に数えられ、上限を超えて起動しない）
       const overBudget = budgetStatus(topicId);
       if (overBudget) {
         triggerBudgetHalt(topicId, agent, overBudget);
         break;
       }
-      const curSnapshot = takeFileSnapshot(topicId);
-      const changesNote = fileChangeNote(ta.fileSnapshot, curSnapshot);
-      const prompt = buildPrompt(topic, agent, msgs, !ta.sessionId, changesNote);
+      // 紐付けありでは Kometa 側は走査せず、プール内（このトピックの成果物・共通ルール）の変化と対象の未コミット変更を注記する
+      const curSnapshot = takeFileSnapshot(topicId, { poolOnly: !!pc.project });
+      const changesNote = fileChangeNote(ta.fileSnapshot, curSnapshot) + (pc.project ? projectChangeNote(pc.probe) : "");
+      const projectInfo = pc.project ? { ...pc, digest: !ta.sessionId ? projectDigestFor(pc.project) : "" } : null;
+      const prompt = buildPrompt(topic, agent, msgs, !ta.sessionId, changesNote, projectInfo);
       const actKey = "thread:" + topicId + ":" + agent;
       const run = startRun("thread", agent, { topicId });
       run.sessionId = ta.sessionId || null;
@@ -1983,7 +2286,7 @@ async function agentLoop(topicId, agent) {
         const hadSession = !!ta.sessionId;
         const opts =
           agent === "claude"
-            ? { extraArgs: ["--allowedTools", "Write(u2a2a/pool/**)", "Edit(u2a2a/pool/**)", "Bash(python3:*)", "Bash(ffmpeg:*)"] }
+            ? { extraArgs: claudeToolArgs(pc.project) }
             : { writeDir: ensureTopicDir(topicId), resumeWritable: !!ta.codexPoolCwd };
         opts.ctl = run.ctl;
         opts.onSessionId = (sid) => (run.sessionId = sid); // 早期捕捉（キャンセル時に interrupted として保持）
@@ -2259,10 +2562,53 @@ async function handleApi(req, res, url) {
   }
 
   // ---- トピック（スレッド）管理 ----
+  // ---- ローカルプロジェクト登録（仕様: SPEC-プロジェクト紐付け.md） ----
+  if (req.method === "GET" && url.pathname === "/api/projects") {
+    return json(res, 200, { projects: state.projects });
+  }
+  if (req.method === "POST" && url.pathname === "/api/projects") {
+    const body = await readBody(req);
+    const v = validateProjectPath(body.path);
+    if (!v.ok) return json(res, v.status, { error: v.error });
+    const existing = state.projects.find((p) => p.path === v.path);
+    if (existing) return json(res, 200, { project: existing, existing: true });
+    const name = typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, 60) : path.basename(v.path);
+    const project = { id: "p_" + id(), name, path: v.path, kind: v.kind, addedTs: Date.now() };
+    state.projects.push(project);
+    touch();
+    return json(res, 201, { project });
+  }
+  if (parts[0] === "api" && parts[1] === "projects" && parts[2]) {
+    const project = findProject(parts[2]);
+    if (!project) return json(res, 404, { error: "project not found" });
+    if (req.method === "GET" && parts[3] === "probe") {
+      return json(res, 200, await probeProject(project));
+    }
+    if (req.method === "PATCH" && parts.length === 3) {
+      const body = await readBody(req);
+      if (typeof body.name === "string" && body.name.trim()) project.name = body.name.trim().slice(0, 60);
+      touch();
+      return json(res, 200, { project });
+    }
+    if (req.method === "DELETE" && parts.length === 3) {
+      // 参照されている登録は削除できない（強制削除は設けない — 合意「Kometa へ自動で戻さない」）
+      const topics = state.topics.filter((t) => t.projectId === project.id).map((t) => t.id);
+      const items = state.pool.filter((it) => it.projectId === project.id).map((it) => it.id);
+      if (topics.length || items.length) return json(res, 409, { error: "トピックまたは成果物から参照されているため削除できません", topics, items });
+      state.projects = state.projects.filter((p) => p.id !== project.id);
+      touch();
+      return json(res, 200, { ok: true });
+    }
+  }
+
   if (req.method === "POST" && url.pathname === "/api/topics") {
     const body = await readBody(req);
     const title = typeof body.title === "string" && body.title.trim() ? body.title.trim().slice(0, 60) : "新しいスレッド";
     const topic = defaultTopic(title);
+    if (body.projectId) {
+      if (!findProject(body.projectId)) return json(res, 400, { error: "未登録の projectId です" });
+      topic.projectId = body.projectId;
+    }
     state.topics.push(topic);
     touch();
     return json(res, 201, topic);
@@ -2298,8 +2644,18 @@ async function handleApi(req, res, url) {
       if (!at) return json(res, 404, { error: "分岐点のメッセージが見つかりません" });
       const branched = defaultTopic(topic.title.slice(0, 50) + "＃分岐");
       branched.branchedFrom = { topicId: topic.id, messageId: at.id };
-      // 分岐元の要約を持ち込む（新セッションの初回応答で文脈として再注入される）
+      // 対象プロジェクト: 省略時は継承
+      if (body.projectId !== undefined && body.projectId !== null && !findProject(body.projectId)) return json(res, 400, { error: "未登録の projectId です" });
+      branched.projectId = body.projectId === undefined ? topic.projectId : body.projectId;
+      branched.projectLocked = false; // 発言のコピーは実行ではない。分岐先自身の初回実行で立つ
+      // 分岐元の要約を持ち込む（新セッションの初回応答で文脈として再注入される）。
+      // 出所（summaryProjectId）も要約と一緒に引き継ぎ、現在の対象と違うときは buildPrompt が注記する
+      // （別対象への分岐だけでなく、分岐後・初回実行前に PATCH で対象を変えた場合も同じ判定で注記される）
       branched.summaryText = topic.summaryText || "";
+      branched.summaryProjectId = topic.summaryText ? topic.summaryProjectId || null : null;
+      // 引き継いだ会話の出所（要約の有無に依らず記録。再要約でも上書きされない恒久マーク）。
+      // 分岐元自身が引き継ぎ元を持つ場合はそれを保ち、最初の出所を失わない
+      branched.carriedProjectId = topic.carriedProjectId !== undefined ? topic.carriedProjectId : topic.projectId || null;
       branched.summaryTs = topic.summaryTs || null;
       branched.qaCount = topic.qaCount || 0;
       const copies = state.messages
@@ -2320,7 +2676,16 @@ async function handleApi(req, res, url) {
     }
     if (req.method === "PATCH") {
       const body = await readBody(req);
+      // 入力をすべて検証してから状態を変える（400／409 で返すときはトピックに何も残さない）。
+      // 対象プロジェクトの紐付けの可否はサーバが判定: 実行済み＝projectLocked なら 409、未登録 id は 400
+      const setProject = "projectId" in body;
+      if (setProject) {
+        if (topic.projectLocked) return json(res, 409, { error: "実行後は対象プロジェクトを変更できません（🌿 分岐で別プロジェクトのトピックを作れます）", reason: "locked" });
+        if (body.projectId !== null && !findProject(body.projectId)) return json(res, 400, { error: "未登録の projectId です" });
+      }
       if (typeof body.title === "string" && body.title.trim()) topic.title = body.title.trim().slice(0, 60);
+      // 要約の出所（summaryProjectId）は触らない — 現在の対象と違えば初回プロンプトで注記される
+      if (setProject) topic.projectId = body.projectId;
       // CLI セッションのリセット（次の応答から新セッション。codex は新方式 cwd=pool で始まる）
       if (AGENTS.includes(body.resetAgent)) {
         const ta = topic.agents[body.resetAgent];
@@ -2440,6 +2805,7 @@ async function handleApi(req, res, url) {
       file: name,
       origin: "user",
       topicId: topicIdFromPath(name),
+      projectId: projectIdOfTopic(topicIdFromPath(name)),
       via: "created",
       status: "submitted",
       reviews: [],
@@ -2479,6 +2845,7 @@ async function handleApi(req, res, url) {
       file: name,
       origin,
       topicId: topicIdFromPath(name) || (bodyTopic ? bodyTopic.id : null),
+      projectId: projectIdOfTopic(topicIdFromPath(name) || (bodyTopic ? bodyTopic.id : null)),
       status: "submitted",
       reviews: [],
       fromMessageId: typeof body.fromMessageId === "string" ? body.fromMessageId : null,
@@ -2517,6 +2884,7 @@ async function handleApi(req, res, url) {
       file: name,
       origin,
       topicId: topicIdFromPath(name) || (upTopic ? upTopic.id : null),
+      projectId: projectIdOfTopic(topicIdFromPath(name) || (upTopic ? upTopic.id : null)),
       via: "upload",
       status: "submitted",
       reviews: [],
@@ -2661,6 +3029,7 @@ async function handleApi(req, res, url) {
       agenda: typeof body.agenda === "string" ? body.agenda.trim().slice(0, 120) : "",
     };
     qaTopic.qaCount = (qaTopic.qaCount || 0) + 1;
+    qaTopic.projectLocked = true; // 質疑の開始も実行の開始
     const msg = {
       id: id(),
       topicId: qaTopic.id,
@@ -2825,5 +3194,5 @@ saveState();
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`U2A2A Orchestration: http://127.0.0.1:${PORT}`);
-  logEvent("system", "サーバー起動（schemaVersion 5）", "info");
+  logEvent("system", "サーバー起動（schemaVersion 6）", "info");
 });
