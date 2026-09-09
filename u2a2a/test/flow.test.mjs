@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 import { performance } from "node:perf_hooks";
 import { buildFlowGraph, groupUserSends, collectRelays, artifactVerdicts, nodeStatus, childBranches, branchOrigin, foldPlan, membershipOf } from "../lib.mjs";
 
@@ -462,3 +463,187 @@ for (const [name, inp] of Object.entries(fixtureInputs())) {
     assert.deepEqual(actual, saved.expected);
   });
 }
+
+// 実寸法・CSS・ブラウザ描画は別途受け入れ確認が必要。SSE相当の再描画は実関数を実行する。
+test("flow UI: filters, column jump and repeated redraw", () => {
+  const source = fs.readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const fixture = JSON.parse(fs.readFileSync(path.join(FIXTURE_DIR, "flow-3agents.json"), "utf8")).input;
+// 表示ロジック用の小さなDOM代替。CSSレイアウトやブラウザ描画の検証ではない。
+class Element {
+ constructor(tag='div'){this.tagName=tag.toUpperCase();this.children=[];this.parentElement=null;this.attrs={};this.dataset={};this.listeners={};this._text='';this.hidden=false;this.disabled=false;this.value='';this._top=0;this.scrollHeight=2500;this.clientHeight=500;this.scrollWidth=1000;this.style={setProperty:(k,v)=>this.style[k]=v,getPropertyValue:k=>this.style[k]||''};this.classList={contains:c=>this.classes.includes(c),add:(...cs)=>this.setAttribute('class',[...new Set([...this.classes,...cs])].join(' ')),remove:(...cs)=>this.setAttribute('class',this.classes.filter(c=>!cs.includes(c)).join(' ')),toggle:(c,b)=>{const yes=b??!this.classes.includes(c);yes?this.classList.add(c):this.classList.remove(c);return yes;}};}
+ get isConnected(){for(let n=this;n;n=n.parentElement)if(n===body)return true;return false;}
+ get classes(){return (this.attrs.class||'').split(/\s+/).filter(Boolean);}
+ get textContent(){return this._text+this.children.map(c=>c.textContent).join('');}
+ set textContent(v){this.textWrites=(this.textWrites||0)+1;this.replaceChildren();this._text=String(v??'');}
+ set innerHTML(v){this.textContent=v;}
+ get innerHTML(){return this.textContent;}
+ get scrollTop(){return this._top;}
+ set scrollTop(v){this._top=Math.max(0,Math.min(v,Math.max(0,this.scrollHeight-this.clientHeight)));}
+ setAttribute(k,v){this.attrs[k]=String(v);if(k==='hidden')this.hidden=true;if(k.startsWith('data-'))this.dataset[k.slice(5).replace(/-([a-z])/g,(_,c)=>c.toUpperCase())]=String(v);}
+ getAttribute(k){return k in this.attrs?this.attrs[k]:null;}
+ removeAttribute(k){delete this.attrs[k];if(k==='hidden')this.hidden=false;}
+ appendChild(c){c.remove();c.parentElement=this;this.children.push(c);return c;}
+ insertBefore(c,ref){c.remove();c.parentElement=this;const i=this.children.indexOf(ref);this.children.splice(i<0?this.children.length:i,0,c);return c;}
+ replaceChildren(...cs){for(const c of this.children)c.parentElement=null;this.children=[];this._top=0;this._text='';cs.forEach(c=>this.appendChild(c));}
+ remove(){if(this.parentElement){const p=this.parentElement;p.children=p.children.filter(c=>c!==this);this.parentElement=null;}}
+ addEventListener(type,fn){if(!this.listeners[type])this.listeners[type]=[];this.listeners[type].push(fn);}
+ dispatch(type,event={}){const e={target:this,stopPropagation(){},preventDefault(){},...event};this['on'+type]?.(e);for(const fn of this.listeners[type]||[])fn(e);}
+ click(){if(!this.disabled)this.dispatch('click');}
+ focus(){this.focused=true;context.document.activeElement=this;}
+ scrollIntoView(){this.scrolledIntoView=true;if(this.parentElement?.classes.includes("messages"))this.parentElement.scrollTop=700;}
+ matches(selector){
+  selector=selector.trim();const nots=[...selector.matchAll(/:not\(([^)]+)\)/g)];if(nots.some(m=>this.matches(m[1])))return false;selector=selector.replace(/:not\([^)]+\)/g,'');
+  for(const m of selector.matchAll(/\[([^=\]]+)(?:="([^"]*)")?\]/g)){const v=m[1].startsWith('data-')?this.dataset[m[1].slice(5).replace(/-([a-z])/g,(_,c)=>c.toUpperCase())]:this.attrs[m[1]];if(m[2]!==undefined?v!==m[2]:v===undefined)return false;}
+  selector=selector.replace(/\[[^\]]+\]/g,'');const id=selector.match(/#([\w-]+)/);if(id&&this.attrs.id!==id[1])return false;
+  if([...selector.matchAll(/\.([\w-]+)/g)].some(m=>!this.classes.includes(m[1])))return false;
+  const tag=selector.match(/^[a-zA-Z][\w-]*/);return !tag||this.tagName===tag[0].toUpperCase();
+ }
+ querySelectorAll(selector){
+  const all=[];const visit=n=>{for(const c of n.children){all.push(c);visit(c);}};visit(this);
+  const matches=(n,s)=>{s=s.trim();const direct=s.lastIndexOf(' > ');if(direct>=0)return n.matches(s.slice(direct+3))&&!!n.parentElement&&matches(n.parentElement,s.slice(0,direct));const space=s.lastIndexOf(' ');if(space>=0){if(!n.matches(s.slice(space+1)))return false;for(let p=n.parentElement;p;p=p.parentElement)if(matches(p,s.slice(0,space)))return true;return false;}return n.matches(s);};
+  return all.filter(n=>selector.split(',').some(s=>matches(n,s)));
+ }
+ querySelector(s){return this.querySelectorAll(s)[0]||null;}
+ getClientRects(){for(let n=this;n;n=n.parentElement)if(n.hidden)return [];return [this.getBoundingClientRect()];}
+ getBoundingClientRect(){return {top:20,bottom:420,left:20,right:320,width:300,height:400};}
+}
+const body=new Element('body');
+const make=(tag,attrs={},children=[])=>{const n=new Element(tag);for(const[k,v]of Object.entries(attrs)){if(k==='text')n.textContent=v;else if(k.startsWith('on'))n.addEventListener(k.slice(2),v);else n.setAttribute(k,v);}children.forEach(c=>n.appendChild(c));return n;};
+const main=make('main');body.appendChild(main);
+const zone=make('section',{id:'flow-zone',hidden:''}),canvas=make('div',{id:'flow-canvas'});zone.appendChild(canvas);main.appendChild(zone);
+for(const id of ['flow-links','flow-empty','flow-warnings','flow-episodes'])canvas.appendChild(make(id==='flow-links'?'svg':'div',{id}));
+body.querySelector('#flow-warnings').appendChild(make('summary'));body.querySelector('#flow-warnings').appendChild(make('div',{class:'flow-text'}));
+main.appendChild(make('button',{id:'flow-new',hidden:''}));
+for(const id of ['flow-filter-agent','flow-filter-kind','flow-filter-status','flow-filter-reset','flow-filter-count'])zone.appendChild(make(id.includes('reset')?'button':id.includes('count')?'span':'select',{id}));
+for(const id of ['topic-bar','pool-dialog','pool-search'])body.appendChild(make('div',{id}));
+const messagesBoxes=new Map();
+for(const agent of ['claude','codex','grok']){const col=make('section',{class:'thread-col','data-agent':agent});const box=make('div',{class:'messages',id:'messages-'+agent});col.appendChild(box);col.appendChild(make('span',{id:'count-'+agent}));main.appendChild(col);messagesBoxes.set(agent,box);}
+const timers=[];let now=1000;const raf=[];let currentId=fixture.topicId,poolRenders=0,threadRebuilds=0;
+const events=new Map();const win={addEventListener:(name,fn)=>events.set(name,fn),dispatchEvent:e=>events.get(e.type)?.(e)};
+const context=vm.createContext({console,Map,Set,JSON,Math,Error,Element,Date:{now:()=>now},state:fixture,window:win,document:{body,getElementById:id=>body.querySelector('#'+id),querySelector:s=>body.querySelector(s),querySelectorAll:s=>body.querySelectorAll(s),createElementNS:(_,tag)=>make(tag)},
+ el:make,$:s=>body.querySelector(s),NAMES:{claude:'Claude Code',codex:'Codex',grok:'Grok',user:'ユーザー'},STATUS_LABEL:{queued:'キュー'},STOP_LABELS:{agreed:'合意成立'},
+ currentTopic:()=>fixture.topics.find(t=>t.id===currentId),participantsOf:t=>(t||fixture.topics.find(t=>t.id===currentId))?.participants||['claude','codex'],agentIds:()=>['claude','codex','grok'],
+ columnTopic:fixture.topicId,foldedColumns:new Map(),narrowColumnLayout:{matches:false},
+ requestAnimationFrame:fn=>{raf.push(fn);return raf.length;},cancelAnimationFrame:()=>{},setTimeout:fn=>{timers.push(fn);return timers.length;},clearTimeout(){},
+ ensureTopic(){},syncAgentDefinitions(){},ensureAgentColumns(){context.columnTopic=currentId;for(const col of main.querySelectorAll(".thread-col"))col.classList.toggle("is-folded",!!context.foldedColumns.get(currentId)?.has(col.dataset.agent));},syncSendTargets(){},renderAuthControls(){},syncAgentAction(){},syncPoolReviewers(){},renderTopicBar(){body.querySelector('#topic-bar').replaceChildren();},renderProjectUI(){},renderTasks(){},renderAgentStatus(){},renderQaBar(){},renderBudgetBar(){},renderHealth(){},renderPool(){poolRenders++;},scheduleLinks(){},
+ toast:text=>context.lastToast=text,rawView:new Set(),expandedRelays:new Set(),mediaFailed:new Set(),provOf:m=>m.provenance||{},isRelayCopy:m=>!!m.provenance?.source,fmtTime:()=>'',renderMarkdown:text=>text,metaEl:()=>make('div'),isRunning:()=>false,
+ poolSelectedId:null,poolCurrentDir:'',poolFocus:null,togglePool:collapse=>body.classList.toggle('pool-collapsed',collapse),
+ chooseDestination(){},openTaskDialog(){},openPoolDialog(){},copy(){},ctxItems:()=>[],openCtxMenu(){},
+ switchTopic:id=>{currentId=id;context.render();},
+});
+function extract(name){const match=source.match(new RegExp('^function '+name+'\\([^]*?^}', 'm'));assert.ok(match,name);return match[0];}
+vm.runInContext(['messageEl','renderThread','captureThreadBottoms','restoreThreadBottoms','metaText','fmtTok','fmtElapsed','metaEl','taskEl','threadActivity'].map(extract).join('\n'),context);
+const originalRenderThread=context.renderThread;context.renderThread=(...args)=>{threadRebuilds++;return originalRenderThread(...args);};
+vm.runInContext(source.slice(source.indexOf('const viewModes ='),source.indexOf('// ---- render ----'))+'\n'+extract('render'),context);
+const run=s=>vm.runInContext(s,context);const flush=()=>{const jobs=raf.splice(0);jobs.forEach(fn=>fn());};
+const checks=[];
+const check=(name,condition)=>{assert.ok(condition,name);checks.push(name);};
+const cards=()=>run('flowCards');
+const graph=()=>run('flowGraph');
+const findKind=kind=>graph().nodes.find(n=>n.kind===kind);
+const nodeCard=node=>cards().get(node.key);
+const filter=(agent='',kind='',status='')=>{body.querySelector('#flow-filter-agent').value=agent;body.querySelector('#flow-filter-kind').value=kind;body.querySelector('#flow-filter-status').value=status;context.changeFlowFilter();flush();};
+const visible=()=>[...cards().values()].filter(c=>!c._flowParts.slot.hidden);
+const stateBefore=JSON.stringify(fixture);
+context.render();check('module未ロード時は列を利用可能',run('displayedView')==='columns');
+win.FlowGraph={buildFlowGraph};win.dispatchEvent({type:'flowgraph-ready'});flush();
+check('実グラフ導出と描画を結合し3名既定フロー',run('displayedView')==='flow'&&cards().size===graph().nodes.length);
+check('未絞り込み時の起点列を従来どおり保持', [...run('flowEpisodes').values()].every(e=>!e._flowParts.origin.hidden));
+check('meta欠落・配送コピーを集計しない', context.flowMetaSummary([{id:'no-meta'},{id:'copy',meta:{costUsd:1},provenance:{source:{messageId:'original'}}}]).length===0);
+const graphBefore=JSON.stringify(graph());
+const countNode=body.querySelector('#flow-filter-count'), countWrites=countNode.textWrites;
+context.render();context.render();
+check('同じ件数のlive領域を書き換えない',countNode.textWrites===countWrites);
+const realMessagesFor=context.flowMessagesFor;let messageScans=0;
+context.flowMessagesFor=(...args)=>{messageScans++;return realMessagesFor(...args);};
+context.render();
+check('未設定フィルタは本文走査を増やさない',messageScans===graph().nodes.length);
+context.flowMessagesFor=realMessagesFor;
+filter('codex');
+check('宛先codexの送信起点も残す',graph().nodes.filter(n=>n.kind==='send'&&(n.lanes||[]).includes('codex')).every(n=>!nodeCard(n)._flowParts.slot.hidden));
+for(const kind of ['pending','artifact','relay','task']) {
+ check('実行中の'+kind+'を状態で抽出',context.matchesFlowFilter({kind,status:'run'},{status:'run'}));
+ check('停止中の'+kind+'を実行中から除外',!context.matchesFlowFilter({kind,status:'ok'},{status:'run'}));
+}
+filter('','','run');
+check('状態セレクトはrunカードを表示',visible().length===graph().nodes.filter(n=>n.status==='run'||n.active).length);
+filter('user','task');zone.scrollHeight=zone.clientHeight;
+const extra={id:'new-filtered',topicId:fixture.topicId,thread:'codex',author:'codex',text:'new',ts:999999};
+fixture.messages.push(extra);context.render();flush();
+check('短い絞り込み結果で空振り新着ボタンを出さない',body.querySelector('#flow-new').hidden&&!run('flowStateFor(currentTopic().id).unseen'));
+fixture.messages.pop();zone.scrollHeight=2500;filter();context.render();
+
+filter('','artifact');
+check('成果物だけ表示しグラフを変更しない',visible().length>0&&visible().every(c=>c.dataset.key.startsWith('art:'))&&JSON.stringify(graph())===graphBefore);
+check('非該当の束を非表示', [...run('flowEpisodes').values()].some(e=>e.hidden));
+filter('codex','artifact');
+check('担当と種別はAND条件',visible().every(c=>graph().nodes.find(n=>n.key===c.dataset.key).origin==='codex'));
+filter('user','task');check('0件表示と解除導線',visible().length===0&&!body.querySelector('#flow-empty').hidden&&!body.querySelector('#flow-filter-reset').disabled);
+body.querySelector('#flow-filter-reset').click();flush();
+check('解除ですべてのカードを復元',visible().length===graph().nodes.length&&body.querySelector('#flow-filter-reset').disabled);
+filter('grok','relay');
+check('複合リレーは参加者で一致し全手番を保持',visible().length>0&&visible().every(c=>graph().nodes.find(n=>n.key===c.dataset.key).kind==='relay'));
+const relay=findKind('relay');const relayCount=context.flowMessagesFor(relay).length;
+nodeCard(relay)._flowParts.toggle.click();
+check('フィルタ中も複合カードの全文を保持',nodeCard(relay)._flowParts.detail.querySelectorAll('.flow-message').length===relayCount);
+context.setViewMode('columns');context.setViewMode('flow');
+check('列往復でフィルタ記憶',body.querySelector('#flow-filter-agent').value==='grok'&&body.querySelector('#flow-filter-kind').value==='relay');
+filter();
+// 元応答に後着したmetaだけが変わるケース。表示関数も本体から抽出した実装。
+const reply=graph().nodes.find(n=>n.kind==='replies')||findKind('reply');
+const sourceMessages=context.flowMessagesFor(reply);const originalMeta=sourceMessages.map(m=>m.meta);
+sourceMessages[0].meta={durationMs:1234,usage:{inTok:1200,outTok:80},billing:{mode:'metered',usd:0.0123},status:'completed'};
+context.render();
+const replyCard=nodeCard(reply);
+check('折りたたみメタは既存表記の時間・使用量・費用',replyCard._flowParts.meta.textContent.includes('1.2k')&&replyCard._flowParts.meta.textContent.includes('$0.0123')&&!replyCard._flowParts.meta.hidden);
+sourceMessages[0].meta.billing.usd=0.0456;context.render();
+check('タイトル不変のmeta更新を反映',replyCard._flowParts.meta.textContent.includes('$0.0456'));
+sourceMessages[0].meta.billing={mode:'unknown'};context.render();
+check('費用不明を0円にしない',replyCard._flowParts.meta.textContent.includes('費用不明')&&!replyCard._flowParts.meta.textContent.includes('$0.0000'));
+replyCard._flowParts.toggle.click();
+check('本文展開中は要約を隠す',replyCard._flowParts.meta.hidden);
+check('列で開くは既存actions行に配置',replyCard._flowParts.detail.querySelectorAll('.flow-open-column').every(b=>b.parentElement.classes.includes('actions')));
+check('各元発言に列で開くを設置',replyCard._flowParts.detail.querySelectorAll('.flow-open-column').length===sourceMessages.length);
+const selected=sourceMessages[sourceMessages.length-1];
+context.foldedColumns.set(fixture.topicId,new Set([selected.thread]));
+replyCard._flowParts.detail.querySelectorAll('.flow-open-column').at(-1).click();
+const target=messagesBoxes.get(selected.thread).querySelectorAll('.msg').find(n=>n.dataset.mid===selected.id);
+check('複合カード内の選択発言へ列ジャンプ・強調・フォーカス',run('displayedView')==='columns'&&target?.scrolledIntoView&&target.focused&&target.classList.contains('flow-highlight'));
+check('対象列の折りたたみ解除',!context.foldedColumns.get(fixture.topicId).has(selected.thread));
+check('列ジャンプ後の位置を保存',run('columnScrollStates').get(fixture.topicId)?.has(selected.thread));
+const selectedBox=messagesBoxes.get(selected.thread);
+check('ジャンプで実際に中間位置へ移動',selectedBox.scrollTop===700);
+for(let update=0;update<3;update++) {
+ context.render();
+ const current=selectedBox.querySelectorAll('.msg').find(n=>n.dataset.mid===selected.id);
+ check('SSE相当の再描画'+update+'後も位置・強調・フォーカスを保持',selectedBox.scrollTop===700&&current!==target&&current.classList.contains('flow-highlight')&&context.document.activeElement===current);
+}
+selectedBox.scrollTop=900;context.render();
+check('ジャンプ後の手動スクロールを巻き戻さない',selectedBox.scrollTop===900);
+now+=2100;timers.at(-1)();context.render();
+check('再生成された発言の強調も期限切れで解除',!selectedBox.querySelectorAll('.msg').some(n=>n.classList.contains('flow-highlight'))&&selectedBox.scrollTop===900);
+
+context.openFlowMessageInColumn('missing');check('消えた発言は理由を表示',context.lastToast==='元の発言が見つかりません');
+context.setViewMode('flow');
+filter('user','send');const send=findKind('send');const sendCard=nodeCard(send);sendCard._flowParts.toggle.click();
+const userMessages=context.flowMessagesFor(send);
+check('送信束の各レーンを選択可能',sendCard._flowParts.detail.querySelectorAll('.flow-open-column').length===userMessages.length);
+filter('','task');
+check('種別で隠した展開本文も消える',!replyCard._flowParts.detail.isConnected&&!sendCard._flowParts.detail.isConnected);
+// 隠れたカードを端点にする接続線を描かない。
+for(const ep of graph().episodes)run('flowStateFor(currentTopic().id).episodes').set(ep.key,true);
+context.refreshFlowDetails(fixture.topicId);flush();
+const expectedTaskEdges=graph().edges.filter(e=>e.from?.nodeKey?.startsWith('task:')&&e.to?.nodeKey?.startsWith('task:'));
+check('非表示ノードへの線を描かない',expectedTaskEdges.length===0&&body.querySelector('#flow-links').children.length===0);
+run('flowJump = { topicId: currentTopic().id, messageId: "r1" }');
+context.render();flush();
+check('分岐対象ジャンプ時はフィルタ解除し対象を表示',body.querySelector('#flow-filter-kind').value===''&&nodeCard(reply).scrolledIntoView);
+filter('','task');
+const remembered=run('flowStateFor(currentTopic().id).filters');
+const other={id:'legacy',participants:['claude','codex']};fixture.topics.push(other);context.switchTopic('legacy');
+check('2名既定の列を維持',run('displayedView')==='columns');context.setViewMode('flow');
+check('別トピックのフィルタは独立',body.querySelector('#flow-filter-kind').value==='');
+context.switchTopic(fixture.topicId);check('元トピックのフィルタを復元',body.querySelector('#flow-filter-kind').value===remembered.kind);
+fixture.topics.pop();sourceMessages.forEach((m,i)=>{if(originalMeta[i]===undefined)delete m.meta;else m.meta=originalMeta[i];});
+check('表示操作は永続stateを変更しない',JSON.stringify(fixture)===stateBefore);
+});

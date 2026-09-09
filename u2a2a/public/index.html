@@ -858,9 +858,20 @@
   #view-controls button[aria-pressed="true"] { color: var(--text); border-color: var(--codex); background: var(--panel-2); }
   #flow-load-note { font-size: 11px; color: var(--dim); max-width: 220px; white-space: normal; }
   #flow-zone[hidden], #flow-new[hidden], #flow-empty[hidden], #flow-warnings[hidden], .flow-episode-body[hidden], .flow-detail[hidden] { display: none !important; }
-  body.flow-view main { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); overflow: hidden; }
+  body.flow-view main { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
   body.flow-view main > .thread-col, body.flow-view #link-layer { display: none !important; }
-  #flow-zone { grid-column: 1; grid-row: 1; min-height: 0; min-width: 0; width: 100%; overflow: auto; position: relative; overflow-anchor: none; }
+  body:not(.flow-view) #flow-filters { display: none !important; }
+  #flow-filters { grid-column: 1; grid-row: 1; background: var(--panel); display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 10px 18px; border-bottom: 1px solid var(--line); }
+  #flow-filters label { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  #flow-filters select { max-width: 180px; }
+  #flow-filters :focus-visible, .flow-detail .actions button:focus-visible { outline: 2px solid var(--codex); outline-offset: -2px; }
+  #flow-filter-count { color: var(--dim); font-size: 12px; }
+  .flow-episode[hidden], .flow-card-slot[hidden], .flow-meta-summary[hidden], .flow-origin[hidden] { display: none !important; }
+  .flow-episode.is-filtered .flow-episode-body { grid-template-columns: minmax(0, 1fr); }
+  .flow-episode.is-filtered .flow-responses { grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr)); }
+  .flow-meta-summary { color: var(--dim); font-size: 10.5px; padding: 0 12px 10px; overflow-wrap: anywhere; }
+  .flow-meta-summary > div + div { margin-top: 4px; }
+  #flow-zone { grid-column: 1; grid-row: 2; min-height: 0; min-width: 0; width: 100%; overflow: auto; position: relative; overflow-anchor: none; }
   #flow-canvas { position: relative; min-height: 100%; padding: 18px; }
   #flow-links { position: absolute; top: 0; left: 0; pointer-events: none; overflow: hidden; z-index: 0; }
   .flow-edge { fill: none; stroke: var(--dim); stroke-width: 1.5; opacity: .65; }
@@ -906,7 +917,7 @@
   .flow-card[data-glow="ok"] { box-shadow: inset 0 0 0 1px rgba(110, 168, 254, 0.55), inset 0 0 16px rgba(110, 168, 254, 0.28), inset 0 0 48px rgba(110, 168, 254, 0.08); }
   .flow-card[data-glow="wait"] { box-shadow: inset 0 0 0 1px rgba(231, 200, 107, 0.55), inset 0 0 16px rgba(231, 200, 107, 0.28), inset 0 0 48px rgba(231, 200, 107, 0.08); }
   .flow-card[data-glow="err"] { box-shadow: inset 0 0 0 1px rgba(255, 123, 123, 0.6), inset 0 0 16px rgba(255, 123, 123, 0.3), inset 0 0 48px rgba(255, 123, 123, 0.1); }
-  .flow-card.flow-highlight { outline: 2px solid var(--user); outline-offset: 2px; }
+  .flow-card.flow-highlight, main > .thread-col .msg.flow-highlight { outline: 2px solid var(--user); outline-offset: 2px; }
   @media (max-width: 1100px) {
     #flow-canvas { padding: 10px; }
     .flow-episode-body, .flow-responses { grid-template-columns: minmax(0, 1fr) !important; }
@@ -961,6 +972,13 @@
 <div id="content">
 <main>
   <svg id="link-layer"></svg>
+    <div id="flow-filters" role="group" aria-label="フローの絞り込み">
+      <label>エージェント <select id="flow-filter-agent"><option value="">すべて</option></select></label>
+      <label>種別 <select id="flow-filter-kind"><option value="">すべて</option></select></label>
+      <label>状態 <select id="flow-filter-status"><option value="">すべて</option></select></label>
+      <button type="button" id="flow-filter-reset" class="small">解除</button>
+      <span id="flow-filter-count" role="status"></span>
+    </div>
   <section id="flow-zone" aria-label="会話のフロー" tabindex="0" hidden>
     <div id="flow-canvas">
       <svg id="flow-links" aria-hidden="true"></svg>
@@ -2369,7 +2387,7 @@ const flowKindLabels = { send: "ユーザー", reply: "応答", replies: "応答
 const flowStatusLabels = { run: "実行中", ok: "処理完了", wait: "待ち", err: "エラー／停止" };
 
 function flowStateFor(topicId) {
-  if (!flowViewStates.has(topicId)) flowViewStates.set(topicId, { episodes: new Map(), cards: new Set(), scrollTop: 0, atBottom: true, unseen: false, nodeKeys: null, messageIds: null, anchor: null });
+  if (!flowViewStates.has(topicId)) flowViewStates.set(topicId, { episodes: new Map(), cards: new Set(), filters: { agent: "", kind: "", status: "" }, scrollTop: 0, atBottom: true, unseen: false, nodeKeys: null, messageIds: null, anchor: null });
   return flowViewStates.get(topicId);
 }
 
@@ -2497,6 +2515,98 @@ function jumpFlowTopic(topicId, messageId, anchorKey, useOrigin = false) {
   switchTopic(topicId);
 }
 
+// フィルタはカード単位。複合カードの本文・元グラフは変更しない。
+function hasFlowFilter(filters) {
+  return !!(filters.agent || filters.kind || filters.status);
+}
+
+function matchesFlowFilter(node, filters) {
+  if (!hasFlowFilter(filters)) return true;
+  if (filters.kind && node.kind !== filters.kind) return false;
+  if (filters.status && (node.active ? "run" : node.status) !== filters.status) return false;
+  if (!filters.agent) return true;
+  const agents = new Set([node.agent, node.origin, ...(node.participants || []), ...(node.lanes || [])]);
+  if (node.kind === "send") agents.add("user");
+  for (const message of flowMessagesFor(node)) { agents.add(message.author); agents.add(message.thread); }
+  return agents.has(filters.agent);
+}
+
+function renderFlowFilters(graph, saved, visibleCount) {
+  const agentSelect = $("#flow-filter-agent"), kindSelect = $("#flow-filter-kind");
+  const agents = new Set(["user", ...agentIds(), ...participantsOf()]);
+  for (const node of graph.nodes) {
+    for (const agent of [node.agent, node.origin, ...(node.participants || []), ...(node.lanes || [])]) if (agent) agents.add(agent);
+  }
+  if (saved.filters.agent) agents.add(saved.filters.agent); // 更新で一時的に0件でも選択を保つ。
+  const choices = [[agentSelect, [...agents].map((id) => [id, NAMES[id] || id]), saved.filters.agent],
+    [kindSelect, Object.entries(flowKindLabels), saved.filters.kind],
+    [$("#flow-filter-status"), Object.entries(flowStatusLabels), saved.filters.status]];
+  for (const [select, entries, value] of choices) {
+    const signature = JSON.stringify(entries);
+    if (select.dataset.options !== signature) {
+      select.replaceChildren(el("option", { value: "", text: "すべて" }), ...entries.map(([id, label]) => el("option", { value: id, text: label })));
+      select.dataset.options = signature;
+    }
+    select.value = value;
+  }
+  $("#flow-filter-reset").disabled = !hasFlowFilter(saved.filters);
+  const count = $("#flow-filter-count"), text = visibleCount + " / " + graph.nodes.length + " カード";
+  if (count.textContent !== text) count.textContent = text;
+}
+
+function changeFlowFilter() {
+  if (!displayedTopicId || displayedView !== "flow") return;
+  const saved = flowStateFor(displayedTopicId);
+  saved.filters = { agent: $("#flow-filter-agent").value, kind: $("#flow-filter-kind").value, status: $("#flow-filter-status").value };
+  // 明示の絞り込み操作では先頭から結果を読む。通常の新着追従とは分ける。
+  const zone = $("#flow-zone");
+  zone.scrollTop = 0;
+  refreshFlowDetails(displayedTopicId);
+  zone.scrollTop = 0;
+  saved.scrollTop = 0;
+  saved.atBottom = zone.scrollHeight - zone.scrollTop - zone.clientHeight < 60;
+  saved.anchor = captureFlowAnchor();
+}
+$("#flow-filter-agent").addEventListener("change", changeFlowFilter);
+$("#flow-filter-kind").addEventListener("change", changeFlowFilter);
+$("#flow-filter-status").addEventListener("change", changeFlowFilter);
+$("#flow-filter-reset").addEventListener("click", () => {
+  $("#flow-filter-agent").value = "";
+  $("#flow-filter-kind").value = "";
+  $("#flow-filter-status").value = "";
+  changeFlowFilter();
+});
+
+let flowColumnJump = null;
+
+function openFlowMessageInColumn(messageId) {
+  const message = (state.messages || []).find((m) => m.id === messageId && m.topicId === currentTopic()?.id);
+  if (!message) return toast("元の発言が見つかりません");
+  if (!participantsOf().includes(message.thread) || !agentIds().includes(message.thread)) return toast("この発言の列は現在の参加者にありません");
+  foldedColumns.get(message.topicId)?.delete(message.thread);
+  setViewMode("columns"); // 再描画と保存位置の復元が完了してから、対象の発言へ移動する。
+  const box = document.getElementById("messages-" + message.thread);
+  const target = [...(box?.querySelectorAll(".msg") || [])].find((node) => node.dataset.mid === message.id);
+  if (!target) return toast("元の発言を列に表示できませんでした");
+  target.scrollIntoView({ block: "center" });
+  target.setAttribute("tabindex", "-1");
+  target.focus({ preventScroll: true });
+  const jump = flowColumnJump = { topicId: message.topicId, messageId: message.id, until: Date.now() + 2000 };
+  target.classList.add("flow-highlight");
+  setTimeout(() => {
+    if (flowColumnJump !== jump) return;
+    flowColumnJump = null;
+    for (const node of document.querySelectorAll("main > .thread-col .msg.flow-highlight")) node.classList.remove("flow-highlight");
+  }, 2000);
+  saveDisplayedPosition();
+}
+
+// 合計ではなく元応答ごとの既存表記を再利用。配送コピーの費用を重複表示しない。
+function flowMetaSummary(messages) {
+  return messages.filter((m) => m.meta && !isRelayCopy(m))
+    .map((m) => ({ id: m.id, text: (messages.length > 1 ? (NAMES[m.author] || m.author) + " · " : "") + metaText(m.meta) }));
+}
+
 function updateFlowCard(card, node, saved, origin) {
   const messages = flowMessagesFor(node), expanded = saved.cards.has(node.key);
   const marks = flowMarks.get(node.key) || [];
@@ -2505,7 +2615,8 @@ function updateFlowCard(card, node, saved, origin) {
   const task = flowTasks.get(node.key);
   const activity = node.kind === "pending" ? threadActivity(node.agent) : null;
   const preview = String(node.title || node.head || node.text || messages[0]?.text || "").slice(0, 100).replace(/\s+/g, " ");
-  const signature = JSON.stringify([node.kind, node.agent, node.status, node.active, node.taskStatus, node.inferred,
+  const metaSummary = flowMetaSummary(messages);
+  const signature = JSON.stringify([metaSummary, node.kind, node.agent, node.status, node.active, node.taskStatus, node.inferred,
     node.count, node.verdicts, preview, node.hops?.length, node.stopReason, node.branchPoint,
     messages.length, marks, ownBranches, isOrigin ? origin : null, expanded]);
   const summaryChanged = card.dataset.sig !== signature;
@@ -2550,6 +2661,8 @@ function updateFlowCard(card, node, saved, origin) {
   for (const verdict of node.verdicts || []) badges.push(el("span", { class: "flow-badge", text: (NAMES[verdict.reviewer] || verdict.reviewer) + ": " + verdict.label }));
   if (node.branchPoint) badges.push(el("span", { class: "flow-badge", text: "分岐点" }));
   parts.badges.replaceChildren(...badges);
+  parts.meta.hidden = expanded || !metaSummary.length;
+  parts.meta.replaceChildren(...metaSummary.map((entry) => el("div", { text: entry.text })));
   const terminals = marks.map((edge) => el("span", { class: "flow-terminal" + (edge.style === "gray" ? " is-gray" : ""), text: "● " + (edge.to.label || edge.to.mark) }));
   if (node.kind === "unrelayed" && !marks.some((edge) => edge.to.mark === "unrelayed")) terminals.push(el("span", { class: "flow-terminal is-gray", text: "● 中継なし" }));
   parts.marks.replaceChildren(...terminals);
@@ -2564,7 +2677,7 @@ function updateFlowCard(card, node, saved, origin) {
     const hop = (node.hops || []).find((entry) => entry.messageId === message.id);
     return el("div", { class: "flow-message" + (hop ? " flow-hop" : ""), "data-message-id": message.id }, [
       el("div", { class: "flow-message-origin", text: (hop ? "手番 " + (hop.seq ?? hop.turn) + " · " : "") + "ID: " + message.id + " · 宛先: " + (NAMES[message.thread] || message.thread) }),
-      messageEl(message, { onChange: () => refreshFlowDetails(topicId) }),
+      messageEl(message, { onChange: () => refreshFlowDetails(topicId), onOpenColumn: () => openFlowMessageInColumn(message.id) }),
     ]);
   });
   if (task) details.push(taskEl(task));
@@ -2577,17 +2690,18 @@ function createFlowCard(key) {
   const badges = el("div", { class: "flow-badges" }), marks = el("div", { class: "flow-marks" });
   const branches = el("div", { class: "flow-branches" }), detail = el("div", { class: "flow-detail", id: "flow-detail-" + encodeURIComponent(key), hidden: "" });
   const activity = el("div", { class: "flow-activity" });
-  const card = el("article", { class: "flow-card", "data-key": key, tabindex: "-1" }, [toggle, badges, marks, activity]);
+  const meta = el("div", { class: "flow-meta-summary", hidden: "" });
+  const card = el("article", { class: "flow-card", "data-key": key, tabindex: "-1" }, [toggle, badges, meta, marks, activity]);
   toggle.setAttribute("aria-controls", detail.id || detail.getAttribute("id"));
   const slot = el("div", { class: "flow-card-slot" }, [card, branches]);
-  card._flowParts = { toggle, badges, marks, branches, activity, detail, slot };
+  card._flowParts = { toggle, badges, marks, branches, activity, meta, detail, slot };
   return card;
 }
 
 function captureFlowAnchor() {
   const top = $("#flow-zone").getBoundingClientRect().top;
   for (const section of flowEpisodes.values()) {
-    if (section.getBoundingClientRect().bottom <= top) continue;
+    if (!section.getClientRects().length || section.getBoundingClientRect().bottom <= top) continue;
     for (const card of section.querySelectorAll(".flow-card")) {
       if (card.getClientRects().length && card.getBoundingClientRect().bottom > top) return { key: card.dataset.key, offset: card.getBoundingClientRect().top - top };
     }
@@ -2626,6 +2740,7 @@ function renderFlow(graph, userAction = false, restoring = false) {
   }
   const nodes = new Map(graph.nodes.map((node) => [node.key, node]));
   if (flowJump?.topicId === graph.topicId) {
+    saved.filters = { agent: "", kind: "", status: "" }; // 明示的な分岐移動は対象を確実に見せる。
     const key = flowJump.useOrigin ? graph.origin?.anchorKey : flowJump.anchorKey || graph.membership[flowJump.messageId];
     const target = flowNodeKey(key);
     for (const episode of graph.episodes) if (episode.nodeKeys.includes(target)) saved.episodes.set(episode.key, true);
@@ -2633,6 +2748,9 @@ function renderFlow(graph, userAction = false, restoring = false) {
     flowJump.target = target;
   }
   for (const [key, card] of flowCards) if (!nodes.has(key)) { card._flowParts.slot.remove(); flowCards.delete(key); }
+  const visibleKeys = new Set(graph.nodes.filter((node) => matchesFlowFilter(node, saved.filters)).map((node) => node.key));
+  const filtering = hasFlowFilter(saved.filters);
+  renderFlowFilters(graph, saved, visibleKeys.size);
   const sections = [];
   for (const episode of graph.episodes) {
     let section = flowEpisodes.get(episode.key);
@@ -2648,11 +2766,15 @@ function renderFlow(graph, userAction = false, restoring = false) {
     const open = saved.episodes.has(episode.key) ? saved.episodes.get(episode.key) : !episode.folded;
     const { toggle, body } = section._flowParts;
     const episodeNodes = episode.nodeKeys.map((key) => nodes.get(key)).filter(Boolean);
+    const shownNodes = episodeNodes.filter((node) => visibleKeys.has(node.key));
+    section.hidden = !shownNodes.length;
+    section.classList.toggle("is-filtered", filtering && shownNodes.length < episodeNodes.length);
     const first = episodeNodes.find((node) => node.kind === "send") || episodeNodes[0];
     const title = episode.kind === "orphan" ? "起点なし" : String(first?.head || first?.title || first?.text || flowKindLabels[first?.kind] || "会話").replace(/\s+/g, " ").slice(0, 60);
     const count = episode.count || {};
     const relayHops = episodeNodes.filter((node) => node.kind === "relay").reduce((sum, node) => sum + (node.hops?.length || 0), 0);
     toggle.textContent = (open ? "▾ " : "▸ ") + title + " · 応答 " + (count.replies || 0) + (relayHops ? "／リレー " + relayHops + "手" : "") + "／成果物 " + (count.artifacts || 0) + "／タスク " + (count.tasks || 0) + "／外部同期 " + (count.syncs || 0);
+    if (filtering) toggle.textContent += " · 表示 " + shownNodes.length + "/" + episodeNodes.length;
     toggle.setAttribute("aria-expanded", String(open));
     toggle.onclick = () => { saved.episodes.set(episode.key, !open); refreshFlowDetails(graph.topicId); };
     body.hidden = !open;
@@ -2664,22 +2786,24 @@ function renderFlow(graph, userAction = false, restoring = false) {
       if (!card) { card = createFlowCard(node.key); flowCards.set(node.key, card); }
       updateFlowCard(card, node, saved, graph.origin);
       const lane = responseAgents.indexOf(node.agent || node.origin);
-      card._flowParts.slot.style.gridColumn = node.kind === "relay" ? "1 / -1" : String(lane >= 0 ? lane + 1 : Math.max(1, responseAgents.length));
+      card._flowParts.slot.hidden = !visibleKeys.has(node.key);
+      card._flowParts.slot.style.gridColumn = filtering ? "auto" : node.kind === "relay" ? "1 / -1" : String(lane >= 0 ? lane + 1 : Math.max(1, responseAgents.length));
       return card._flowParts.slot;
     });
     const originIndex = episodeNodes.findIndex((node) => node.kind === "send");
     // 起点なし（orphan）束は origin 列を空にして全件を responses へ（応答やリレーを起点列へ昇格させない）
     if (originIndex >= 0 && cards[originIndex]) cards[originIndex].style.gridColumn = "auto";
+    section._flowParts.origin.hidden = filtering && (originIndex < 0 || !visibleKeys.has(episodeNodes[originIndex].key));
     reconcileFlowChildren(section._flowParts.origin, originIndex >= 0 ? cards.filter((_, i) => i === originIndex) : []);
     reconcileFlowChildren(section._flowParts.responses, originIndex >= 0 ? cards.filter((_, i) => i !== originIndex) : cards);
-    reconcileFlowChildren(section._flowParts.expanded, episodeNodes.filter((node) => saved.cards.has(node.key)).map((node) => flowCards.get(node.key)._flowParts.detail));
+    reconcileFlowChildren(section._flowParts.expanded, shownNodes.filter((node) => saved.cards.has(node.key)).map((node) => flowCards.get(node.key)._flowParts.detail));
     sections.push(section);
   }
   const episodeKeys = new Set(graph.episodes.map((episode) => episode.key));
   for (const [key, section] of flowEpisodes) if (!episodeKeys.has(key)) { section.remove(); flowEpisodes.delete(key); }
   reconcileFlowChildren($("#flow-episodes"), sections);
-  $("#flow-empty").textContent = "まだ発言がありません";
-  $("#flow-empty").hidden = sections.length > 0;
+  $("#flow-empty").textContent = filtering ? "条件に一致するカードはありません。絞り込みを解除するとすべて表示できます。" : "まだ発言がありません";
+  $("#flow-empty").hidden = visibleKeys.size > 0;
   const warnings = $("#flow-warnings");
   warnings.hidden = !(graph.warnings || []).length;
   warnings.querySelector("summary").textContent = "一部の参照を確認できません（" + (graph.warnings || []).length + "件）";
@@ -2696,7 +2820,8 @@ function renderFlow(graph, userAction = false, restoring = false) {
   saved.anchor = captureFlowAnchor();
   saved.scrollTop = zone.scrollTop;
   if (userAction) saved.atBottom = zone.scrollHeight - zone.scrollTop - zone.clientHeight < 60;
-  if (before.atBottom) saved.unseen = false;
+  // 絞り込み中は新着ボタンを出さない。解除後の未絞り込み表示から検知を再開する。
+  if (before.atBottom || filtering) saved.unseen = false;
   $("#flow-new").hidden = !saved.unseen;
   if (flowJump?.topicId === graph.topicId) {
     const jump = flowJump;
@@ -2726,6 +2851,10 @@ function scheduleFlowLinks() {
   });
 }
 
+function visibleFlowCard(card) {
+  return !!card && card.isConnected && !card._flowParts.slot.hidden && !!card.getClientRects().length;
+}
+
 function drawFlowLinks() {
   const svg = $("#flow-links");
   if (displayedView !== "flow" || !flowGraph) { svg.replaceChildren(); return; }
@@ -2749,9 +2878,10 @@ function drawFlowLinks() {
   for (const edge of flowGraph.edges) {
     if (edge.to?.mark || edge.kind === "relay-hop" || edge.kind === "branch") continue;
     const from = flowCards.get(flowNodeKey(edge.from?.nodeKey)), to = flowCards.get(flowNodeKey(edge.to?.nodeKey));
-    if (from !== to) connect(from, to, edge.from?.port || "right", edge.to?.port || "left", edge.style);
+    if (from !== to && visibleFlowCard(from) && visibleFlowCard(to)) connect(from, to, edge.from?.port || "right", edge.to?.port || "left", edge.style);
   }
   for (const card of flowCards.values()) {
+    if (!visibleFlowCard(card)) continue;
     const hops = [...card._flowParts.detail.querySelectorAll(".flow-hop")];
     for (let i = 1; i < hops.length; i++) connect(hops[i - 1], hops[i], "bottom", "top", "solid");
     for (const branch of card._flowParts.branches.querySelectorAll(".flow-branch")) connect(card, branch, "right", "left", "solid");
@@ -3725,7 +3855,7 @@ function applyThreadGlow(agent, a, ta) {
   col.dataset.glow = glow;
 }
 
-function messageEl(m, { onChange }) {
+function messageEl(m, { onChange, onOpenColumn }) {
   const agent = m.thread;
   const meta = el("div", { class: "meta" }, [
     el("span", { class: "who", text: NAMES[m.author] }),
@@ -3774,6 +3904,8 @@ function messageEl(m, { onChange }) {
       },
     }),
   ]);
+
+  if (onOpenColumn) actions.appendChild(el("button", { type: "button", class: "small flow-open-column", text: "列で開く", "aria-label": (NAMES[m.thread] || m.thread) + " の列でこの発言を開く", onclick: onOpenColumn }));
 
   // 転送・質疑中継で届いた内容は送信元に原文があるため、受信側では折りたたみ表示
   let body;
@@ -3834,12 +3966,15 @@ function messageEl(m, { onChange }) {
   }
   if (m.meta && !(isRelayCopy(m) && !expandedRelays.has(m.id))) kids.push(metaEl(m.meta));
   kids.push(actions);
-  return el("div", { class: "msg" + (pv.ingress === "cli-sync" ? " external" : ""), "data-author": m.author, "data-mid": m.id }, kids);
+  const highlighted = displayedView === "columns" && flowColumnJump?.topicId === m.topicId && flowColumnJump.messageId === m.id && flowColumnJump.until > Date.now();
+  return el("div", { class: "msg" + (pv.ingress === "cli-sync" ? " external" : "") + (highlighted ? " flow-highlight" : ""), "data-author": m.author, "data-mid": m.id, ...(highlighted ? { tabindex: "-1" } : {}) }, kids);
 }
 
 function renderThread(agent, savedAtBottom) {
   if (displayedView === "flow") { dirtyThreadTopics.add(currentTopic()?.id); return; }
   const box = $("#messages-" + agent);
+  const scrollTop = box.scrollTop;
+  const focusedMessageId = document.activeElement?.dataset.mid;
   const atBottom = savedAtBottom ?? (box.scrollHeight - box.scrollTop - box.clientHeight < 60);
   const topic = currentTopic();
   const msgs = state.messages.filter((m) => m.thread === agent && topic && m.topicId === topic.id);
@@ -3860,7 +3995,11 @@ function renderThread(agent, savedAtBottom) {
     const act = threadActivity(agent);
     box.appendChild(act ? activityEl(act) : el("div", { class: "typing", text: NAMES[agent] + " が応答中" }));
   }
-  if (atBottom) box.scrollTop = box.scrollHeight;
+  box.scrollTop = atBottom ? box.scrollHeight : scrollTop;
+  if (focusedMessageId) {
+    const focused = [...box.querySelectorAll(".msg")].find((node) => node.dataset.mid === focusedMessageId);
+    if (focused) { focused.setAttribute("tabindex", "-1"); focused.focus({ preventScroll: true }); }
+  }
 }
 
 function taskPrompt(t) {
