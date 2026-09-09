@@ -1094,7 +1094,12 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo 
         : "";
   // 紐付けありの初回のみ、対象プロジェクトの概要（README 冒頭＋直下エントリ名、4,000 文字まで）
   const digestNote = isFirst && project && projectInfo.digest ? `\n\n--- 対象プロジェクトの概要（初回のみ） ---\n${projectInfo.digest}\n` : "";
-  return preamble + contextNote + digestNote + qaJoinNote + backlogNote + lines + qaNote + changesNote + artifactNote + commonRulesBlock("通常応答");
+  // Grok は権限拒否で応答全体が停止するため、拒否されるシェルを最初から使わないよう明示する（工程0の実測: 複合シェル偵察で停止）
+  const grokShellNote =
+    agent === "grok"
+      ? `\n\n（Grok への注意: シェル（run_terminal_command）で許可されているのは python3 / ffmpeg だけです。git・ls・cat などそれ以外のシェルコマンドは権限拒否となり、応答全体がその場で停止します。ファイル・差分・状況の確認は read_file / list_dir / grep ツールで行ってください）`
+      : "";
+  return preamble + contextNote + digestNote + qaJoinNote + backlogNote + lines + qaNote + changesNote + artifactNote + grokShellNote + commonRulesBlock("通常応答");
 }
 
 // 質疑モード（仕様: SPEC-Grok参戦.md「リレー機構」）: 応答者以外の参加者全員へ配送し、手番の 1 名だけを起動する。
@@ -2113,6 +2118,9 @@ function buildFixPrompt(item, agent, pc = null, offline = false) {
     `- ファイル保存を済ませてから、応答として「何をどう直したか／直さなかったか」の要約を簡潔に書く\n\n` +
     (reviews || "（レビューはまだありません。成果物の品質を自己点検して改善してください）") +
     offlineNote +
+    (agent === "grok"
+      ? `\n（Grok への注意: シェルで許可されているのは python3 / ffmpeg だけです。git 等それ以外は権限拒否となり修正全体が停止します。確認は read_file / list_dir / grep ツールで）`
+      : "") +
     commonRulesBlock("修正")
   );
 }
