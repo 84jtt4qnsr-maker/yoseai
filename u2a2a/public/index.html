@@ -2546,7 +2546,7 @@ function updateFlowCard(card, node, saved, origin) {
   if (node.status) badges.push(el("span", { class: "flow-badge", text: flowStatusLabels[node.status] || node.status }));
   if (node.taskStatus) badges.push(el("span", { class: "flow-badge", text: STATUS_LABEL[node.taskStatus] || node.taskStatus }));
   if (node.kind === "replies") badges.push(el("span", { class: "flow-badge", text: messages.length + "件の応答" }));
-  if (node.kind === "relay") badges.push(el("span", { class: "flow-badge", text: (node.hops || []).length + "手" + (node.stopReason ? " · " + (STOP_LABELS[node.stopReason] || node.stopReason) : "") }));
+  if (node.kind === "relay") badges.push(el("span", { class: "flow-badge", text: (node.hops || []).length + "手" + (node.active ? "" : node.stopReason ? " · " + (STOP_LABELS[node.stopReason] || node.stopReason) : " · 終了理由不明") }));
   for (const verdict of node.verdicts || []) badges.push(el("span", { class: "flow-badge", text: (NAMES[verdict.reviewer] || verdict.reviewer) + ": " + verdict.label }));
   if (node.branchPoint) badges.push(el("span", { class: "flow-badge", text: "分岐点" }));
   parts.badges.replaceChildren(...badges);

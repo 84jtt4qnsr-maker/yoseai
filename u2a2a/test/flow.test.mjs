@@ -288,9 +288,11 @@ test("外部同期: cli-sync は sync ノードになり、送信束の候補に
   const s = byKey(g, "msg:s1");
   assert.deepEqual([s.kind, s.status, s.text], ["sync", "ok", "ターミナルで続けた分"]);
   assert.equal(edgesOf(g, "answer").some((e) => e.to.nodeKey === "msg:s1"), true);
-  // 外部同期のユーザー発言は束の候補にならない（単独の send。UI 送信の同文とは束ねない）
-  assert.deepEqual(g.nodes.filter((n) => n.kind === "send").map((n) => n.messageIds), [["u1"], ["u2"], ["u3"]]);
-  assert.equal(g.episodes[0].count.syncs, 1);
+  // 外部同期のユーザー発言も sync ノード（SPEC ノード表: cli-sync はすべて sync。送信束の候補にしない）
+  assert.deepEqual(g.nodes.filter((n) => n.kind === "send").map((n) => n.messageIds), [["u1"], ["u3"]]);
+  const u2 = byKey(g, "msg:u2");
+  assert.equal(u2 && u2.kind, "sync", "cli-sync のユーザー発言は sync ノード");
+  assert.equal(u2.text, "外部で送った発言", "本文は保持される");
 });
 
 // 14. 折りたたみ

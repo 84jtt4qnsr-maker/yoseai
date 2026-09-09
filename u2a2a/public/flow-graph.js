@@ -59,7 +59,8 @@ function uniq(list) {
 // 同一トピック・author=user・UI 直接送信・同一本文・異なる宛先レーン・束の先頭 ts から windowMs 以内、を推定でまとめる。
 // 直前候補との差ではなく先頭からの幅なので、0・40・80ms が連鎖して 1 束にならない。
 export function groupUserSends(msgs, windowMs = FLOW_DEFAULTS.sendWindowMs) {
-  const cands = (msgs || []).filter((m) => m && m.author === "user" && !isCopy(m)).slice().sort(cmpTs);
+  // SPEC ノード表: ingress "cli-sync" はユーザー発言でもすべて sync ノード（送信束の候補にしない）
+  const cands = (msgs || []).filter((m) => m && m.author === "user" && !isCopy(m) && provOf(m).ingress !== "cli-sync").slice().sort(cmpTs);
   const out = [];
   let cur = null;
   for (const m of cands) {
@@ -151,6 +152,7 @@ export function nodeStatus(node, ctx = {}) {
       return TASK_STATUS[node.taskStatus] || "wait";
     case "relay":
       if (node.active) return "run";
+      if (!node.stopReason) return ""; // 停止理由の記録がない旧リレー: 「終了理由不明」の中立表示（成功の青にしない）
       return RELAY_STOP_STATUS[node.stopReason] || "ok";
     default:
       return "ok";
@@ -240,7 +242,7 @@ export function buildFlowGraph(input, options = {}) {
 
   for (const m of msgs) {
     if (sendIds.has(m.id) || isCopy(m)) continue;
-    if (m.author === "user") continue; // 送信束が全件拾う（isCopy でない user 発言は groupUserSends の候補）
+    if (m.author === "user" && provOf(m).ingress !== "cli-sync") continue; // 送信束が拾う（cli-sync のユーザー発言は下の sync ノードへ）
     if (relayOfReply.has(m.id)) continue; // リレーの手番応答は複合カードの中
     const pv = provOf(m);
     const lane = m.thread || m.author;
