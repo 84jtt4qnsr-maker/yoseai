@@ -1,0 +1,996 @@
+{
+  "name": "flow-3agents",
+  "input": {
+    "topicId": "topicA",
+    "messages": [
+      {
+        "id": "u1",
+        "topicId": "topicA",
+        "thread": "claude",
+        "author": "user",
+        "text": "三者で相談したい",
+        "provenance": {
+          "ingress": "ui",
+          "delivery": "direct",
+          "trigger": "manual",
+          "source": null
+        },
+        "ts": 1000
+      },
+      {
+        "id": "u2",
+        "topicId": "topicA",
+        "thread": "codex",
+        "author": "user",
+        "text": "三者で相談したい",
+        "provenance": {
+          "ingress": "ui",
+          "delivery": "direct",
+          "trigger": "manual",
+          "source": null
+        },
+        "ts": 1001
+      },
+      {
+        "id": "u3",
+        "topicId": "topicA",
+        "thread": "grok",
+        "author": "user",
+        "text": "三者で相談したい",
+        "provenance": {
+          "ingress": "ui",
+          "delivery": "direct",
+          "trigger": "manual",
+          "source": null
+        },
+        "ts": 1002
+      },
+      {
+        "id": "r1",
+        "topicId": "topicA",
+        "thread": "claude",
+        "author": "claude",
+        "text": "構造から見ると…",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "direct",
+          "trigger": "auto",
+          "source": null
+        },
+        "ts": 1100
+      },
+      {
+        "id": "r2",
+        "topicId": "topicA",
+        "thread": "codex",
+        "author": "codex",
+        "text": "実装面では…",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "direct",
+          "trigger": "auto",
+          "source": null
+        },
+        "ts": 1150
+      },
+      {
+        "id": "r3",
+        "topicId": "topicA",
+        "thread": "claude",
+        "author": "claude",
+        "text": "補足です",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "direct",
+          "trigger": "auto",
+          "source": null
+        },
+        "ts": 1200
+      },
+      {
+        "id": "q1",
+        "topicId": "topicA",
+        "thread": "grok",
+        "author": "user",
+        "text": "今回決めること: 手狭の解決法",
+        "provenance": {
+          "ingress": "ui",
+          "delivery": "direct",
+          "trigger": "manual",
+          "source": null
+        },
+        "ts": 2000
+      },
+      {
+        "id": "h1",
+        "topicId": "topicA",
+        "thread": "grok",
+        "author": "grok",
+        "text": "横断整理",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "direct",
+          "trigger": "auto",
+          "source": null
+        },
+        "ts": 2100
+      },
+      {
+        "id": "h1claude",
+        "topicId": "topicA",
+        "thread": "claude",
+        "author": "grok",
+        "text": "手番 1",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "qa-relay",
+          "trigger": "auto",
+          "source": {
+            "topicId": "topicA",
+            "messageId": "h1",
+            "agent": "grok",
+            "relayId": "R1",
+            "seq": 1,
+            "turn": 0
+          }
+        },
+        "ts": 2101
+      },
+      {
+        "id": "h1codex",
+        "topicId": "topicA",
+        "thread": "codex",
+        "author": "grok",
+        "text": "手番 1",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "qa-relay",
+          "trigger": "auto",
+          "source": {
+            "topicId": "topicA",
+            "messageId": "h1",
+            "agent": "grok",
+            "relayId": "R1",
+            "seq": 1,
+            "turn": 0
+          }
+        },
+        "ts": 2101
+      },
+      {
+        "id": "h2",
+        "topicId": "topicA",
+        "thread": "claude",
+        "author": "claude",
+        "text": "根拠付きレビュー",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "direct",
+          "trigger": "auto",
+          "source": null
+        },
+        "ts": 2200
+      },
+      {
+        "id": "h2codex",
+        "topicId": "topicA",
+        "thread": "codex",
+        "author": "claude",
+        "text": "手番 2",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "qa-relay",
+          "trigger": "auto",
+          "source": {
+            "topicId": "topicA",
+            "messageId": "h2",
+            "agent": "claude",
+            "relayId": "R1",
+            "seq": 2,
+            "turn": 1
+          }
+        },
+        "ts": 2201
+      },
+      {
+        "id": "h2grok",
+        "topicId": "topicA",
+        "thread": "grok",
+        "author": "claude",
+        "text": "手番 2",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "qa-relay",
+          "trigger": "auto",
+          "source": {
+            "topicId": "topicA",
+            "messageId": "h2",
+            "agent": "claude",
+            "relayId": "R1",
+            "seq": 2,
+            "turn": 1
+          }
+        },
+        "ts": 2201
+      },
+      {
+        "id": "h3",
+        "topicId": "topicA",
+        "thread": "codex",
+        "author": "codex",
+        "text": "実装案 【質疑終了】",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "direct",
+          "trigger": "auto",
+          "source": null
+        },
+        "ts": 2300
+      },
+      {
+        "id": "h3claude",
+        "topicId": "topicA",
+        "thread": "claude",
+        "author": "codex",
+        "text": "手番 3",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "qa-relay",
+          "trigger": "auto",
+          "source": {
+            "topicId": "topicA",
+            "messageId": "h3",
+            "agent": "codex",
+            "relayId": "R1",
+            "seq": 3,
+            "turn": 2
+          }
+        },
+        "ts": 2301
+      },
+      {
+        "id": "h3grok",
+        "topicId": "topicA",
+        "thread": "grok",
+        "author": "codex",
+        "text": "手番 3",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "qa-relay",
+          "trigger": "auto",
+          "source": {
+            "topicId": "topicA",
+            "messageId": "h3",
+            "agent": "codex",
+            "relayId": "R1",
+            "seq": 3,
+            "turn": 2
+          }
+        },
+        "ts": 2301
+      },
+      {
+        "id": "late",
+        "topicId": "topicA",
+        "thread": "grok",
+        "author": "grok",
+        "text": "旧リレー宛ての応答",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "direct",
+          "trigger": "auto",
+          "source": null
+        },
+        "ts": 2400,
+        "staleRelayId": "R0"
+      },
+      {
+        "id": "s1",
+        "topicId": "topicA",
+        "thread": "codex",
+        "author": "codex",
+        "text": "ターミナルで続けた分",
+        "provenance": {
+          "ingress": "cli-sync",
+          "delivery": "direct",
+          "trigger": "manual",
+          "source": null
+        },
+        "ts": 2500
+      },
+      {
+        "id": "u4",
+        "topicId": "topicA",
+        "thread": "codex",
+        "author": "user",
+        "text": "タスクにします",
+        "provenance": {
+          "ingress": "ui",
+          "delivery": "direct",
+          "trigger": "manual",
+          "source": null
+        },
+        "ts": 3000
+      },
+      {
+        "id": "r4",
+        "topicId": "topicA",
+        "thread": "codex",
+        "author": "codex",
+        "text": "結果を戻します",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "direct",
+          "trigger": "auto",
+          "source": null
+        },
+        "ts": 3100,
+        "taskId": "t1"
+      },
+      {
+        "id": "fw",
+        "topicId": "topicA",
+        "thread": "grok",
+        "author": "codex",
+        "text": "実装面では…",
+        "provenance": {
+          "ingress": "ui",
+          "delivery": "relay",
+          "trigger": "manual",
+          "source": {
+            "topicId": "topicA",
+            "messageId": "r2",
+            "agent": "codex"
+          }
+        },
+        "ts": 3150
+      }
+    ],
+    "pool": [
+      {
+        "id": "p1",
+        "title": "合意メモ.md",
+        "file": "topics/topicA/合意メモ.md",
+        "origin": "claude",
+        "topicId": "topicA",
+        "reviewers": [
+          "codex",
+          "grok"
+        ],
+        "status": "submitted",
+        "reviews": [
+          {
+            "id": "v1",
+            "reviewer": "codex",
+            "text": "【判定】承認",
+            "verdict": "承認",
+            "ts": 1300
+          }
+        ],
+        "fromMessageId": "r3",
+        "ts": 1250
+      },
+      {
+        "id": "p2",
+        "title": "hello.md",
+        "file": "topics/topicA/hello.md",
+        "origin": "grok",
+        "topicId": "topicA",
+        "reviewers": [
+          "claude",
+          "codex"
+        ],
+        "status": "submitted",
+        "reviews": [],
+        "fromMessageId": null,
+        "ts": 2050
+      }
+    ],
+    "tasks": [
+      {
+        "id": "t1",
+        "agent": "codex",
+        "topicId": "topicA",
+        "title": "手動拡幅の実装",
+        "detail": "",
+        "status": "returned",
+        "fromMessageId": "r2",
+        "result": "結果を戻します",
+        "ts": 1160
+      }
+    ],
+    "topics": [
+      {
+        "id": "topicA",
+        "title": "三者会談",
+        "participants": [
+          "claude",
+          "codex",
+          "grok"
+        ],
+        "agents": {},
+        "relay": {
+          "active": false,
+          "id": "R1",
+          "participants": [
+            "claude",
+            "codex",
+            "grok"
+          ],
+          "turn": 0,
+          "seq": 3,
+          "stopReason": "agreed",
+          "startMessageId": "q1"
+        }
+      },
+      {
+        "id": "childA",
+        "title": "三者会談＃分岐",
+        "participants": [
+          "claude",
+          "codex",
+          "grok"
+        ],
+        "agents": {},
+        "relay": {
+          "active": false,
+          "id": null,
+          "participants": [],
+          "turn": 0,
+          "seq": 0,
+          "stopReason": null,
+          "startMessageId": null
+        },
+        "branchedFrom": {
+          "topicId": "topicA",
+          "messageId": "r2"
+        }
+      }
+    ],
+    "running": {
+      "topicA:grok": true
+    },
+    "reviewPending": {
+      "p2": [
+        "claude"
+      ]
+    },
+    "fixPending": {}
+  },
+  "expected": {
+    "topicId": "topicA",
+    "episodes": [
+      {
+        "key": "ep:u1",
+        "kind": "send",
+        "ts": 1000,
+        "nodeKeys": [
+          "msg:u1",
+          "grp:r1",
+          "msg:r2",
+          "msg:s1",
+          "task:t1",
+          "art:p1"
+        ],
+        "count": {
+          "replies": 3,
+          "artifacts": 1,
+          "tasks": 1,
+          "syncs": 1
+        },
+        "folded": false
+      },
+      {
+        "key": "ep:q1",
+        "kind": "relay",
+        "ts": 2000,
+        "nodeKeys": [
+          "msg:q1",
+          "relay:R1",
+          "msg:late"
+        ],
+        "count": {
+          "replies": 1,
+          "artifacts": 0,
+          "tasks": 0,
+          "syncs": 0
+        },
+        "folded": true
+      },
+      {
+        "key": "ep:orphan:p2",
+        "kind": "orphan",
+        "ts": 2050,
+        "nodeKeys": [
+          "art:p2"
+        ],
+        "count": {
+          "replies": 0,
+          "artifacts": 1,
+          "tasks": 0,
+          "syncs": 0
+        },
+        "folded": false
+      },
+      {
+        "key": "ep:u4",
+        "kind": "send",
+        "ts": 3000,
+        "nodeKeys": [
+          "msg:u4",
+          "msg:r4",
+          "run:grok"
+        ],
+        "count": {
+          "replies": 1,
+          "artifacts": 0,
+          "tasks": 0,
+          "syncs": 0
+        },
+        "folded": false
+      }
+    ],
+    "nodes": [
+      {
+        "kind": "send",
+        "key": "msg:u1",
+        "ts": 1000,
+        "messageIds": [
+          "u1",
+          "u2",
+          "u3"
+        ],
+        "lanes": [
+          "claude",
+          "codex",
+          "grok"
+        ],
+        "text": "三者で相談したい",
+        "head": "三者で相談したい",
+        "inferred": true
+      },
+      {
+        "kind": "replies",
+        "key": "grp:r1",
+        "ts": 1100,
+        "agent": "claude",
+        "lane": "claude",
+        "messageIds": [
+          "r1",
+          "r3"
+        ],
+        "count": 2,
+        "head": "構造から見ると…",
+        "status": "ok"
+      },
+      {
+        "kind": "reply",
+        "key": "msg:r2",
+        "messageId": "r2",
+        "ts": 1150,
+        "agent": "codex",
+        "lane": "codex",
+        "text": "実装面では…",
+        "head": "実装面では…",
+        "stopped": false,
+        "meta": null,
+        "taskId": null,
+        "status": "ok"
+      },
+      {
+        "kind": "sync",
+        "key": "msg:s1",
+        "messageId": "s1",
+        "ts": 2500,
+        "agent": "codex",
+        "lane": "codex",
+        "text": "ターミナルで続けた分",
+        "head": "ターミナルで続けた分",
+        "status": "ok"
+      },
+      {
+        "kind": "task",
+        "key": "task:t1",
+        "taskId": "t1",
+        "ts": 1160,
+        "agent": "codex",
+        "title": "手動拡幅の実装",
+        "taskStatus": "returned",
+        "fromMessageId": "r2",
+        "status": "ok"
+      },
+      {
+        "kind": "artifact",
+        "key": "art:p1",
+        "itemId": "p1",
+        "ts": 1250,
+        "title": "合意メモ.md",
+        "file": "topics/topicA/合意メモ.md",
+        "origin": "claude",
+        "itemStatus": "submitted",
+        "fromMessageId": "r3",
+        "verdicts": [
+          {
+            "reviewer": "codex",
+            "label": "承認",
+            "ts": 1300
+          },
+          {
+            "reviewer": "grok",
+            "label": "未実施",
+            "ts": null
+          }
+        ],
+        "pending": false,
+        "status": "ok"
+      },
+      {
+        "kind": "send",
+        "key": "msg:q1",
+        "ts": 2000,
+        "messageIds": [
+          "q1"
+        ],
+        "lanes": [
+          "grok"
+        ],
+        "text": "今回決めること: 手狭の解決法",
+        "head": "今回決めること: 手狭の解決法",
+        "inferred": false
+      },
+      {
+        "kind": "relay",
+        "key": "relay:R1",
+        "relayId": "R1",
+        "ts": 2100,
+        "participants": [
+          "claude",
+          "codex",
+          "grok"
+        ],
+        "hops": [
+          {
+            "seq": 1,
+            "turn": 0,
+            "agent": "grok",
+            "messageId": "h1",
+            "ts": 2100
+          },
+          {
+            "seq": 2,
+            "turn": 1,
+            "agent": "claude",
+            "messageId": "h2",
+            "ts": 2200
+          },
+          {
+            "seq": 3,
+            "turn": 2,
+            "agent": "codex",
+            "messageId": "h3",
+            "ts": 2300
+          }
+        ],
+        "active": false,
+        "stopReason": "agreed",
+        "startMessageId": "q1",
+        "status": "ok"
+      },
+      {
+        "kind": "unrelayed",
+        "key": "msg:late",
+        "messageId": "late",
+        "ts": 2400,
+        "agent": "grok",
+        "lane": "grok",
+        "text": "旧リレー宛ての応答",
+        "head": "旧リレー宛ての応答",
+        "staleRelayId": "R0",
+        "stopped": false,
+        "status": "ok"
+      },
+      {
+        "kind": "artifact",
+        "key": "art:p2",
+        "itemId": "p2",
+        "ts": 2050,
+        "title": "hello.md",
+        "file": "topics/topicA/hello.md",
+        "origin": "grok",
+        "itemStatus": "submitted",
+        "fromMessageId": null,
+        "verdicts": [
+          {
+            "reviewer": "claude",
+            "label": "未実施",
+            "ts": null
+          },
+          {
+            "reviewer": "codex",
+            "label": "未実施",
+            "ts": null
+          }
+        ],
+        "pending": true,
+        "status": "run"
+      },
+      {
+        "kind": "send",
+        "key": "msg:u4",
+        "ts": 3000,
+        "messageIds": [
+          "u4"
+        ],
+        "lanes": [
+          "codex"
+        ],
+        "text": "タスクにします",
+        "head": "タスクにします",
+        "inferred": false
+      },
+      {
+        "kind": "reply",
+        "key": "msg:r4",
+        "messageId": "r4",
+        "ts": 3100,
+        "agent": "codex",
+        "lane": "codex",
+        "text": "結果を戻します",
+        "head": "結果を戻します",
+        "stopped": false,
+        "meta": null,
+        "taskId": "t1",
+        "status": "ok"
+      },
+      {
+        "kind": "pending",
+        "key": "run:grok",
+        "agent": "grok",
+        "lane": "grok",
+        "ts": null,
+        "status": "run"
+      }
+    ],
+    "edges": [
+      {
+        "id": "e:answer:msg:u1:grp:r1",
+        "kind": "answer",
+        "from": {
+          "nodeKey": "msg:u1",
+          "port": "right"
+        },
+        "to": {
+          "nodeKey": "grp:r1",
+          "port": "left"
+        },
+        "style": "dashed",
+        "viaMessageIds": []
+      },
+      {
+        "id": "e:answer:msg:u1:msg:r2",
+        "kind": "answer",
+        "from": {
+          "nodeKey": "msg:u1",
+          "port": "right"
+        },
+        "to": {
+          "nodeKey": "msg:r2",
+          "port": "left"
+        },
+        "style": "dashed",
+        "viaMessageIds": []
+      },
+      {
+        "id": "e:answer:msg:u1:msg:s1",
+        "kind": "answer",
+        "from": {
+          "nodeKey": "msg:u1",
+          "port": "right"
+        },
+        "to": {
+          "nodeKey": "msg:s1",
+          "port": "left"
+        },
+        "style": "dashed",
+        "viaMessageIds": []
+      },
+      {
+        "id": "e:answer:msg:u4:msg:r4",
+        "kind": "answer",
+        "from": {
+          "nodeKey": "msg:u4",
+          "port": "right"
+        },
+        "to": {
+          "nodeKey": "msg:r4",
+          "port": "left"
+        },
+        "style": "dashed",
+        "viaMessageIds": []
+      },
+      {
+        "id": "e:answer:msg:u4:run:grok",
+        "kind": "answer",
+        "from": {
+          "nodeKey": "msg:u4",
+          "port": "right"
+        },
+        "to": {
+          "nodeKey": "run:grok",
+          "port": "left"
+        },
+        "style": "dashed",
+        "viaMessageIds": []
+      },
+      {
+        "id": "e:relay-start:msg:q1:relay:R1:q1",
+        "kind": "relay-start",
+        "from": {
+          "nodeKey": "msg:q1",
+          "port": "right"
+        },
+        "to": {
+          "nodeKey": "relay:R1",
+          "port": "left"
+        },
+        "style": "solid",
+        "viaMessageIds": [
+          "q1"
+        ]
+      },
+      {
+        "id": "e:relay-hop:relay:R1:2",
+        "kind": "relay-hop",
+        "from": {
+          "nodeKey": "relay:R1",
+          "port": "bottom"
+        },
+        "to": {
+          "nodeKey": "relay:R1",
+          "port": "top"
+        },
+        "style": "solid",
+        "viaMessageIds": [
+          "h1",
+          "h2"
+        ]
+      },
+      {
+        "id": "e:relay-hop:relay:R1:3",
+        "kind": "relay-hop",
+        "from": {
+          "nodeKey": "relay:R1",
+          "port": "bottom"
+        },
+        "to": {
+          "nodeKey": "relay:R1",
+          "port": "top"
+        },
+        "style": "solid",
+        "viaMessageIds": [
+          "h2",
+          "h3"
+        ]
+      },
+      {
+        "id": "e:unrelayed:msg:late:mark:unrelayed:late",
+        "kind": "unrelayed",
+        "from": {
+          "nodeKey": "msg:late",
+          "port": "right"
+        },
+        "to": {
+          "mark": "unrelayed",
+          "label": "中継なし"
+        },
+        "style": "gray",
+        "viaMessageIds": [
+          "late"
+        ]
+      },
+      {
+        "id": "e:forward:msg:r2:mark:forward:fw",
+        "kind": "forward",
+        "from": {
+          "nodeKey": "msg:r2",
+          "port": "right"
+        },
+        "to": {
+          "mark": "forward",
+          "label": "転送済み → grok"
+        },
+        "style": "solid",
+        "viaMessageIds": [
+          "fw"
+        ]
+      },
+      {
+        "id": "e:artifact:grp:r1:art:p1",
+        "kind": "artifact",
+        "from": {
+          "nodeKey": "grp:r1",
+          "port": "bottom"
+        },
+        "to": {
+          "nodeKey": "art:p1",
+          "port": "top"
+        },
+        "style": "solid",
+        "viaMessageIds": []
+      },
+      {
+        "id": "e:task:msg:r2:task:t1",
+        "kind": "task",
+        "from": {
+          "nodeKey": "msg:r2",
+          "port": "bottom"
+        },
+        "to": {
+          "nodeKey": "task:t1",
+          "port": "top"
+        },
+        "style": "solid",
+        "viaMessageIds": []
+      },
+      {
+        "id": "e:task-return:task:t1:msg:r4:r4",
+        "kind": "task-return",
+        "from": {
+          "nodeKey": "task:t1",
+          "port": "bottom"
+        },
+        "to": {
+          "nodeKey": "msg:r4",
+          "port": "top"
+        },
+        "style": "solid",
+        "viaMessageIds": [
+          "r4"
+        ]
+      },
+      {
+        "id": "e:branch:msg:r2:mark:branch:r2",
+        "kind": "branch",
+        "from": {
+          "nodeKey": "msg:r2",
+          "port": "right"
+        },
+        "to": {
+          "mark": "branch",
+          "label": "三者会談＃分岐",
+          "childTopicId": "childA"
+        },
+        "style": "solid",
+        "viaMessageIds": [
+          "r2"
+        ]
+      }
+    ],
+    "membership": {
+      "u1": "msg:u1",
+      "u2": "msg:u1",
+      "u3": "msg:u1",
+      "r1": "grp:r1",
+      "r3": "grp:r1",
+      "r2": "msg:r2",
+      "s1": "msg:s1",
+      "q1": "msg:q1",
+      "h1": "relay:R1",
+      "h2": "relay:R1",
+      "h3": "relay:R1",
+      "late": "msg:late",
+      "u4": "msg:u4",
+      "r4": "msg:r4"
+    },
+    "branches": [
+      {
+        "childTopicId": "childA",
+        "title": "三者会談＃分岐",
+        "atMessageId": "r2",
+        "anchorKey": "msg:r2"
+      }
+    ],
+    "origin": null,
+    "warnings": []
+  }
+}

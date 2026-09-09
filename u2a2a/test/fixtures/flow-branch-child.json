@@ -1,0 +1,321 @@
+{
+  "name": "flow-branch-child",
+  "input": {
+    "topicId": "childA",
+    "messages": [
+      {
+        "id": "k1",
+        "topicId": "childA",
+        "thread": "claude",
+        "author": "user",
+        "text": "三者で相談したい",
+        "provenance": {
+          "ingress": "ui",
+          "delivery": "direct",
+          "trigger": "manual",
+          "source": null
+        },
+        "ts": 1000,
+        "copiedFromMessageId": "u1"
+      },
+      {
+        "id": "k2",
+        "topicId": "childA",
+        "thread": "codex",
+        "author": "user",
+        "text": "三者で相談したい",
+        "provenance": {
+          "ingress": "ui",
+          "delivery": "direct",
+          "trigger": "manual",
+          "source": null
+        },
+        "ts": 1001,
+        "copiedFromMessageId": "u2"
+      },
+      {
+        "id": "k3",
+        "topicId": "childA",
+        "thread": "claude",
+        "author": "claude",
+        "text": "構造から見ると…",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "direct",
+          "trigger": "auto",
+          "source": null
+        },
+        "ts": 1100,
+        "copiedFromMessageId": "r1"
+      },
+      {
+        "id": "k4",
+        "topicId": "childA",
+        "thread": "codex",
+        "author": "codex",
+        "text": "実装面では…",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "direct",
+          "trigger": "auto",
+          "source": null
+        },
+        "ts": 1150,
+        "copiedFromMessageId": "r2"
+      },
+      {
+        "id": "k5",
+        "topicId": "childA",
+        "thread": "codex",
+        "author": "user",
+        "text": "分岐後の発言",
+        "provenance": {
+          "ingress": "ui",
+          "delivery": "direct",
+          "trigger": "manual",
+          "source": null
+        },
+        "ts": 5000
+      },
+      {
+        "id": "k6",
+        "topicId": "childA",
+        "thread": "codex",
+        "author": "codex",
+        "text": "分岐後の応答",
+        "provenance": {
+          "ingress": "agent-loop",
+          "delivery": "direct",
+          "trigger": "auto",
+          "source": null
+        },
+        "ts": 5100
+      }
+    ],
+    "pool": [],
+    "tasks": [],
+    "topics": [
+      {
+        "id": "topicA",
+        "title": "三者会談",
+        "participants": [
+          "claude",
+          "codex",
+          "grok"
+        ],
+        "agents": {},
+        "relay": {
+          "active": false,
+          "id": "R1",
+          "participants": [
+            "claude",
+            "codex",
+            "grok"
+          ],
+          "turn": 0,
+          "seq": 3,
+          "stopReason": "agreed",
+          "startMessageId": "q1"
+        }
+      },
+      {
+        "id": "childA",
+        "title": "三者会談＃分岐",
+        "participants": [
+          "claude",
+          "codex",
+          "grok"
+        ],
+        "agents": {},
+        "relay": {
+          "active": false,
+          "id": null,
+          "participants": [],
+          "turn": 0,
+          "seq": 0,
+          "stopReason": null,
+          "startMessageId": null
+        },
+        "branchedFrom": {
+          "topicId": "topicA",
+          "messageId": "r2"
+        }
+      }
+    ],
+    "running": {},
+    "reviewPending": {},
+    "fixPending": {}
+  },
+  "expected": {
+    "topicId": "childA",
+    "episodes": [
+      {
+        "key": "ep:k1",
+        "kind": "send",
+        "ts": 1000,
+        "nodeKeys": [
+          "msg:k1",
+          "msg:k3",
+          "msg:k4"
+        ],
+        "count": {
+          "replies": 2,
+          "artifacts": 0,
+          "tasks": 0,
+          "syncs": 0
+        },
+        "folded": false
+      },
+      {
+        "key": "ep:k5",
+        "kind": "send",
+        "ts": 5000,
+        "nodeKeys": [
+          "msg:k5",
+          "msg:k6"
+        ],
+        "count": {
+          "replies": 1,
+          "artifacts": 0,
+          "tasks": 0,
+          "syncs": 0
+        },
+        "folded": false
+      }
+    ],
+    "nodes": [
+      {
+        "kind": "send",
+        "key": "msg:k1",
+        "ts": 1000,
+        "messageIds": [
+          "k1",
+          "k2"
+        ],
+        "lanes": [
+          "claude",
+          "codex"
+        ],
+        "text": "三者で相談したい",
+        "head": "三者で相談したい",
+        "inferred": true
+      },
+      {
+        "kind": "reply",
+        "key": "msg:k3",
+        "messageId": "k3",
+        "ts": 1100,
+        "agent": "claude",
+        "lane": "claude",
+        "text": "構造から見ると…",
+        "head": "構造から見ると…",
+        "stopped": false,
+        "meta": null,
+        "taskId": null,
+        "status": "ok"
+      },
+      {
+        "kind": "reply",
+        "key": "msg:k4",
+        "messageId": "k4",
+        "ts": 1150,
+        "agent": "codex",
+        "lane": "codex",
+        "text": "実装面では…",
+        "head": "実装面では…",
+        "stopped": false,
+        "meta": null,
+        "taskId": null,
+        "status": "ok",
+        "branchPoint": true
+      },
+      {
+        "kind": "send",
+        "key": "msg:k5",
+        "ts": 5000,
+        "messageIds": [
+          "k5"
+        ],
+        "lanes": [
+          "codex"
+        ],
+        "text": "分岐後の発言",
+        "head": "分岐後の発言",
+        "inferred": false
+      },
+      {
+        "kind": "reply",
+        "key": "msg:k6",
+        "messageId": "k6",
+        "ts": 5100,
+        "agent": "codex",
+        "lane": "codex",
+        "text": "分岐後の応答",
+        "head": "分岐後の応答",
+        "stopped": false,
+        "meta": null,
+        "taskId": null,
+        "status": "ok"
+      }
+    ],
+    "edges": [
+      {
+        "id": "e:answer:msg:k1:msg:k3",
+        "kind": "answer",
+        "from": {
+          "nodeKey": "msg:k1",
+          "port": "right"
+        },
+        "to": {
+          "nodeKey": "msg:k3",
+          "port": "left"
+        },
+        "style": "dashed",
+        "viaMessageIds": []
+      },
+      {
+        "id": "e:answer:msg:k1:msg:k4",
+        "kind": "answer",
+        "from": {
+          "nodeKey": "msg:k1",
+          "port": "right"
+        },
+        "to": {
+          "nodeKey": "msg:k4",
+          "port": "left"
+        },
+        "style": "dashed",
+        "viaMessageIds": []
+      },
+      {
+        "id": "e:answer:msg:k5:msg:k6",
+        "kind": "answer",
+        "from": {
+          "nodeKey": "msg:k5",
+          "port": "right"
+        },
+        "to": {
+          "nodeKey": "msg:k6",
+          "port": "left"
+        },
+        "style": "dashed",
+        "viaMessageIds": []
+      }
+    ],
+    "membership": {
+      "k1": "msg:k1",
+      "k2": "msg:k1",
+      "k3": "msg:k3",
+      "k4": "msg:k4",
+      "k5": "msg:k5",
+      "k6": "msg:k6"
+    },
+    "branches": [],
+    "origin": {
+      "parentTopicId": "topicA",
+      "parentMessageId": "r2",
+      "anchorKey": "msg:k4"
+    },
+    "warnings": []
+  }
+}

@@ -494,3 +494,6 @@ export const GROK_STOP_NOTE = "Grok が権限要求または中断で停止し�
 export function isGrokUnauthedError(text) {
   return /not signed in|unauthenticated|please (log|sign) ?in/i.test(String(text || ""));
 }
+
+// フロービューのグラフ導出（仕様: SPEC-フロービュー.md）。本体は public/flow-graph.js（ブラウザも同じファイルを読む）。ここはテスト用の再 export
+export * from "./public/flow-graph.js";

@@ -247,3 +247,17 @@ xAI Grok（Grok Build CLI）を加え、**トピックごとに参加者を選�
 
 - `u2a2a/data/state.json` に自動保存（git 管理外）。
 - 複数ウィンドウで開いても SSE でライブ同期。
+
+## フロービュー（グラフ導出）
+
+スレッド 3 列の代わりに「最初と最後が見えて、途中は束」の進行を見せる表示（仕様: `pool/topics/9a299f1bac1a09fb/SPEC-フロービュー.md`）。
+扱う情報は `state` のまま。導出は `public/flow-graph.js` の純関数 `buildFlowGraph(publicState の一部, options)` で、
+ブラウザ（`<script type="module">`）と Node（`lib.mjs` が再 export、`test/flow.test.mjs`）が同じファイルを読む。サーバは変更しない。
+
+- 束（エピソード）: ユーザー発言（`ingress:"ui"`・`delivery:"direct"`）を起点に 1 束。`all` 送信はレーンごとに別 ID なので、同文・別レーン・先頭から 50ms 以内を「推定の送信束」（`inferred`）にまとめる。質疑開始（`relay.startMessageId`）は単独束
+- ノード: `send` / `reply` / `replies`（同一束・同一著者 2 件以上）/ `relay`（質疑 1 本を `relayId` で 1 枚）/ `unrelayed`（`staleRelayId`）/ `sync`（外部同期。`ingress:"cli-sync"` はユーザー発言も含む）/ `system`（blocked・cancelled）/ `artifact` / `task` / `pending`（実行中）
+- エッジ: 明示 ID（`source.messageId`・`fromMessageId`・`taskId`・`copiedFromMessageId`・`branchedFrom`）だけ実線。ユーザー発言→応答はレーン＋時刻の推定で破線（入力集合の復元は約束しない）。配送先の無い転送・引き継ぎ・未中継は終端マーク
+- `membership`（元メッセージ ID → 所属カード key）で、束ねても成果物・分岐の接続先を失わない。分岐先ではコピーが新 ID を持つため、`copiedFromMessageId` で親側の ID を読み替える
+- 折りたたみは既定値だけ返す（先頭・末尾 2 束・実行中・分岐点を含む束は開く）。1 行の件数は応答・成果物・タスク・外部同期・リレー
+- fixture: `test/fixtures/flow-*.json`（入力→出力の組。描画側の先行実装用）。更新は `FLOW_FIXTURES_UPDATE=1 node --test test/flow.test.mjs`
+
