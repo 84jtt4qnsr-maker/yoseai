@@ -90,6 +90,30 @@ node u2a2a/server.mjs
 外部依存なし、HTML タグはすべてエスケープされるため安全。
 メッセージごとの「生表示」ボタンで元テキストと切り替え可能。
 
+## 要約の鮮度（仕様: SPEC-要約鮮度.md）
+
+スレッド要約は「発言 12 件差」と「質疑の決着」で自動更新される。この 2 つのトリガは変えていない。
+変えたのは **結果が見えること**。`topic.summaryState` に最後の試行の結果を残す。
+
+```jsonc
+{ "phase": "idle" | "running" | "skipped" | "failed",
+  "reason": null | "budget-halt" | "budget-cap" | "no-messages" | "already-running" | "cancelled" | "error",
+  "detail": "", "ts": 0, "startedTs": null, "trigger": null | "auto" | "manual" | "relay-agreed" }
+```
+
+- 成功したら `idle` に戻す。成功の事実は `summaryTs` / `summaryAt` / `summaryLastMsgId` が表す
+- 予算停止・上限超過での見送りは、以前は無言で `return` していた。いまは理由が残る
+- `GET /api/topics/:id/summary-status` → `{ total, unreflected, threshold, due, state, ... }`
+- `POST /api/topics/:id/summarize` → `202 { ok, started, state }`（走行中・見送りは `started: false`）
+- **`already-running` は応答にだけ入り、`topic.summaryState` には残さない。** 自動要約の再判定は 30 秒ごとに走るので、
+  走行中のトピックは必ずこの分岐に入る。永続化すると「更新中」の表示が開始直後に「見送り」で潰れる
+
+**未反映件数は配送コピーを除いて数える。** 質疑の 1 手番は「応答 1 件 ＋ 配送コピー 参加者-1 件」で保存されるため、
+素の件数は 3 名で約 3 倍になる。`lib.unreflectedCount()` が、元発言が同じトピックに居るコピーを落として数える。
+
+`summary-status` の `due`（`unreflected >= 12`）は **表示の強調用で、自動要約の発火条件ではない**。
+発火は現行どおり「素の件数 − `summaryAt` >= 12」なので、3 名リレーでは自動要約のほうが先に走る（`due` はほとんど立たない）。
+
 ## エージェントの作業文脈サポート
 
 - **変更ファイル通知**: (トピック×エージェント) ごとに前回プロンプト生成時のファイル状態

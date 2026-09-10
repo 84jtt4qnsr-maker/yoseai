@@ -53,6 +53,18 @@
     overflow-x: auto;
     flex: none;
   }
+  #summary-status { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 6px 18px; border-bottom: 1px solid var(--line); background: var(--panel); color: var(--dim); font-size: 11px; overflow-wrap: anywhere; }
+  #summary-retry[hidden] { display: none; }
+  #summary-status[hidden] { display: none; }
+  #summary-phase { flex-basis: 100%; }
+  #summary-phase:empty { display: none; }
+  #summary-update:disabled, #summary-retry:disabled { opacity: 0.45; cursor: not-allowed; }
+  #summary-status[data-phase="failed"] #summary-phase { color: var(--danger); }
+  #summary-status[data-phase="skipped"] #summary-phase { color: #e7c86b; }
+  #summary-status[data-phase="running"] { animation: glow-breath 2.6s ease-in-out infinite; }
+  #summary-freshness.is-due { color: #e7c86b; font-weight: 600; }
+  @media (prefers-reduced-motion: reduce) { #summary-status[data-phase="running"] { animation: none; } }
+  #summary-update:focus-visible, #summary-retry:focus-visible { outline: 2px solid var(--codex); outline-offset: 2px; }
   .topic-tab {
     display: flex;
     gap: 6px;
@@ -942,6 +954,13 @@
 
 <!-- トピック（スレッド）タブ -->
 <div id="topic-bar"></div>
+<section id="summary-status" aria-label="要約の鮮度" hidden>
+  <span id="summary-updated"></span>
+  <span id="summary-freshness"></span>
+  <button type="button" id="summary-update" class="small" data-summary-topic="">今すぐ更新</button>
+  <button type="button" id="summary-retry" class="small" hidden>状態を再取得</button>
+  <span id="summary-phase" role="status" aria-live="polite"></span>
+</section>
 <div id="project-context" hidden></div>
 <div id="project-stop" role="status" hidden></div>
 
@@ -1276,6 +1295,7 @@ function renderTopicBar() {
     onclick: (event) => openProjectChoice("new", undefined, null, event.shiftKey),
   }));
   renderViewControls();
+  refreshSummaryControls();
 }
 const POOL_STATUS_LABEL = { submitted: "持ち込み", reviewing: "レビュー", approved: "承認", rejected: "差し戻し" };
 
@@ -1403,6 +1423,143 @@ function updateRelayLinks() {
 }
 
 window.addEventListener("resize", scheduleLinks);
+
+// ---- 要約の鮮度と手動更新 ----
+const summaryRequests = new Set();
+const summaryFeedback = new Map();
+const summaryStatusCache = new Map();
+
+function summaryStamp(topic) {
+  return JSON.stringify([topic.summaryState, topic.summaryTs, topic.summaryAt, topic.summaryLastMsgId]);
+}
+
+function summarySnapshot(topic) {
+  // 件数に関係するSSE変更だけ再取得する。本文や実況の更新では問い合わせない。
+  return JSON.stringify([summaryStamp(topic), (state.messages || []).filter((m) => m.topicId === topic.id)
+    .map((m) => [m.id, m.ts, m.provenance?.delivery, m.provenance?.source?.relayId, m.provenance?.source?.seq])]);
+}
+
+function summaryDate(ts) {
+  if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) return "不明";
+  return new Date(ts).toLocaleString("ja-JP", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function summaryPhaseText(recorded) {
+  const labels = { idle: "待機中", running: "更新中", skipped: "更新見送り", failed: "更新失敗" };
+  const reasons = { "budget-halt": "予算停止中", "budget-cap": "予算上限", "no-messages": "対象の発言がありません", "already-running": "すでに更新中", cancelled: "更新を中断しました", error: "要約の生成に失敗しました" };
+  if (!recorded || !labels[recorded.phase]) return "更新状態は未記録";
+  if (recorded.phase === "idle") return "";
+  return labels[recorded.phase] + (recorded.reason ? " — " + (reasons[recorded.reason] || recorded.reason) : "") +
+    (recorded.detail ? " — " + String(recorded.detail).slice(0, 200) : "") + (recorded.ts ? "（" + summaryDate(recorded.ts) + "）" : "");
+}
+
+function summaryStatusModel(topic, key = summarySnapshot(topic)) {
+  const cache = summaryStatusCache.get(topic.id);
+  const current = cache?.key === key ? cache : null;
+  const feedback = summaryFeedback.get(topic.id);
+  if (feedback && feedback.stamp !== summaryStamp(topic)) summaryFeedback.delete(topic.id);
+  const local = summaryFeedback.get(topic.id);
+  const data = current?.data || null; // loading 中も持ち越した直前値を表示する
+  const recorded = data?.state || topic.summaryState;
+  const validCount = Number.isInteger(data?.unreflected) && data.unreflected >= 0;
+  const noSummary = !topic.summaryText && !data?.summaryTs;
+  const freshness = current?.status === "error" ? "未反映数を取得できません" : !data ? "未反映数を確認中…" :
+    !validCount ? "未反映数は不明" :
+    noSummary ? (data.unreflected === 0 ? "要約未作成" : "要約未作成（未反映 " + data.unreflected + " 件）") :
+    data.unreflected === 0 ? "最新" : "未反映 " + data.unreflected + " 件";
+  return { updated: "要約の最終更新: " + (data?.summaryTs || topic.summaryTs ? summaryDate(data?.summaryTs || topic.summaryTs) : "未作成"),
+    freshness, status: local?.text || summaryPhaseText(recorded),
+    phase: local?.error ? "failed" : local?.running ? "running" : recorded?.phase || "unknown", due: validCount && !!data.due,
+    reason: current?.error || recorded?.detail || "", running: !!local?.running || recorded?.phase === "running" || recorded?.reason === "already-running" };
+}
+
+function ensureSummaryStatus(topic, key = summarySnapshot(topic)) {
+  if (summaryStatusCache.get(topic.id)?.key === key) return;
+  const prev = summaryStatusCache.get(topic.id);
+  // 再取得中も直前の件数を捨てない（表示は保ち、取得完了で置き換える）
+  const entry = { key, status: "loading", data: prev?.status === "ready" ? prev.data : undefined };
+  summaryStatusCache.set(topic.id, entry);
+  api("/api/topics/" + encodeURIComponent(topic.id) + "/summary-status", "GET", undefined, { silent: true }).then((data) => {
+    if (summaryStatusCache.get(topic.id) !== entry) return;
+    if (data.topicId !== topic.id || !Number.isInteger(data.unreflected) || data.unreflected < 0) throw new Error("要約状態の応答形式が一致しません");
+    entry.status = "ready"; entry.data = data;
+    // 受付後の抑止はGETでは解除せず、SSEのstamp更新を待つ。
+    const feedback = summaryFeedback.get(topic.id);
+    if (!feedback?.error && !feedback?.running) summaryFeedback.delete(topic.id);
+  }).catch((error) => {
+    if (summaryStatusCache.get(topic.id) !== entry) return;
+    entry.status = "error"; entry.error = error.message || "通信エラー";
+  }).finally(() => {
+    if (currentTopic()?.id === topic.id && summaryStatusCache.get(topic.id) === entry) refreshSummaryControls();
+  });
+}
+
+function refreshSummaryControls() {
+  const topic = currentTopic(), panel = $("#summary-status");
+  panel.hidden = !topic;
+  const models = new Map();
+  const modelFor = (target) => {
+    if (!models.has(target.id)) {
+      const key = summarySnapshot(target);
+      if (target.id === topic?.id) ensureSummaryStatus(target, key);
+      models.set(target.id, summaryStatusModel(target, key));
+    }
+    return models.get(target.id);
+  };
+  if (topic) {
+    const model = modelFor(topic);
+    const text = summaryRequests.has(topic.id) ? "更新を要求中…" : model.status;
+    const values = [["#summary-updated", model.updated], ["#summary-freshness", model.freshness], ["#summary-phase", text]];
+    for (const [selector, value] of values) if ($(selector).textContent !== value) $(selector).textContent = value;
+    $("#summary-retry").hidden = summaryStatusCache.get(topic.id)?.status !== "error";
+    panel.dataset.phase = model.phase;
+    $("#summary-freshness").classList.toggle("is-due", model.due);
+    $("#summary-phase").title = model.reason;
+    $("#summary-update").dataset.summaryTopic = topic.id;
+  }
+  for (const button of document.querySelectorAll("button[data-summary-topic]")) {
+    const target = (state.topics || []).find((t) => t.id === button.dataset.summaryTopic);
+    button.disabled = !target || summaryRequests.has(target.id) || modelFor(target).running;
+  }
+}
+
+async function requestSummaryUpdate(topicId) {
+  const topic = (state.topics || []).find((t) => t.id === topicId);
+  if (!topic || summaryRequests.has(topicId) || summaryStatusModel(topic).running) return;
+  const requestedStamp = summaryStamp(topic);
+  summaryRequests.add(topicId);
+  summaryFeedback.delete(topicId);
+  refreshSummaryControls();
+  try {
+    const result = await api("/api/topics/" + encodeURIComponent(topicId) + "/summarize", "POST", {}, { silent: true });
+    const latest = (state.topics || []).find((t) => t.id === topicId);
+    const notice = result.state ? summaryPhaseText(result.state) : result.started === true ? "更新中 — 結果の反映を待っています。" : "更新要求を受け付けました。結果の反映を待っています。";
+    // HTTP 202 は受付。SSEが先に届いていた場合は、その新しい結果を上書きしない。
+    if (latest && summaryStamp(latest) === requestedStamp) summaryFeedback.set(topicId, {
+      stamp: requestedStamp, text: notice, error: result.state?.phase === "failed",
+      running: result.started === true || result.state?.phase === "running" || result.state?.reason === "already-running",
+    });
+    if (result.started === false || currentTopic()?.id !== topicId) toast("「" + topic.title + "」: " + notice);
+  } catch (error) {
+    const latest = (state.topics || []).find((t) => t.id === topicId);
+    const text = "更新要求を確認できませんでした: " + (error.message || "通信エラー");
+    if (latest) summaryFeedback.set(topicId, { stamp: summaryStamp(latest), text, error: true });
+    if (currentTopic()?.id !== topicId) toast("「" + topic.title + "」: " + text);
+  } finally {
+    summaryRequests.delete(topicId);
+    summaryStatusCache.delete(topicId); // POST後は、見送りでも最新の件数・状態を取得する。
+    refreshSummaryControls();
+  }
+}
+
+$("#summary-update").addEventListener("click", () => requestSummaryUpdate(currentTopic()?.id));
+
+$("#summary-retry").addEventListener("click", () => {
+  const topic = currentTopic();
+  if (!topic) return;
+  summaryStatusCache.delete(topic.id);
+  refreshSummaryControls();
+});
 
 // ---- 応答メタ（コスト・トークン・所要時間）表示 ----
 function fmtTok(n) {
@@ -3552,9 +3709,9 @@ function renderTopicDetail(box, t) {
     }),
     el("button", {
       class: "small",
-      text: "📌 要約を更新",
-      onclick: () => api("/api/topics/" + t.id + "/summarize", "POST", {})
-        .then(() => toast("要約を生成中…（完了するとミラーの📌概要が更新されます）")),
+      text: "📌 要約を更新", "data-summary-topic": t.id,
+      ...(summaryRequests.has(t.id) || summaryStatusModel(t).running ? { disabled: "" } : {}),
+      onclick: () => requestSummaryUpdate(t.id),
     }),
   ]);
   box.appendChild(actions);
@@ -4465,7 +4622,7 @@ function ctxItems(t) {
     const topic = (state.topics || []).find((x) => x.id === t.id);
     if (!topic) return [];
     return [
-      ["📌 要約を更新", () => api("/api/topics/" + topic.id + "/summarize", "POST", {}).then(() => toast("要約を生成中…"))],
+      ["📌 要約を更新", () => requestSummaryUpdate(topic.id)],
       ["履歴をコピー", async () => {
         if (!topic.mirrorFile) return;
         const r = await fetch("/api/pool/file/" + encodeURIComponent(topic.mirrorFile));

@@ -47,6 +47,8 @@ import {
   grokMetaFrom,
   GROK_STOP_NOTE,
   isGrokUnauthedError,
+  summaryFreshness,
+  sortByTsId,
 } from "./lib.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -111,6 +113,23 @@ function stopRelay(topic, reason) {
 // トピックの参加者のうち自分以外（OTHER の置き換え）
 const peers = (topic, agent) => peersOf(topic.participants, agent);
 
+// 要約の最後の試行の結果（仕様: SPEC-要約鮮度.md）。成功したら idle に戻し、成功の事実は summaryTs / summaryAt が表す
+function defaultSummaryState() {
+  return { phase: "idle", reason: null, detail: "", ts: 0, startedTs: null, trigger: null };
+}
+
+// summaryState を書き換えて UI へ届ける（無言のスキップを作らない）。
+// 中身が変わらないときは何もしない: 予算見送りは 30 秒ごとの checkSummaries で同じ判定を繰り返すので、
+// そのたびに touch() すると全 SSE クライアントへ publicState() を撒き続けることになる
+function setSummaryState(topic, patch) {
+  const prev = topic.summaryState || defaultSummaryState();
+  const next = { ...prev, ...patch };
+  const same = topic.summaryState && ["phase", "reason", "detail", "trigger", "startedTs"].every((k) => prev[k] === next[k]);
+  if (same) return;
+  topic.summaryState = { ...next, ts: Date.now() };
+  touch();
+}
+
 function defaultTopic(title, participants = LEGACY_AGENTS) {
   const list = [...new Set(participants.filter((a) => AGENTS.includes(a)))];
   return {
@@ -122,6 +141,7 @@ function defaultTopic(title, participants = LEGACY_AGENTS) {
     agents: Object.fromEntries((list.length ? list : LEGACY_AGENTS).map((a) => [a, topicAgent()])),
     projectId: null, // 対象プロジェクト（null = 未紐付け = Kometa リポジトリ）
     projectLocked: false, // 初回実行で立つ。以後は対象を変更できない（仕様: 実行後の変更は新規トピック）
+    summaryState: defaultSummaryState(),
   };
 }
 
@@ -219,6 +239,9 @@ function loadState() {
         t.participants = [...new Set(t.participants.filter((a) => AGENTS.includes(a)))];
         t.agents = t.agents || {};
         for (const a of t.participants) t.agents[a] = { ...topicAgent(), ...t.agents[a] };
+        // schemaVersion 8: 要約の試行結果。再起動時に running のまま固まらないよう idle から始める
+        t.summaryState = { ...defaultSummaryState(), ...(t.summaryState || {}) };
+        if (t.summaryState.phase === "running") t.summaryState = { ...defaultSummaryState(), ts: Date.now() };
       }
       delete parsed.relay;
       parsed.budgets = { ...defaultBudgets(), ...(parsed.budgets || {}) };
@@ -332,7 +355,7 @@ function persistState() {
   const t0 = Date.now();
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    state.schemaVersion = 7;
+    state.schemaVersion = 8;
     const jsonStr = JSON.stringify(state, null, 2);
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, jsonStr);
@@ -1131,7 +1154,7 @@ function qaHop(topic, agent, replyText, sourceMsgId) {
   // 終了宣言は最終行末尾にそのまま書かれたマーカーのみ有効（lib.hasEndMark: 文中・否定文・引用・コードで包んだ言及では発火しない）、かつ参加者全員が 1 回以上発言した後のみ
   if (canEndRelay(r, replyText, QA_END_MARK)) {
     stopRelay(topic, "agreed");
-    summarizeTopic(topic.id); // 質疑の決着は要約の節目
+    summarizeTopic(topic.id, "relay-agreed"); // 質疑の決着は要約の節目
     return;
   }
   if (r.remaining <= 0) {
@@ -2237,14 +2260,41 @@ async function runFix(itemId, agent, fopts = {}) {
 const SUMMARY_EVERY = 12;
 const summaryPending = new Set();
 
-async function summarizeTopic(topicId) {
+// trigger: "auto"（件数閾値）/ "manual"（UI）/ "relay-agreed"（質疑の決着）。
+// 起動判定は同期で終える（呼び出し側は promise を待たない）。戻り値は { started, state }。
+// 予算・発言なしの見送りは summaryState に理由を残すが、**already-running だけは残さない**:
+// checkSummaries は 30 秒ごとに閾値超えのトピックを呼ぶので、走行中の要約は必ずここへ入る。
+// 永続化すると「更新中」表示が開始直後に「見送り」で潰れる（仕様: SPEC-要約鮮度.md。応答にだけ返す）
+function summarizeTopic(topicId, trigger = "auto") {
   const topic = findTopic(topicId);
-  if (!topic || summaryPending.has(topicId)) return;
-  // 予算管理下に置く（合意事項B）: 停止中・上限超過なら halt は起こさず静かにスキップ
-  if (state.budgetHalt || budgetStatus(topicId)) return;
+  if (!topic) return { started: false, state: null };
+  if (summaryPending.has(topicId)) {
+    const cur = topic.summaryState || defaultSummaryState();
+    return { started: false, state: { ...cur, phase: "skipped", reason: "already-running", detail: "", trigger, ts: Date.now() } };
+  }
+  // 予算管理下に置く（合意事項B）: 停止中・上限超過なら halt は起こさず見送る（理由は残す）
+  if (state.budgetHalt) {
+    setSummaryState(topic, { phase: "skipped", reason: "budget-halt", detail: String(state.budgetHalt.reason || state.budgetHalt), trigger });
+    return { started: false, state: topic.summaryState };
+  }
+  const cap = budgetStatus(topicId);
+  if (cap) {
+    setSummaryState(topic, { phase: "skipped", reason: "budget-cap", detail: String(cap), trigger });
+    return { started: false, state: topic.summaryState };
+  }
   const msgs = state.messages.filter((m) => m.topicId === topicId);
-  if (!msgs.length) return;
+  if (!msgs.length) {
+    setSummaryState(topic, { phase: "skipped", reason: "no-messages", detail: "", trigger });
+    return { started: false, state: topic.summaryState };
+  }
   summaryPending.add(topicId);
+  setSummaryState(topic, { phase: "running", reason: null, detail: "", startedTs: Date.now(), trigger });
+  runSummary(topic, msgs, trigger); // 完了・失敗は summaryState（＝SSE）で伝える。呼び出し側は待たない
+  return { started: true, state: topic.summaryState };
+}
+
+async function runSummary(topic, msgs, trigger) {
+  const topicId = topic.id;
   // 要約の出所は開始時点の対象で固定する（await の間に PATCH で対象が変わっても、この要約は開始時点の対象の文脈で作られたもの）
   const originProjectId = topic.projectId || null;
   // 前回の要約が別の対象（分岐元など）で作られたもの、または分岐で引き継いだ会話の出所（carriedProjectId、
@@ -2286,10 +2336,17 @@ async function summarizeTopic(topicId) {
     topic.summaryProjectId = originProjectId; // 要約の出所（開始時点の対象。分岐で要約と一緒に引き継ぐ）
     topic.summaryAt = msgs.length;
     topic.summaryTs = Date.now();
-    topic.summaryLastMsgId = msgs[msgs.length - 1].id; // 「どこまでを対象にした要約か」を固定
+    topic.summaryLastMsgId = sortByTsId(msgs).pop().id; // 「どこまでを対象にした要約か」を固定（数える側と同じ並び順）
+    setSummaryState(topic, { phase: "idle", reason: null, detail: "", trigger }); // 成功の事実は summaryTs / summaryAt が表す
     touch();
   } catch (e) {
-    if (!e.cancelled) logEvent("summary", `スレッド要約の生成に失敗（${topic.title}）: ` + (e.message || e), "warn");
+    if (e.cancelled) {
+      // 明示的な中断は失敗ではない（見送り扱い）
+      setSummaryState(topic, { phase: "skipped", reason: "cancelled", detail: "", trigger });
+    } else {
+      setSummaryState(topic, { phase: "failed", reason: "error", detail: String(e.message || e).slice(0, 200), trigger });
+      logEvent("summary", `スレッド要約の生成に失敗（${topic.title}）: ` + (e.message || e), "warn");
+    }
   } finally {
     endRun(run.runId);
     actEnd(actKey);
@@ -2297,10 +2354,29 @@ async function summarizeTopic(topicId) {
   }
 }
 
+// 鮮度の一件分（API と SSE 利用側で同じ形を使う）
+function summaryStatus(topic) {
+  const msgs = state.messages.filter((m) => m.topicId === topic.id);
+  const f = summaryFreshness(topic, msgs, SUMMARY_EVERY);
+  return {
+    topicId: topic.id,
+    summaryTs: topic.summaryTs || null,
+    summaryAt: topic.summaryAt || 0,
+    summaryLastMsgId: topic.summaryLastMsgId || null,
+    total: f.total,
+    unreflected: f.unreflected,
+    threshold: f.threshold,
+    due: f.due,
+    state: topic.summaryState || defaultSummaryState(),
+  };
+}
+
+// 自動トリガ（変更なし）。判定は「素の件数 - summaryAt」で、表示用の unreflected（配送コピー除外）とは別物。
+// 30 秒ごとに呼ばれるので、走行中のトピックは毎回 already-running で戻る（summaryState は running のまま）
 function checkSummaries() {
   for (const t of state.topics) {
     const n = state.messages.filter((m) => m.topicId === t.id).length;
-    if (n && n - (t.summaryAt || 0) >= SUMMARY_EVERY) summarizeTopic(t.id);
+    if (n && n - (t.summaryAt || 0) >= SUMMARY_EVERY) summarizeTopic(t.id, "auto");
   }
 }
 
@@ -2958,8 +3034,14 @@ async function handleApi(req, res, url) {
     if (!topic) return json(res, 404, { error: "topic not found" });
     // 手動での要約更新
     if (req.method === "POST" && parts[3] === "summarize") {
-      summarizeTopic(topic.id);
-      return json(res, 202, { ok: true });
+      // 起動判定は同期。already-running はトピックに残さないので、応答は戻り値の state を使う
+      const { started, state: st } = summarizeTopic(topic.id, "manual");
+      return json(res, 202, { ok: true, started, state: st || defaultSummaryState() });
+    }
+
+    // 鮮度の確認（SSE を待たずに開いた瞬間に確かめるための補助。数え方は lib.unreflectedCount）
+    if (req.method === "GET" && parts[3] === "summary-status") {
+      return json(res, 200, summaryStatus(topic));
     }
 
     // 分岐: 指定メッセージ地点までの履歴を新トピックへコピーする
@@ -2996,6 +3078,10 @@ async function handleApi(req, res, url) {
           copiedFromMessageId: m.id, // provenance.source は上書きしない（複製履歴は別軸）
         }));
       branched.summaryAt = copies.length;
+      // 要約が「どこまでを見たか」はコピー後の ID で持つ（親の ID は分岐先に存在しない）。
+      // 末尾は挿入順ではなく数える側と同じ並び（ts 昇順・同 ts は id 昇順）で取る。
+      // 質疑の配送コピーは同一 ts で複数作られ、ID はランダム hex なので挿入順の末尾とは一致しない
+      branched.summaryLastMsgId = copies.length ? sortByTsId(copies).pop().id : null;
       // 分岐直後に旧履歴へ自動応答が走らないよう、既読位置を分岐時点に合わせる
       for (const a of branched.participants) branched.agents[a].lastSeenTs = Date.now();
       state.topics.push(branched);
@@ -3557,6 +3643,6 @@ saveState();
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`U2A2A Orchestration: http://127.0.0.1:${PORT}`);
-  logEvent("system", "サーバー起動（schemaVersion 7）", "info");
+  logEvent("system", "サーバー起動（schemaVersion 8）", "info");
   if (state.agents.grok) checkGrokAuth().catch((e) => logEvent("cli", "Grok の認証確認に失敗: " + (e.message || e), "warn"));
 });

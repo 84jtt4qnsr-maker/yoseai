@@ -1,0 +1,13 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "u2a2a",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "u2a2a/server.mjs"
+      ],
+      "port": 4742
+    }
+  ]
+}

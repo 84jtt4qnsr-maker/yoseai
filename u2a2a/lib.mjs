@@ -438,6 +438,49 @@ export function dedupeRelayCopies(msgs) {
   });
 }
 
+// ---- 要約の鮮度（仕様: SPEC-要約鮮度.md「未反映件数の数え方」）----
+// 発言の並び順（ts 昇順、同 ts は id 昇順）。「どこまで要約したか」を指す summaryLastMsgId を書く側と
+// 数える側で同じ順序を使う（質疑の配送コピーは同一 ts で複数作られるので、挿入順とは一致しない）
+export function sortByTsId(msgs) {
+  return (msgs || []).slice().sort((a, b) => (a.ts || 0) - (b.ts || 0) || String(a.id).localeCompare(String(b.id)));
+}
+
+// 素の件数は 3 名リレーで 1 手番が 3 件（応答 1 ＋ 配送コピー 2）になるため、人が読む単位に合わせて数える。
+// 起点は summaryLastMsgId の次から。ID が対象内に無ければ summaryAt 件目から（旧トピック・分岐直後の後方互換）
+export function unreflectedMessages(msgs, opts = {}) {
+  const list = sortByTsId(msgs);
+  let start = null;
+  if (opts.summaryLastMsgId) {
+    const i = list.findIndex((m) => m && m.id === opts.summaryLastMsgId);
+    if (i >= 0) start = i + 1;
+  }
+  if (start == null) start = Math.min(Math.max(0, Number(opts.summaryAt) || 0), list.length);
+  // 配送コピー（qa-relay / relay / handoff）は、元発言が同じトピックに居るなら数えない。
+  // 質疑の手番は「応答 1 件（自分のレーン・source なし）＋ 配送コピー 参加者-1 件」で保存されるため、
+  // コピーを落とすと 1 手番 = 1 件になる。元発言を辿れない孤児のコピーだけ relayId+seq で 1 件に畳んで残す
+  const ids = new Set(list.map((m) => m && m.id));
+  const kept = list.slice(start).filter((m) => {
+    const pv = (m && m.provenance) || {};
+    if (pv.delivery !== "qa-relay" && pv.delivery !== "relay" && pv.delivery !== "handoff") return true;
+    const src = pv.source && pv.source.messageId;
+    return !(src && ids.has(src));
+  });
+  return dedupeRelayCopies(kept);
+}
+
+export function unreflectedCount(msgs, opts = {}) {
+  return unreflectedMessages(msgs, opts).length;
+}
+
+// トピックの鮮度。due は表示の強調用（未反映が閾値以上）であって、自動要約の発火条件ではない。
+// 自動トリガは checkSummaries の「素の件数 - summaryAt >= SUMMARY_EVERY」のままで、こちらの方が先に立つ
+export function summaryFreshness(topic, msgs, threshold) {
+  const t = topic || {};
+  const unreflected = unreflectedCount(msgs, { summaryLastMsgId: t.summaryLastMsgId, summaryAt: t.summaryAt });
+  const th = Number(threshold) || 0;
+  return { total: (msgs || []).length, unreflected, threshold: th, due: th > 0 && unreflected >= th };
+}
+
 // Grok streaming-json（NDJSON）の解析。text デルタの連結・end の最終メタ・error 行・実況ステップ
 // 実測（smoke-Grok工程0.md）: thought / text（デルタ）/ usage / tool_call / tool_call_update / end
 export function parseGrokStream(lines) {
