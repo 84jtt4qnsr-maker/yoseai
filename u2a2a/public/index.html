@@ -905,7 +905,13 @@
   .flow-meta-summary { color: var(--dim); font-size: 10.5px; padding: 0 12px 10px; overflow-wrap: anywhere; }
   .flow-meta-summary > div + div { margin-top: 4px; }
   #flow-zone { grid-column: 1; grid-row: 2; min-height: 0; min-width: 0; width: 100%; overflow: auto; position: relative; overflow-anchor: none; }
-  #flow-canvas { position: relative; min-height: 100%; padding: 18px; }
+  #flow-canvas { position: relative; min-height: 100%; padding: 18px;
+    /* Obsidian キャンバス風の＋グリッド。コンテンツ側に敷くのでスクロール・ズームに追従する */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28'%3E%3Cpath d='M14 10.5v7M10.5 14h7' stroke='%232a3341' stroke-opacity='0.55' stroke-width='1'/%3E%3C/svg%3E");
+    background-size: 28px 28px;
+  }
+  #flow-zoom { margin-left: auto; display: inline-flex; gap: 4px; align-items: center; }
+  #flow-zoom-reset { min-width: 52px; font-variant-numeric: tabular-nums; }
   #flow-links { position: absolute; top: 0; left: 0; pointer-events: none; overflow: hidden; z-index: 0; }
   .flow-edge { fill: none; stroke: var(--dim); stroke-width: 1.5; opacity: .65; }
   .flow-edge.is-dashed { stroke-dasharray: 5 5; }
@@ -1019,6 +1025,11 @@
       <label>状態 <select id="flow-filter-status"><option value="">すべて</option></select></label>
       <button type="button" id="flow-filter-reset" class="small">解除</button>
       <span id="flow-filter-count" role="status"></span>
+      <span id="flow-zoom" role="group" aria-label="フローの表示倍率">
+        <button type="button" id="flow-zoom-out" class="small" title="縮小">－</button>
+        <button type="button" id="flow-zoom-reset" class="small" title="等倍に戻す">100%</button>
+        <button type="button" id="flow-zoom-in" class="small" title="拡大">＋</button>
+      </span>
     </div>
   <section id="flow-zone" aria-label="会話のフロー" tabindex="0" hidden>
     <div id="flow-canvas">
@@ -3316,6 +3327,18 @@ function visibleFlowCard(card) {
   return !!card && card.isConnected && !card._flowParts.slot.hidden && !!card.getClientRects().length;
 }
 
+// フローの表示倍率（メモリのみ。CSS zoom はレイアウトごと拡縮するのでスクロール量も自然に追従する）
+let flowZoom = 1;
+function applyFlowZoom(next) {
+  flowZoom = Math.min(1.5, Math.max(0.5, Math.round(next * 10) / 10));
+  $("#flow-canvas").style.zoom = flowZoom;
+  $("#flow-zoom-reset").textContent = Math.round(flowZoom * 100) + "%";
+  requestAnimationFrame(drawFlowLinks); // レイアウトが変わるので接続線を引き直す
+}
+$("#flow-zoom-in").addEventListener("click", () => applyFlowZoom(flowZoom + 0.1));
+$("#flow-zoom-out").addEventListener("click", () => applyFlowZoom(flowZoom - 0.1));
+$("#flow-zoom-reset").addEventListener("click", () => applyFlowZoom(1));
+
 function drawFlowLinks() {
   const svg = $("#flow-links");
   if (displayedView !== "flow" || !flowGraph) { svg.replaceChildren(); return; }
@@ -3328,7 +3351,8 @@ function drawFlowLinks() {
     if (!from?.getClientRects().length || !to?.getClientRects().length) return;
     const a = from.getBoundingClientRect(), b = to.getBoundingClientRect();
     if ((a.bottom < viewport.top || a.top > viewport.bottom) && (b.bottom < viewport.top || b.top > viewport.bottom)) return;
-    const point = (r, port) => ({ x: (port === "left" ? r.left : port === "right" ? r.right : r.left + r.width / 2) - rect.left, y: (port === "top" ? r.top : port === "bottom" ? r.bottom : r.top + r.height / 2) - rect.top });
+    const z = flowZoom || 1; // CSS zoom 中の BCR は倍率込み。SVG はレイアウト座標なので割り戻す
+    const point = (r, port) => ({ x: ((port === "left" ? r.left : port === "right" ? r.right : r.left + r.width / 2) - rect.left) / z, y: ((port === "top" ? r.top : port === "bottom" ? r.bottom : r.top + r.height / 2) - rect.top) / z });
     const start = point(a, fromPort), end = point(b, toPort);
     const curve = document.createElementNS("http://www.w3.org/2000/svg", "path");
     const middle = (start.x + end.x) / 2;
