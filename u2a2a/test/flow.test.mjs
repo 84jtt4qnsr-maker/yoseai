@@ -646,4 +646,119 @@ check('別トピックのフィルタは独立',body.querySelector('#flow-filter
 context.switchTopic(fixture.topicId);check('元トピックのフィルタを復元',body.querySelector('#flow-filter-kind').value===remembered.kind);
 fixture.topics.pop();sourceMessages.forEach((m,i)=>{if(originalMeta[i]===undefined)delete m.meta;else m.meta=originalMeta[i];});
 check('表示操作は永続stateを変更しない',JSON.stringify(fixture)===stateBefore);
+
+// 検索も既存の列DOM代替で検証する。実ブラウザのdialog/CSS検証とは別。
+context.Date = class extends Date { static now() { return now; } };
+const searchNodes = new Map();
+for (const [id, tag] of [['dialog','dialog'],['input','input'],['results','ul'],['count','p'],['more','button'],['close','button'],['form','form']]) {
+  const node = make(tag, { id: 'message-search-' + id }); body.appendChild(node); searchNodes.set(id, node);
+}
+const dialog = searchNodes.get('dialog'), searchInput = searchNodes.get('input'), results = searchNodes.get('results');
+results.contains = node => { for (; node; node = node.parentElement) if (node === results) return true; return false; };
+Object.defineProperty(results, 'lastElementChild', { get: () => results.children.at(-1) });
+const closeJobs = [], closeListeners = [];
+const addDialogListener = dialog.addEventListener.bind(dialog);
+dialog.addEventListener = (type, fn, options) => type === 'close' ? closeListeners.push({ fn, once: options?.once }) : addDialogListener(type, fn);
+dialog.showModal = () => { dialog.open = true; };
+dialog.close = () => {
+  dialog.open = false;
+  // ブラウザの復帰をcloseイベントより前に模擬し、RAF前には列へfocusしないことを確認。
+  run('messageSearchButton').focus();
+  closeJobs.push(() => {
+    for (const listener of [...closeListeners]) { if (listener.once) closeListeners.splice(closeListeners.indexOf(listener), 1); listener.fn(); }
+  });
+};
+const searchTimers = new Map(); let searchTimerId = 0;
+context.setTimeout = fn => { searchTimers.set(++searchTimerId, fn); return searchTimerId; };
+context.clearTimeout = id => searchTimers.delete(id);
+const flushSearchTimers = () => { const jobs = [...searchTimers.values()]; searchTimers.clear(); jobs.forEach(fn => fn()); };
+vm.runInContext(source.slice(source.indexOf('// ---- トピック横断の発言検索'), source.indexOf('// ---- 要約の鮮度')), context);
+const searchTopic = { id: 'search-topic', title: '<script>search</script>', participants: ['claude','codex','grok'] };
+fixture.topics.push(searchTopic);
+for (let i = 0; i < 55; i++) fixture.messages.push({ id: 'search-' + i, topicId: searchTopic.id, thread: 'claude', author: 'claude', text: 'needle <img onerror=evil()> ' + i, ts: i + 1 });
+searchInput.value = 'needle'; context.openMessageSearch();
+check('検索50件・総数表示', results.children.length === 50 && searchNodes.get('count').textContent.includes('55件'));
+check('抜粋一致箇所をtextのmarkで強調', results.querySelector('mark').textContent === 'needle' && !results.querySelector('img') && !results.querySelector('script'));
+const stableRow = results.children[0]; stableRow.querySelector('button').focus();
+context.noteMessageSearchUpdate(); context.render();
+check('SSE通知で結果行・フォーカスを変えない', results.children[0] === stableRow && context.document.activeElement === stableRow.querySelector('button') && searchNodes.get('count').textContent.includes('データ更新あり'));
+searchNodes.get('more').click();
+check('更新通知後のページングは検索スナップショットを維持', results.children.length === 55 && searchNodes.get('count').textContent.includes('データ更新あり'));
+searchInput.focus(); dialog.dispatch('keydown', { key: 'ArrowDown' });
+check('入力から下矢印で結果へ', context.document.activeElement === results.children[0].querySelector('button'));
+dialog.dispatch('keydown', { key: 'ArrowDown' });
+check('下矢印で次の結果へ', context.document.activeElement === results.children[1].querySelector('button'));
+searchInput.dispatch('compositionstart'); searchInput.value = 'missing';
+searchInput.dispatch('input', { isComposing: true }); context.noteMessageSearchUpdate();
+searchNodes.get('form').dispatch('submit');
+check('IME中はSSE・submitでも再検索しない', results.children.length === 55 && searchTimers.size === 0);
+searchInput.dispatch('compositionend');
+check('変換終了後もデバウンス待ち', results.children.length === 55 && searchTimers.size === 1);
+searchInput.value = 'needle'; searchInput.dispatch('input');
+check('連続入力のタイマーを置き換える', searchTimers.size === 1);
+flushSearchTimers();
+check('再検索で更新通知を解消', !searchNodes.get('count').textContent.includes('データ更新あり'));
+context.foldedColumns.set(searchTopic.id, new Set(['claude']));
+const priorId = context.currentTopic().id, priorView = run('displayedView');
+const actualGetElementById = context.document.getElementById;
+context.document.getElementById = id => id === 'messages-claude' ? null : actualGetElementById(id);
+context.openMessageSearchHit(searchTopic.id, 'search-54');
+check('描画失敗は検索を残し元トピック・モードへ戻る', dialog.open && context.currentTopic().id === priorId && run('displayedView') === priorView && !run('viewModes').has(searchTopic.id));
+check('描画失敗で折りたたみと展開状態を復元', context.foldedColumns.get(searchTopic.id).has('claude') && !context.expandedRelays.has('search-54'));
+context.document.getElementById = actualGetElementById;
+context.openMessageSearchHit(searchTopic.id, 'search-54');
+check('検索成功後にcloseしネイティブのフォーカス復帰を待つ', !dialog.open && context.document.activeElement === run('messageSearchButton'));
+context.render(); // close待ちに列ノードが再作成されるケース
+closeJobs.shift()(); flush();
+const searchTarget = messagesBoxes.get('claude').querySelectorAll('.msg').find(node => node.dataset.mid === 'search-54');
+check('close後の最新DOMへフォーカス・スクロール・2秒強調', context.document.activeElement === searchTarget && searchTarget.scrolledIntoView && searchTarget.classList.contains('flow-highlight') && run('flowColumnJump.until') === now + 2000);
+context.openMessageSearch(); context.openMessageSearchHit('missing-topic', 'missing');
+check('消えた結果は検索ダイアログを閉じない', dialog.open);
+context.switchTopic(priorId); context.openMessageSearchHit(searchTopic.id, 'search-54');
+fixture.messages = fixture.messages.filter(m => m.id !== 'search-54');
+context.render(); closeJobs.shift()(); flush();
+check('close待ちに対象が削除された場合も元トピックへ戻して検索を再表示', dialog.open && context.currentTopic().id === priorId);
+});
+
+
+test("発言検索: 旧中継・配送チェーン・分岐境界・孤児を保持する", () => {
+  const html = fs.readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const sandbox = vm.createContext({});
+  for (const name of ["legacyRelaySource", "searchMessageHits", "messageSearchExcerpt"]) {
+    const fn = html.match(new RegExp("^function " + name + "\\([^]*?^}", "m"));
+    assert.ok(fn, name); vm.runInContext(fn[0], sandbox);
+  }
+  const topics = [{ id: "a" }, { id: "b" }];
+  const root = { id: "root", topicId: "a", thread: "claude", author: "claude", text: "needle <script> [.*]", ts: 1 };
+  const copy = (id, messageId, delivery = "qa-relay", extra = {}) => ({ ...root, id, thread: "codex", ts: 2,
+    provenance: { delivery, source: { messageId, agent: "claude" } }, ...extra });
+  const messages = [root, copy("legacy", null), copy("relay", "legacy", "relay"), copy("handoff", "relay", "handoff"),
+    copy("branch", "root", "qa-relay", { topicId: "b", copiedFromMessageId: "legacy" }),
+    copy("orphan", "missing"), copy("cycle-a", "cycle-b"), copy("cycle-b", "cycle-a"),
+    { ...root, id: "independent" }, copy("unknown-agent", null, "qa-relay", { provenance: { delivery: "qa-relay", source: { messageId: null } } }),
+    copy("other-topic", null, "qa-relay", { topicId: "b" }),
+    copy("deleted-topic", "root", "relay", { topicId: "deleted" })];
+  deepFreeze(messages); deepFreeze(topics);
+  const before = JSON.stringify(messages);
+  const hits = sandbox.searchMessageHits(messages, topics, " NEEDLE ");
+  assert.equal(hits.find(hit => hit.message.id === "root").copies, 3);
+  for (const id of ["branch", "independent", "other-topic"]) assert.ok(hits.some(hit => hit.message.id === id), id);
+  assert.equal(hits.find(hit => hit.message.id === "branch").topic.id, "b");
+  assert.equal(hits.find(hit => hit.message.id === "branch").unresolved, false);
+  for (const id of ["orphan", "cycle-a", "cycle-b", "unknown-agent"]) assert.equal(hits.find(hit => hit.message.id === id).unresolved, true, id);
+  assert.equal(hits.some(hit => hit.message.id === "deleted-topic"), false);
+  assert.equal(sandbox.searchMessageHits(messages, topics, "  ").length, 0);
+  assert.equal(sandbox.searchMessageHits(messages, topics, "[.*]").length, hits.length);
+  assert.equal(JSON.stringify(messages), before);
+  const excerpt = sandbox.messageSearchExcerpt("İ prefix NEEDLE suffix", "needle");
+  assert.equal(excerpt.match, "NEEDLE");
+  assert.equal(excerpt.before + excerpt.match + excerpt.after, "İ prefix NEEDLE suffix");
+  assert.equal(sandbox.messageSearchExcerpt("İ", "i").match, "İ");
+  assert.equal(sandbox.legacyRelaySource(copy("future", null, "relay", { ts: 0 }), [root]), null);
+  assert.equal(sandbox.legacyRelaySource(copy("wrong-author", null, "relay", { author: "grok" }), [root]), null);
+  assert.equal(sandbox.legacyRelaySource(copy("wrong-text", null, "relay", { text: "different" }), [root]), null);
+  for (const delivery of ["qa-relay", "relay", "handoff"]) {
+    const branch = copy("branch-" + delivery, "root", delivery, { topicId: "b", copiedFromMessageId: "old" });
+    assert.equal(sandbox.searchMessageHits([root, branch], topics, "needle").length, 2);
+  }
 });

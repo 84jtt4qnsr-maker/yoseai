@@ -782,6 +782,19 @@
     padding: 18px;
     width: min(520px, 92vw);
   }
+  #message-search-dialog { width: min(760px, calc(100vw - 24px)); max-width: calc(100vw - 24px); max-height: calc(100dvh - 24px); box-sizing: border-box; }
+  #message-search-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+  #message-search-form label { flex: 1 1 240px; min-width: 0; }
+  #message-search-count { color: var(--dim); font-size: 12px; margin: 10px 0; }
+  #message-search-results { list-style: none; padding: 3px; margin: 0; max-height: 55vh; overflow: auto; overflow-anchor: none; }
+  #message-search-results li + li { margin-top: 6px; }
+  .message-search-hit { width: 100%; text-align: left; white-space: normal; padding: 10px; }
+  .message-search-meta, .message-search-excerpt { display: block; overflow-wrap: anywhere; }
+  .message-search-meta { color: var(--dim); font-size: 11px; margin-bottom: 5px; }
+  .message-search-excerpt { font-size: 13px; }
+  #message-search-more[hidden] { display: none; }
+  #message-search-more { margin-top: 10px; }
+  #message-search-dialog :focus-visible, #message-search-open:focus-visible { outline: 2px solid var(--codex); outline-offset: -2px; }
   dialog::backdrop { background: #0009; }
   dialog h3 { margin: 0 0 12px; font-size: 15px; }
   dialog .field { margin-bottom: 10px; display: flex; flex-direction: column; gap: 4px; }
@@ -1045,7 +1058,20 @@
 </section>
 </div>
 
-<!-- ヘルス（イベントログ・ストレージ計測）ダイアログ -->
+<!-- 発言検索ダイアログ -->
+<dialog id="message-search-dialog" aria-labelledby="message-search-heading">
+  <h3 id="message-search-heading">発言検索</h3>
+  <form id="message-search-form">
+    <label>全トピックの本文 <input id="message-search-input" type="search" autocomplete="off" placeholder="検索する文字列" aria-describedby="message-search-count" /></label>
+    <button type="submit" class="small">検索</button>
+    <button type="button" id="message-search-close" class="small">閉じる</button>
+  </form>
+  <p id="message-search-count" role="status" aria-live="polite"></p>
+  <ul id="message-search-results" aria-label="検索結果"></ul>
+  <button type="button" id="message-search-more" class="small" hidden>さらに50件表示</button>
+</dialog>
+
+<!-- プロジェクトダイアログ -->
 <dialog id="projects-dialog" aria-labelledby="projects-heading">
   <h3 id="projects-heading">📁 プロジェクト</h3>
   <p class="project-hint">既存のローカルフォルダを参照先として登録します。トピックの対象は実行前に選択できます。</p>
@@ -1077,6 +1103,7 @@
   </form>
 </dialog>
 
+<!-- ヘルス（イベントログ・ストレージ計測）ダイアログ -->
 <dialog id="health-dialog">
   <h3>🩺 運用イベント</h3>
   <div class="field"><label id="health-storage"></label></div>
@@ -1294,6 +1321,7 @@ function renderTopicBar() {
     title: "Shift＋クリックで参加者・プロジェクトを選択",
     onclick: (event) => openProjectChoice("new", undefined, null, event.shiftKey),
   }));
+  bar.appendChild(messageSearchButton);
   renderViewControls();
   refreshSummaryControls();
 }
@@ -1388,9 +1416,7 @@ function updateRelayLinks() {
     let srcMsg = pvm.source.messageId ? state.messages.find((o) => o.id === pvm.source.messageId) : null;
     if (!srcMsg) {
       // ID なしの旧中継用フォールバック: 同一トピック・送信元スレッド・同著者・同文の直前メッセージ
-      srcMsg = state.messages.find(
-        (o) => o.topicId === t.id && o.thread === pvm.source.agent && o.author === m.author && o.text === m.text && o.ts <= m.ts
-      );
+      srcMsg = legacyRelaySource(m, state.messages);
     }
     const src = srcMsg && document.querySelector('main > .thread-col .msg[data-mid="' + srcMsg.id + '"]');
     if (!src || src.closest(".is-folded") || tgt.closest(".is-folded")) continue;
@@ -1423,6 +1449,166 @@ function updateRelayLinks() {
 }
 
 window.addEventListener("resize", scheduleLinks);
+
+// ---- トピック横断の発言検索（本文の文字列検索） ----
+// updateRelayLinks と同じ旧中継の条件。独立した同文発言同士は統合しない。
+function legacyRelaySource(message, messages) {
+  const agent = message.provenance?.source?.agent;
+  if (!agent) return null;
+  return messages.find((other) => other.id !== message.id && other.topicId === message.topicId &&
+    other.thread === agent && other.author === message.author && other.text === message.text && other.ts <= message.ts) || null;
+}
+
+function searchMessageHits(messages, topics, query) {
+  const needle = String(query || "").trim().toLowerCase();
+  if (!needle) return [];
+  const topicMap = new Map(topics.map((topic) => [topic.id, topic]));
+  const byId = new Map(messages.map((message) => [message.id, message]));
+  const resolved = new Map();
+  const isDelivery = (message) => ["qa-relay", "relay", "handoff"].includes(message.provenance?.delivery);
+  const originalFor = (message) => {
+    const path = [], seen = new Set();
+    let current = message;
+    // 分岐コピーは配送の provenance も継承する。分岐先の履歴を境界として保持する。
+    while (!current.copiedFromMessageId && isDelivery(current)) {
+      if (resolved.has(current.id)) {
+        const known = resolved.get(current.id);
+        for (const item of path) resolved.set(item.id, known);
+        return known;
+      }
+      if (seen.has(current.id)) { for (const item of path) resolved.set(item.id, null); return null; }
+      seen.add(current.id); path.push(current);
+      const sourceId = current.provenance?.source?.messageId;
+      // 明示IDが壊れている場合は推測しない。IDなしの旧中継だけを補完する。
+      const parent = sourceId ? byId.get(sourceId) : legacyRelaySource(current, messages);
+      if (!parent || !topicMap.has(parent.topicId)) {
+        for (const item of path) resolved.set(item.id, null);
+        return null;
+      }
+      current = parent;
+    }
+    for (const item of path) resolved.set(item.id, current);
+    return current;
+  };
+  const groups = new Map();
+  for (const message of messages) {
+    if (!topicMap.has(message.topicId)) continue;
+    const original = originalFor(message);
+    const target = original || message; // 孤児・循環参照でも検索結果を失わない。
+    let group = groups.get(target.id);
+    if (!group) { group = { message: target, topic: topicMap.get(target.topicId), copies: 0, unresolved: !original }; groups.set(target.id, group); }
+    if (message.id !== target.id) group.copies++;
+  }
+  return [...groups.values()].filter((group) => String(group.message.text || "").toLowerCase().includes(needle))
+    .sort((a, b) => (Number(b.message.ts) || 0) - (Number(a.message.ts) || 0) || String(a.message.id).localeCompare(String(b.message.id)));
+}
+
+function messageSearchExcerpt(text, query) {
+  const value = String(text || ""), needle = String(query || "").trim().toLowerCase();
+  const index = needle ? value.toLowerCase().indexOf(needle) : -1;
+  let first = 0, last = 0, offset = 0, folded = 0;
+  // İ のように小文字化で長さが変わる文字も、元本文の境界に戻して切り出す。
+  if (index >= 0) for (const char of value) {
+    const next = folded + char.toLowerCase().length;
+    if (folded <= index && index < next) first = offset;
+    offset += char.length;
+    if (next >= index + needle.length) { last = offset; break; }
+    folded = next;
+  }
+  const start = Math.max(0, first - 60), end = Math.min(value.length, Math.max(start + 220, Math.min(last, first + 220)));
+  const clean = (part) => part.replace(/\s+/g, " ");
+  return {
+    before: (start ? "…" : "") + clean(value.slice(start, first)),
+    match: clean(value.slice(first, Math.min(last, end))),
+    after: clean(value.slice(Math.min(last, end), end)) + (end < value.length ? "…" : ""),
+  };
+}
+
+let messageSearchLimit = 50;
+let messageSearchQuery = "";
+let messageSearchHits = [];
+let messageSearchTimer = 0;
+let messageSearchComposing = false;
+let messageSearchDirty = false;
+const messageSearchButton = el("button", { type: "button", id: "message-search-open", class: "small", text: "発言検索", "aria-haspopup": "dialog", onclick: openMessageSearch });
+
+function openMessageSearch() {
+  const dialog = $("#message-search-dialog");
+  if (!dialog.open) dialog.showModal();
+  renderMessageSearch();
+  $("#message-search-input").focus();
+}
+
+function openMessageSearchHit(topicId, messageId) {
+  const dialog = $("#message-search-dialog");
+  // DOMへの描画成功までは検索を閉じない。失敗時は元トピック・表示状態へ戻る。
+  const focusTarget = openFlowMessageInColumn(messageId, topicId, true);
+  if (!focusTarget) return;
+  dialog.addEventListener("close", () => requestAnimationFrame(() => {
+    if (dialog.open) return;
+    if (!focusTarget()) openMessageSearch();
+  }), { once: true });
+  dialog.close(); // ネイティブのフォーカス復帰とcloseイベントを経てから列へフォーカスする。
+}
+
+function noteMessageSearchUpdate() {
+  if (!$("#message-search-dialog").open || messageSearchDirty) return;
+  messageSearchDirty = true;
+  $("#message-search-count").textContent += " · データ更新あり。検索で更新できます。";
+}
+
+function renderMessageSearch(refresh = true) {
+  if (!$("#message-search-dialog").open || messageSearchComposing) return;
+  const list = $("#message-search-results"), top = list.scrollTop;
+  if (refresh) {
+    clearTimeout(messageSearchTimer);
+    const query = $("#message-search-input").value.trim();
+    if (query !== messageSearchQuery) { messageSearchLimit = 50; list.scrollTop = 0; }
+    messageSearchQuery = query;
+    messageSearchHits = searchMessageHits(state.messages || [], state.topics || [], query);
+    messageSearchDirty = false;
+  }
+  const hits = messageSearchHits, visible = hits.slice(0, messageSearchLimit);
+  const label = !messageSearchQuery ? "本文に含まれる文字列を入力してください。" : !hits.length ? "一致する発言はありません。" : hits.length + "件（" + visible.length + "件表示・新しい順）";
+  $("#message-search-count").textContent = label + (messageSearchDirty ? " · データ更新あり。検索で更新できます。" : "");
+  if (list.contains(document.activeElement)) $("#message-search-input").focus();
+  list.replaceChildren(...visible.map((hit) => {
+    const { message, topic } = hit;
+    const when = typeof message.ts === "number" && Number.isFinite(message.ts) && message.ts > 0 ? new Date(message.ts).toLocaleString("ja-JP") : "時刻不明";
+    const meta = (topic.title || "無題のトピック") + " · " + (NAMES[message.author] || message.author || "著者不明") + " · " + when +
+      (hit.copies ? " · 配送コピー " + hit.copies + "件を統合" : "") + (hit.unresolved ? " · 元発言の参照なし" : "");
+    const excerpt = messageSearchExcerpt(message.text, messageSearchQuery);
+    return el("li", { "data-message-id": message.id }, [el("button", { type: "button", class: "message-search-hit", onclick: () => openMessageSearchHit(topic.id, message.id) }, [
+      el("span", { class: "message-search-meta", text: meta }),
+      el("span", { class: "message-search-excerpt" }, [el("span", { text: excerpt.before }), el("mark", { text: excerpt.match }), el("span", { text: excerpt.after })]),
+    ])]);
+  }));
+  if (!refresh) list.scrollTop = top;
+  const more = $("#message-search-more");
+  more.hidden = visible.length >= hits.length;
+  if (more.hidden && document.activeElement === more) list.lastElementChild?.querySelector("button")?.focus();
+}
+
+function scheduleMessageSearch() {
+  clearTimeout(messageSearchTimer);
+  if (!messageSearchComposing) messageSearchTimer = setTimeout(() => renderMessageSearch(), 150);
+}
+
+$("#message-search-form").addEventListener("submit", (event) => { event.preventDefault(); if (!messageSearchComposing) renderMessageSearch(); });
+$("#message-search-input").addEventListener("input", (event) => { if (!event.isComposing) scheduleMessageSearch(); });
+$("#message-search-input").addEventListener("compositionstart", () => { messageSearchComposing = true; clearTimeout(messageSearchTimer); });
+$("#message-search-input").addEventListener("compositionend", () => { messageSearchComposing = false; scheduleMessageSearch(); });
+$("#message-search-dialog").addEventListener("close", () => { clearTimeout(messageSearchTimer); messageSearchComposing = false; });
+$("#message-search-close").addEventListener("click", () => $("#message-search-dialog").close());
+$("#message-search-more").addEventListener("click", () => { messageSearchLimit += 50; renderMessageSearch(false); });
+$("#message-search-dialog").addEventListener("keydown", (event) => {
+  if (event.isComposing || messageSearchComposing || !["ArrowDown", "ArrowUp"].includes(event.key)) return;
+  const buttons = [...$("#message-search-results").querySelectorAll("button")];
+  const index = buttons.indexOf(document.activeElement);
+  if (index < 0 && document.activeElement !== $("#message-search-input")) return;
+  const next = index < 0 ? 0 : Math.max(0, Math.min(buttons.length - 1, index + (event.key === "ArrowDown" ? 1 : -1)));
+  if (buttons[next]) { event.preventDefault(); buttons[next].focus(); }
+});
 
 // ---- 要約の鮮度と手動更新 ----
 const summaryRequests = new Set();
@@ -2736,26 +2922,56 @@ $("#flow-filter-reset").addEventListener("click", () => {
 
 let flowColumnJump = null;
 
-function openFlowMessageInColumn(messageId) {
-  const message = (state.messages || []).find((m) => m.id === messageId && m.topicId === currentTopic()?.id);
-  if (!message) return toast("元の発言が見つかりません");
-  if (!participantsOf().includes(message.thread) || !agentIds().includes(message.thread)) return toast("この発言の列は現在の参加者にありません");
-  foldedColumns.get(message.topicId)?.delete(message.thread);
-  setViewMode("columns"); // 再描画と保存位置の復元が完了してから、対象の発言へ移動する。
-  const box = document.getElementById("messages-" + message.thread);
-  const target = [...(box?.querySelectorAll(".msg") || [])].find((node) => node.dataset.mid === message.id);
-  if (!target) return toast("元の発言を列に表示できませんでした");
-  target.scrollIntoView({ block: "center" });
-  target.setAttribute("tabindex", "-1");
-  target.focus({ preventScroll: true });
-  const jump = flowColumnJump = { topicId: message.topicId, messageId: message.id, until: Date.now() + 2000 };
-  target.classList.add("flow-highlight");
-  setTimeout(() => {
-    if (flowColumnJump !== jump) return;
-    flowColumnJump = null;
-    for (const node of document.querySelectorAll("main > .thread-col .msg.flow-highlight")) node.classList.remove("flow-highlight");
-  }, 2000);
+function openFlowMessageInColumn(messageId, topicId = currentTopic()?.id, deferFocus = false) {
+  const message = (state.messages || []).find((m) => m.id === messageId && m.topicId === topicId);
+  const topic = (state.topics || []).find((t) => t.id === topicId);
+  if (!message) { toast("元の発言が見つかりません"); return false; }
+  if (!topic) { toast("対象トピックが見つかりません"); return false; }
+  if (!participantsOf(topic).includes(message.thread) || !agentIds().includes(message.thread)) {
+    toast("この発言の列は現在の参加者にありません"); return false;
+  }
+  const previousTopicId = currentTopic()?.id, previousMode = viewModes.get(topic.id);
+  const wasFolded = foldedColumns.get(topic.id)?.has(message.thread), wasExpanded = expandedRelays.has(message.id);
   saveDisplayedPosition();
+  foldedColumns.get(topic.id)?.delete(message.thread);
+  if (isRelayCopy(message)) expandedRelays.add(message.id);
+  if (topic.id !== previousTopicId) {
+    viewModes.set(topic.id, "columns");
+    switchTopic(topic.id);
+  } else setViewMode("columns");
+  const findTarget = () => {
+    const box = document.getElementById("messages-" + message.thread);
+    return [...(box?.querySelectorAll(".msg") || [])].find((node) => node.dataset.mid === message.id);
+  };
+  const failed = () => {
+    if (previousMode === undefined) viewModes.delete(topic.id); else viewModes.set(topic.id, previousMode);
+    if (wasFolded) foldedColumns.get(topic.id)?.add(message.thread);
+    if (!wasExpanded) expandedRelays.delete(message.id);
+    switchTopic(previousTopicId);
+    if (displayedView === "columns") restoreColumnPosition(previousTopicId);
+    toast("元の発言を列に表示できませんでした");
+    return false;
+  };
+  if (!findTarget()) return failed();
+  const focusTarget = () => {
+    // dialog close 待ちの間にSSEでDOMが再生成されても、現在のノードを使う。
+    if (currentTopic()?.id !== topic.id) return false;
+    const target = findTarget();
+    if (!target) return failed();
+    target.scrollIntoView({ block: "center" });
+    target.setAttribute("tabindex", "-1");
+    target.focus({ preventScroll: true });
+    const jump = flowColumnJump = { topicId: message.topicId, messageId: message.id, until: Date.now() + 2000 };
+    target.classList.add("flow-highlight");
+    setTimeout(() => {
+      if (flowColumnJump !== jump) return;
+      flowColumnJump = null;
+      for (const node of document.querySelectorAll("main > .thread-col .msg.flow-highlight")) node.classList.remove("flow-highlight");
+    }, 2000);
+    saveDisplayedPosition();
+    return true;
+  };
+  return deferFocus ? focusTarget : focusTarget();
 }
 
 // 合計ではなく元応答ごとの既存表記を再利用。配送コピーの費用を重複表示しない。
@@ -4787,6 +5003,7 @@ function wireAgent(agent) {
 const es = new EventSource("/api/events");
 es.onmessage = (e) => {
   state = JSON.parse(e.data);
+  noteMessageSearchUpdate();
   render();
 };
 render();
