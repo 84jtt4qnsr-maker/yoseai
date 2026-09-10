@@ -349,7 +349,74 @@ export const AGENT_DEFS = {
   grok: { name: "Grok", cssVar: "--grok", color: "#b99aff" },
 };
 export const LEGACY_AGENTS = ["claude", "codex"]; // 旧トピックの参加者・thread:"both" の意味
-export const RELAY_STOP_REASONS = ["agreed", "hops", "budget", "error", "cancelled", "auto-off", "unauthed", "manual"];
+// null は「理由が記録されていない」= 不明。移行で復元した過去リレーは基本これになる（偽の確実さを作らない）
+export const RELAY_STOP_REASONS = ["agreed", "hops", "budget", "error", "cancelled", "auto-off", "unauthed", "manual", "restart"];
+
+// ---- 質疑リレーの履歴（仕様: SPEC-relayHistory.md）----
+// 確定記録 1 件の形。不明な項目は null のままにする（"" や既定値で埋めない）
+export function relayRecord(relay, extra = {}) {
+  const r = relay || {};
+  return {
+    id: r.id || null,
+    participants: Array.isArray(r.participants) ? r.participants.slice() : [],
+    spoken: r.spoken && typeof r.spoken === "object" ? { ...r.spoken } : {},
+    hops: Number(r.seq) || 0,
+    stopReason: r.stopReason || null,
+    agenda: typeof r.agenda === "string" ? r.agenda : null,
+    startMessageId: r.startMessageId || null,
+    startedTs: r.startedTs || null,
+    endedTs: null,
+    reconstructed: false,
+    ...extra,
+  };
+}
+
+// 配送コピーの provenance だけから過去リレーを復元する。
+// 分かるのは参加者の並び（source.turn が participants の添字）・手番数・時刻の範囲だけ。
+// 停止理由・議題・開始メッセージは復元できないので null のまま返す
+export function reconstructRelays(msgs) {
+  const byId = new Map();
+  for (const m of sortByTsId(msgs)) {
+    const pv = (m && m.provenance) || {};
+    const s = pv.delivery === "qa-relay" ? pv.source : null;
+    if (!s || s.relayId == null) continue;
+    let r = byId.get(s.relayId);
+    if (!r) {
+      r = { id: s.relayId, seqs: new Set(), turns: new Map(), spoken: {}, startedTs: m.ts || null, endedTs: m.ts || null };
+      byId.set(s.relayId, r);
+    }
+    r.endedTs = m.ts || r.endedTs;
+    if (r.startedTs == null || (m.ts != null && m.ts < r.startedTs)) r.startedTs = m.ts;
+    const key = s.seq != null ? "s:" + s.seq : "m:" + (s.messageId || m.id);
+    if (r.seqs.has(key)) continue; // 同じ手番の配送コピーは 1 件として数える
+    r.seqs.add(key);
+    const agent = s.agent || m.author;
+    if (agent) {
+      r.spoken[agent] = (r.spoken[agent] || 0) + 1;
+      if (Number.isInteger(s.turn) && s.turn >= 0) r.turns.set(s.turn, agent); // 手番の添字から参加者の並びを戻す
+    }
+  }
+  return [...byId.values()]
+    .map((r) => ({
+      id: r.id,
+      participants: [...r.turns.keys()].sort((a, b) => a - b).map((k) => r.turns.get(k)),
+      spoken: r.spoken,
+      hops: r.seqs.size,
+      stopReason: null, // 復元できない。不明のまま
+      agenda: null,
+      startMessageId: null,
+      startedTs: r.startedTs,
+      endedTs: r.endedTs,
+      reconstructed: true,
+    }))
+    .sort((a, b) => (a.startedTs || 0) - (b.startedTs || 0) || String(a.id).localeCompare(String(b.id)));
+}
+
+// 履歴から 1 本引く（フロービューが過去リレーの結末を出すための参照）
+export function findRelayRecord(topic, relayId) {
+  if (!topic || relayId == null) return null;
+  return (topic.relayHistory || []).find((h) => h && h.id === relayId) || null;
+}
 
 // 参加者のうち自分以外
 export function peersOf(participants, agent) {

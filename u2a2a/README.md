@@ -272,6 +272,25 @@ xAI Grok（Grok Build CLI）を加え、**トピックごとに参加者を選�
 - `u2a2a/data/state.json` に自動保存（git 管理外）。
 - 複数ウィンドウで開いても SSE でライブ同期。
 
+## 質疑リレーの履歴（仕様: SPEC-relayHistory.md）
+
+`topic.relay` は現在の 1 本しか持たないため、次の質疑が始まると前のリレーの結末が消える。
+`topic.relayHistory[]` に確定記録を残す。`stopRelay()` の全経路（合意・手数切れ・予算・エラー・中断・手動など）で追記される。
+
+```jsonc
+{ "id": "r_…", "participants": ["grok", "claude", "codex"], "spoken": { "grok": 2 }, "hops": 5,
+  "stopReason": "agreed" | "hops" | … | "restart" | null,
+  "agenda": "…" | null, "startMessageId": "…" | null,
+  "startedTs": 0, "endedTs": 0, "reconstructed": false }
+```
+
+- **`null` は「記録が無い」= 不明**。`""` は「値が無い」。この 2 つを混ぜない
+- 既存データは配送コピーの `provenance.source` から復元する（schemaVersion 9）。
+  復元できるのは参加者の並び・手番数・時刻まで。**停止理由は推測せず `null` のまま**にする（`reconstructed: true`）
+- `active` のまま保存された state を読み込んだら `restart` で確定する。再起動で打ち切られたことは事実なので記録する。
+  表示は黄（打ち切り）で、青（処理完了）にはしない
+- フロービューの `relay` ノードは、進行中でなければこの履歴から `stopReason` / `agenda` / `startMessageId` を引く
+
 ## フロービュー（グラフ導出）
 
 スレッド 3 列の代わりに「最初と最後が見えて、途中は束」の進行を見せる表示（仕様: `pool/topics/9a299f1bac1a09fb/SPEC-フロービュー.md`）。

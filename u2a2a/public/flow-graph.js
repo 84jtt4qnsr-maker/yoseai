@@ -14,6 +14,7 @@ export const RELAY_STOP_STATUS = Object.freeze({
   hops: "wait",
   manual: "wait",
   "auto-off": "wait",
+  restart: "wait", // 再起動での打ち切り。合意で閉じたわけではないので青（完了）にしない
   error: "err",
   budget: "err",
   unauthed: "err",
@@ -221,6 +222,9 @@ export function buildFlowGraph(input, options = {}) {
   const topic = topics.find((t) => t && t.id === topicId) || null;
   if (!topic) warnings.push("topics に " + topicId + " がありません（relay・分岐は無しとして続行）");
   const relayState = (topic && topic.relay) || null;
+  // 過去リレーの結末は topic.relayHistory から引く（topic.relay は現在の 1 本しか持たない）。
+  // 履歴に無い、または stopReason が null のリレーは「終了理由不明」の中立表示のまま（仕様: SPEC-relayHistory.md）
+  const relayHistory = new Map(((topic && topic.relayHistory) || []).filter((h) => h && h.id).map((h) => [h.id, h]));
 
   const msgs = allMessages.filter((m) => m && typeof m === "object" && m.topicId === topicId && m.id != null).slice().sort(cmpTs);
   if (allMessages.some((m) => !m || typeof m !== "object" || m.id == null)) warnings.push("id の無いメッセージを読み飛ばしました");
@@ -267,16 +271,28 @@ export function buildFlowGraph(input, options = {}) {
       return { seq: h.seq, turn: h.turn, agent: h.agent, messageId: h.messageId, ts: m ? tsOf(m) : h.copyTs };
     });
     const current = relayState && relayState.id === r.relayId;
+    const rec = relayHistory.get(r.relayId) || null;
+    // 参加者は「現在のリレー → 確定記録 → 配送コピーからの復元」の順に確からしい方を採る
+    const participants =
+      current && Array.isArray(relayState.participants) && relayState.participants.length
+        ? relayState.participants.slice()
+        : rec && Array.isArray(rec.participants) && rec.participants.length
+          ? rec.participants.slice()
+          : r.participants;
     const n = {
       kind: "relay",
       key: "relay:" + r.relayId,
       relayId: r.relayId,
       ts: Math.min(...hops.map((h) => h.ts)),
-      participants: current && Array.isArray(relayState.participants) && relayState.participants.length ? relayState.participants.slice() : r.participants,
+      participants,
       hops,
       active: !!(current && relayState.active),
-      stopReason: current ? relayState.stopReason || null : null,
-      startMessageId: current ? relayState.startMessageId || null : null,
+      stopReason: current ? relayState.stopReason || null : rec ? rec.stopReason || null : null,
+      startMessageId: current ? relayState.startMessageId || null : rec ? rec.startMessageId || null : null,
+      agenda: current ? relayState.agenda || null : rec ? rec.agenda || null : null,
+      endedTs: rec ? rec.endedTs || null : null,
+      // 記録が復元由来（停止理由が分からない）ことを UI に伝える。true のとき stopReason は必ず null
+      reconstructed: !!(rec && rec.reconstructed),
       copyIds: r.copyIds,
     };
     n.status = nodeStatus(n, ctx);

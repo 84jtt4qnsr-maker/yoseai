@@ -674,6 +674,9 @@
         "active": false,
         "stopReason": "agreed",
         "startMessageId": "q1",
+        "agenda": null,
+        "endedTs": null,
+        "reconstructed": false,
         "status": "ok"
       },
       {

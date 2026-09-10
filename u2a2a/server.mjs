@@ -48,6 +48,8 @@ import {
   GROK_STOP_NOTE,
   isGrokUnauthedError,
   summaryFreshness,
+  relayRecord,
+  reconstructRelays,
   sortByTsId,
 } from "./lib.mjs";
 
@@ -102,12 +104,26 @@ function defaultRelay() {
   return { active: false, remaining: 0, hopsDone: 0, id: null, participants: [], turn: 0, seq: 0, spoken: {}, stopReason: null };
 }
 
-// リレーを止めて理由を残す（合意成立 agreed と打ち切りを区別する）
+// リレーを止めて理由を残す（合意成立 agreed と打ち切りを区別する）。
+// 確定した 1 本は relayHistory へ追記する。topic.relay は次の質疑で上書きされるため、
+// ここで残さないと過去リレーの結末は永久に復元できない（仕様: SPEC-relayHistory.md）
 function stopRelay(topic, reason) {
   const r = topic.relay;
   if (!r.active) return;
   r.active = false;
   r.stopReason = reason;
+  appendRelayHistory(topic, r, reason);
+}
+
+// 同じ id を二重に積まない。既にあれば確定した結末で上書きする（移行で復元した不明分を上書きする経路）
+function appendRelayHistory(topic, relay, reason, endedTs = Date.now()) {
+  if (!relay || !relay.id) return null;
+  topic.relayHistory = topic.relayHistory || [];
+  const rec = relayRecord(relay, { stopReason: reason || null, endedTs, reconstructed: false });
+  const i = topic.relayHistory.findIndex((h) => h && h.id === relay.id);
+  if (i >= 0) topic.relayHistory[i] = { ...topic.relayHistory[i], ...rec };
+  else topic.relayHistory.push(rec);
+  return rec;
 }
 
 // トピックの参加者のうち自分以外（OTHER の置き換え）
@@ -142,6 +158,7 @@ function defaultTopic(title, participants = LEGACY_AGENTS) {
     projectId: null, // 対象プロジェクト（null = 未紐付け = Kometa リポジトリ）
     projectLocked: false, // 初回実行で立つ。以後は対象を変更できない（仕様: 実行後の変更は新規トピック）
     summaryState: defaultSummaryState(),
+    relayHistory: [], // 終わった質疑リレーの確定記録（仕様: SPEC-relayHistory.md）
   };
 }
 
@@ -233,6 +250,26 @@ function loadState() {
         };
       }
       for (const t of parsed.topics) {
+        t.relayHistory = Array.isArray(t.relayHistory) ? t.relayHistory : [];
+        // 保存時に走っていた・終わっていたリレーを、解除する前に確定記録として拾う。
+        // active のまま保存されたものは「再起動で打ち切られた」が事実なので restart。既に止まっていれば理由をそのまま残す
+        if (t.relay && t.relay.id && !t.relayHistory.some((h) => h && h.id === t.relay.id)) {
+          t.relayHistory.push({
+            ...relayRecord(t.relay, {
+              stopReason: t.relay.active ? "restart" : t.relay.stopReason || null,
+              endedTs: t.relay.active ? Date.now() : null,
+              reconstructed: false,
+            }),
+          });
+        }
+        // schemaVersion 9: 配送コピーの provenance から過去リレーを復元する。
+        // 分かるのは参加者の並び・手番数・時刻だけ。停止理由・議題・開始メッセージは不明のまま null にする
+        if (!parsed.schemaVersion || parsed.schemaVersion < 9) {
+          const known = new Set(t.relayHistory.map((h) => h && h.id));
+          const msgs = parsed.messages.filter((m) => m.topicId === t.id);
+          for (const rec of reconstructRelays(msgs)) if (!known.has(rec.id)) t.relayHistory.push(rec);
+        }
+        t.relayHistory.sort((a, b) => (a.startedTs || 0) - (b.startedTs || 0) || String(a.id).localeCompare(String(b.id)));
         t.relay = defaultRelay(); // 再起動後にリレーが勝手に再開しないよう常に解除
         // schemaVersion 7: 参加者。旧トピックは claude / codex の 2 名（grok のセッション・未読は作らない）
         if (!Array.isArray(t.participants) || !t.participants.length) t.participants = LEGACY_AGENTS.slice();
@@ -355,7 +392,7 @@ function persistState() {
   const t0 = Date.now();
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    state.schemaVersion = 8;
+    state.schemaVersion = 9;
     const jsonStr = JSON.stringify(state, null, 2);
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, jsonStr);
@@ -3463,6 +3500,7 @@ async function handleApi(req, res, url) {
       startMessageId: null,
       agenda: typeof body.agenda === "string" ? body.agenda.trim().slice(0, 120) : "",
       id: "r_" + id(),
+      startedTs: Date.now(),
       participants: order,
       turn: 0,
       seq: 0,
@@ -3643,6 +3681,6 @@ saveState();
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`U2A2A Orchestration: http://127.0.0.1:${PORT}`);
-  logEvent("system", "サーバー起動（schemaVersion 8）", "info");
+  logEvent("system", "サーバー起動（schemaVersion 9）", "info");
   if (state.agents.grok) checkGrokAuth().catch((e) => logEvent("cli", "Grok の認証確認に失敗: " + (e.message || e), "warn"));
 });
