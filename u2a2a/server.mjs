@@ -1138,7 +1138,7 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo 
   const artifactNote =
     rootCwd
       ? `\n\n（成果物ファイルの保存先は ${saveDir}/ です（書き込みは u2a2a/pool/ 配下のみ許可）。` +
-        `中間生成物は ${saveDir}/.work/ へ。画像・音声・動画は python3 / ffmpeg で生成できます。` +
+        `中間生成物は ${saveDir}/.work/ へ。画像・音声・動画は python3 / ffmpeg による描画・変換で作れます（拡散モデル等の「画像生成」ツールはこの環境に無いので、生成が必要なら得意な参加者（Codex / Grok）への引き継ぎを提案してください）。` +
         `保存したら本文にそのパスを書いてください — アプリがインライン表示します）`
       : `\n\n（カレントディレクトリ＝ ${saveDir}/ が成果物の保存先です（書き込みはここのみ）。` +
         `中間生成物は .work/ へ。python3 / ffmpeg で画像・音声・動画を生成できます。` +
@@ -1159,7 +1159,7 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo 
   // Grok は権限拒否で応答全体が停止するため、拒否されるシェルを最初から使わないよう明示する（工程0の実測: 複合シェル偵察で停止）
   const grokShellNote =
     agent === "grok"
-      ? `\n\n（Grok への注意: シェル（run_terminal_command）で許可されているのは python3 / ffmpeg だけです。git・ls・cat などそれ以外のシェルコマンドは権限拒否となり、応答全体がその場で停止します。ファイル・差分・状況の確認は read_file / list_dir / grep ツールで行ってください）`
+      ? `\n\n（Grok への注意: シェルで許可されているのは python3 / ffmpeg だけで、しかも必ず 1 行で書いてください（複数行コマンドや mkdir・sips 等は権限拒否となり、応答全体がその場で停止します）。確認は read_file / list_dir / grep ツールで。画像・動画は image_gen / image_edit / image_to_video が使えます — 生成物は python3 の 1 行（例: from PIL import Image; …）で保存先へコピー・変換してください）`
       : "";
   return preamble + contextNote + digestNote + qaJoinNote + backlogNote + lines + qaNote + changesNote + artifactNote + grokShellNote + commonRulesBlock("通常応答");
 }
@@ -1411,7 +1411,9 @@ async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
 // Grok はシェルを与えない（実測: 冒頭に git status && ls 等の複合コマンドで状況把握する流儀のため、
 // Bash(python3:*) のような個別 allow では複合コマンドが拒否され、その場で cancelled 停止してしまう。
 // run_terminal_command ごと外せば read_file / list_dir / grep で探索して完走する。メディア生成は当面 claude/codex 担当）
-const GROK_WRITE_ARGS = ["--allow", "Edit(u2a2a/pool/**)", "--disallowed-tools", "spawn_subagent,run_terminal_command"];
+// 画像・動画は Grok 内蔵の生成スイートを許可（実測: 生成物は ~/.grok/sessions/ 配下に落ちる）。
+// シェルは python3 / ffmpeg の 1 行のみ（複数行・他コマンドは拒否 → プロンプト注意で誘導）。保存は python3 の 1 行コピーで pool へ
+const GROK_WRITE_ARGS = ["--allow", "Edit(u2a2a/pool/**)", "--allow", "Bash(python3:*)", "--allow", "Bash(ffmpeg:*)", "--allow", "image_gen", "--allow", "image_edit", "--allow", "image_to_video", "--allow", "reference_to_video", "--disallowed-tools", "spawn_subagent"];
 // レビューは読み取りツールの正のホワイトリストで絞る。Grok は権限拒否で実行全体が停止するため、
 // read-only サンドボックス下で拒否され得る書き込み系ツール（search_replace 等）を持たせない
 // （web 検索 search_tool は --tools の対象外で残る。実測: whitelist 下でも呼べて完走する）
@@ -2182,7 +2184,7 @@ function buildFixPrompt(item, agent, pc = null, offline = false) {
     (reviews || "（レビューはまだありません。成果物の品質を自己点検して改善してください）") +
     offlineNote +
     (agent === "grok"
-      ? `\n（Grok への注意: シェルで許可されているのは python3 / ffmpeg だけです。git 等それ以外は権限拒否となり修正全体が停止します。確認は read_file / list_dir / grep ツールで）`
+      ? `\n（Grok への注意: シェルは python3 / ffmpeg のみ・必ず 1 行で（複数行や git 等は権限拒否で修正全体が停止）。確認は read_file / list_dir / grep ツールで）`
       : "") +
     commonRulesBlock("修正")
   );

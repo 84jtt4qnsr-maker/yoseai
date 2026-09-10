@@ -515,7 +515,7 @@ const zone=make('section',{id:'flow-zone',hidden:''}),canvas=make('div',{id:'flo
 for(const id of ['flow-links','flow-empty','flow-warnings','flow-episodes'])canvas.appendChild(make(id==='flow-links'?'svg':'div',{id}));
 body.querySelector('#flow-warnings').appendChild(make('summary'));body.querySelector('#flow-warnings').appendChild(make('div',{class:'flow-text'}));
 main.appendChild(make('button',{id:'flow-new',hidden:''}));
-for(const id of ['flow-filter-agent','flow-filter-kind','flow-filter-status','flow-filter-reset','flow-filter-count'])zone.appendChild(make(id.includes('reset')?'button':id.includes('count')?'span':'select',{id}));
+for(const id of ['flow-filter-agent','flow-filter-kind','flow-filter-status','flow-filter-reset','flow-filter-count','flow-zoom-in','flow-zoom-out','flow-zoom-reset'])zone.appendChild(make(id.includes('reset')||id.includes('zoom')?'button':id.includes('count')?'span':'select',{id}));
 for(const id of ['topic-bar','pool-dialog','pool-search'])body.appendChild(make('div',{id}));
 const messagesBoxes=new Map();
 for(const agent of ['claude','codex','grok']){const col=make('section',{class:'thread-col','data-agent':agent});const box=make('div',{class:'messages',id:'messages-'+agent});col.appendChild(box);col.appendChild(make('span',{id:'count-'+agent}));main.appendChild(col);messagesBoxes.set(agent,box);}

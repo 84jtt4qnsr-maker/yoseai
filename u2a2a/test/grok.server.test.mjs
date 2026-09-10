@@ -267,9 +267,11 @@ test("Grok 応答: prompt-file・allow 規則・spawn_subagent 除外・参加�
   assert.ok(call.argv.includes("--prompt-file"));
   assert.ok(call.argv.includes("streaming-json"));
   assert.ok(call.argv.includes("Edit(u2a2a/pool/**)"));
-  assert.ok(!call.argv.some((x) => String(x).startsWith("Bash(")), "Grok にはシェル系 allow を渡さない");
+  // 方針変更（2026-09-10 実測）: 1 行の python3 / ffmpeg と内蔵生成スイートを許可し、プロンプト注意で誘導する
+  assert.ok(call.argv.includes("Bash(python3:*)") && call.argv.includes("Bash(ffmpeg:*)"), "1 行シェルの allow");
+  assert.ok(call.argv.includes("image_gen") && call.argv.includes("image_to_video"), "生成スイートの allow");
   const di = call.argv.indexOf("--disallowed-tools");
-  assert.ok(di >= 0 && call.argv[di + 1] === "spawn_subagent,run_terminal_command", "サブエージェントとシェルを除外");
+  assert.ok(di >= 0 && call.argv[di + 1] === "spawn_subagent", "サブエージェントのみ除外");
   assert.ok(!call.argv.includes("--resume"));
   assert.ok(call.prompt.includes("参加者はユーザー・Claude Code・Grok（あなた）・Codex です"), call.prompt.slice(0, 400));
   assert.ok(call.prompt.includes("書き込みは u2a2a/pool/ 配下のみ"));
