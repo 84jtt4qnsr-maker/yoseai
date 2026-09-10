@@ -182,7 +182,7 @@ before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u2a2a-grok-"));
   appDir = path.join(tmp, "u2a2a");
   fs.mkdirSync(path.join(appDir, "public"), { recursive: true });
-  for (const f of ["server.mjs", "lib.mjs", "package.json", "public/flow-graph.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
+  for (const f of ["server.mjs", "lib.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
   fs.writeFileSync(path.join(appDir, "public", "index.html"), "<html></html>");
   poolDir = path.join(appDir, "pool");
   fs.mkdirSync(poolDir);
@@ -512,4 +512,22 @@ test("再起動: 参加者・依頼先が保持され、grok の認証は再判�
   assert.equal(s.agents.grok.authed, true);
   assert.ok(s.pool.every((p) => Array.isArray(p.reviewers)));
   assert.equal(s.topics.find((t) => t.id === topic3).relay.active, false);
+});
+
+
+test("Grok CLI取消: 発言に未計測metaを保存する", async () => {
+  clearCalls();
+  writeCtl({ grok: { delayMs: 5000 } });
+  const result = await api("POST", "/api/messages", { author: "user", thread: "grok", topicId: topic3, text: "取消対象" });
+  assert.equal(result.status, 201);
+  await waitFor(() => cliCalls("grok").length, "grok CLI started");
+  const run = (await getState()).runs.find(r => r.agent === "grok" && r.kind === "thread");
+  assert.ok(run);
+  assert.equal((await api("POST", "/api/runs/" + run.runId + "/cancel", {})).status, 202);
+  await idle();
+  const record = (await msgsOf(topic3)).filter(m => m.author === "grok").at(-1);
+  assert.equal(record.meta.status, "cancelled");
+  assert.equal(record.meta.billing.mode, "unknown");
+  assert.deepEqual(record.meta.usage, { inTok: null, outTok: null, cacheTok: null });
+  writeCtl({});
 });

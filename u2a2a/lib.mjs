@@ -607,3 +607,6 @@ export function isGrokUnauthedError(text) {
 
 // フロービューのグラフ導出（仕様: SPEC-フロービュー.md）。本体は public/flow-graph.js（ブラウザも同じファイルを読む）。ここはテスト用の再 export
 export * from "./public/flow-graph.js";
+
+// 使用量もブラウザと同じ純関数を使用する。
+export * from "./public/usage.js";

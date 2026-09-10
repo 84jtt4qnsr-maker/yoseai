@@ -126,7 +126,7 @@ before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u2a2a-versions-"));
   appDir = path.join(tmp, "u2a2a");
   fs.mkdirSync(path.join(appDir, "public"), { recursive: true });
-  for (const f of ["server.mjs", "lib.mjs", "package.json", "public/flow-graph.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
+  for (const f of ["server.mjs", "lib.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
   fs.writeFileSync(path.join(appDir, "public", "index.html"), "<html></html>");
   poolDir = path.join(appDir, "pool");
   fs.mkdirSync(poolDir);

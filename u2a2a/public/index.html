@@ -795,6 +795,14 @@
   #message-search-more[hidden] { display: none; }
   #message-search-more { margin-top: 10px; }
   #message-search-dialog :focus-visible, #message-search-open:focus-visible { outline: 2px solid var(--codex); outline-offset: -2px; }
+  #usage-dialog { width: min(1100px, 95vw); max-width: 95vw; max-height: 85vh; box-sizing: border-box; }
+  #usage-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  #usage-table-wrap { overflow: auto; max-height: 55vh; margin: 12px 0; }
+  #usage-dialog table { border-collapse: collapse; width: 100%; min-width: 760px; font-size: 12px; }
+  #usage-dialog th, #usage-dialog td { padding: 8px; border-bottom: 1px solid var(--line); text-align: left; overflow-wrap: anywhere; }
+  .usage-total { background: var(--panel-2); font-weight: 600; }
+  .usage-money, #usage-notes, #usage-status { color: var(--dim); font-size: 11px; }
+  #usage-dialog :focus-visible { outline: 2px solid var(--codex); }
   dialog::backdrop { background: #0009; }
   dialog h3 { margin: 0 0 12px; font-size: 15px; }
   dialog .field { margin-bottom: 10px; display: flex; flex-direction: column; gap: 4px; }
@@ -959,6 +967,7 @@
   <h1>U2A2A Orchestration</h1>
   <span class="sub">ユーザー ⇄ 参加エージェント ／ やり取りから生まれたタスクを各アプリで作業し、結果を再入力する</span>
   <button id="budget-btn" class="small" style="margin-left:auto" title="実行の上限設定（コスト・回数・時間）">⚙ 上限</button>
+  <button type="button" id="usage-btn" class="small" title="発言・レビュー・修正・要約の使用量内訳">📊 使用量</button>
   <button id="projects-btn" class="small">📁 プロジェクト</button>
   <button id="health-btn" class="small" title="運用イベント（失敗ログ）とストレージ計測">🩺</button>
 </header>
@@ -1112,6 +1121,17 @@
     <button id="health-clear">ログをクリア</button>
     <button id="health-close">閉じる</button>
   </div>
+</dialog>
+
+<!-- 使用量内訳ダイアログ -->
+<dialog id="usage-dialog" aria-labelledby="usage-heading">
+  <h3 id="usage-heading">使用量内訳</h3>
+  <div id="usage-controls"><label>範囲 <select id="usage-scope"><option value="">全体</option></select></label><button type="button" id="usage-close" class="small">閉じる</button></div>
+  <p>トークンと累計実行時間を表示します。並列実行の時間も加算します。キャッシュは別掲し、入力へ加算しません。金額は実測USDのみで、定額・不明は含みません。</p>
+  <p class="usage-money">発言に加え、レビュー・修正・要約履歴を含みます。⚙ 上限とは集計対象が異なります（上限判定は発言の実測USD＋旧履歴を含む要約累計）。コピーと未保存の要約履歴はこの内訳には含みません。</p>
+  <p id="usage-status" role="status"></p>
+  <div id="usage-table-wrap"><table><thead><tr><th scope="col">トピック / エージェント</th><th scope="col">記録数</th><th scope="col">入力tok</th><th scope="col">出力tok</th><th scope="col">cache tok（別掲）</th><th scope="col">累計時間</th><th scope="col">費用（参考）</th></tr></thead><tbody id="usage-body"></tbody></table></div>
+  <p id="usage-notes"></p>
 </dialog>
 
 <!-- 上限設定ダイアログ -->
@@ -1356,7 +1376,14 @@ function fmtTime(ts) {
   return new Date(ts).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
 }
 
-function fmtElapsed(ms) {
+function fmtElapsed(ms, { total = false } = {}) {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return "不明";
+  if (total) {
+    const seconds = Math.floor(ms / 1000), minutes = Math.floor(seconds / 60);
+    if (seconds < 60) return seconds + "秒";
+    return minutes < 60 ? minutes + "分 " + (seconds % 60) + "秒" :
+      Math.floor(minutes / 60).toLocaleString("ja-JP") + "時間 " + (minutes % 60) + "分";
+  }
   const s = Math.max(0, Math.floor(ms / 1000));
   return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
 }
@@ -1610,6 +1637,65 @@ $("#message-search-dialog").addEventListener("keydown", (event) => {
   if (buttons[next]) { event.preventDefault(); buttons[next].focus(); }
 });
 
+// ---- 保存済み使用量の内訳（public/usage.js の純関数を共有） ----
+let usageScope = "";
+let usageLoadError = false;
+function openUsage(topicId = "") {
+  usageScope = topicId || "";
+  if (!$("#usage-dialog").open) $("#usage-dialog").showModal();
+  renderUsage();
+}
+function usageMetricText(metric, kind) {
+  if (!metric.known && !metric.unknown) return "—";
+  const value = !metric.known ? (kind === "money" ? "実測なし" : "不明") : kind === "time" ? fmtElapsed(metric.value, { total: true }) : kind === "money" ? (metric.value > 0 && metric.value < 0.01 ? "<$0.01" : "$" + metric.value.toFixed(2)) : fmtTok(metric.value, { exact: true });
+  return value + (metric.unknown ? "（不明・対象外 " + metric.unknown + "件を除外）" : "");
+}
+function renderUsage() {
+  if (!$("#usage-dialog").open) return;
+  const status = $("#usage-status");
+  if (!window.Usage) {
+    status.textContent = usageLoadError ? "使用量モジュールを読み込めません。画面を再読み込みしてください。" : "使用量モジュールを読み込み中…";
+    return;
+  }
+  const report = window.Usage.aggregateUsage(state);
+  status.textContent = "保存済み記録の実測分です。未保存の履歴は含みません。";
+  const selector = $("#usage-scope");
+  const entries = new Map((state.topics || []).map((t) => [t.id, t.title]));
+  for (const topic of report.topics) entries.set(topic.topicId === null ? "__unassigned__" : topic.topicId, topic.title);
+  // value は topicId、未所属だけ専用 sentinel（実際のIDは16桁hex）。
+  if (usageScope && !entries.has(usageScope)) usageScope = "";
+  const options = JSON.stringify([...entries]);
+  if (selector.dataset.options !== options) {
+    selector.replaceChildren(el("option", { value: "", text: "全体" }), ...[...entries].map(([id, title]) => el("option", { value: id, text: title })));
+    selector.dataset.options = options;
+  }
+  selector.value = usageScope;
+  const matches = (id) => !usageScope || (id === null ? "__unassigned__" : id) === usageScope;
+  const records = [];
+  if (!usageScope) records.push({ title: "全体合計", agent: "全員", data: report.total, total: true });
+  for (const topic of report.topics.filter((t) => matches(t.topicId))) {
+    records.push({ title: topic.title, agent: "小計", data: topic.total, total: true });
+    for (const row of report.rows.filter((r) => r.topicId === topic.topicId)) records.push({ title: topic.title, agent: NAMES[row.agent] || row.agent || "エージェント不明", data: row });
+  }
+  $("#usage-body").replaceChildren(...records.map(({ title, agent, data, total }) => el("tr", { class: total ? "usage-total" : "" }, [
+    el("th", { scope: "row", text: title + " / " + agent }),
+    el("td", { text: data.records + "（計測情報不明 " + data.missingMeta + "）", title: "発言 " + data.kinds.message + " / レビュー " + data.kinds.review + " / 修正 " + data.kinds.fix + " / 要約 " + data.kinds.summary }),
+    ...["inTok", "outTok", "cacheTok"].map((key) => el("td", { text: usageMetricText(data[key], "tokens") })),
+    el("td", { text: usageMetricText(data.durationMs, "time") }),
+    el("td", { class: "usage-money", text: usageMetricText(data.usd, "money") + " / 定額 " + data.billing.plan + "件・費用不明 " + data.billing.unknown + "件" }),
+  ])));
+  const excluded = report.excluded;
+  const legacy = report.legacySummaryTopics.filter(matches);
+  $("#usage-notes").textContent = (legacy.length ? "旧要約の履歴未保存: " + legacy.length + "トピック（実行件数・使用量は不明、集計外）。 " : "") +
+    (!usageScope ? "全体の除外: 配送コピー " + excluded.delivery + "、分岐コピー " + excluded.branch + "、重複ID " + excluded.duplicate + "、ユーザー発言 " + excluded.user + "、未実施 " + excluded.skipped + "、外部結果 " + excluded.external + "件。" : "") +
+    (!records.length ? " この範囲には集計できる実行記録がありません。" : "");
+}
+$("#usage-btn").addEventListener("click", () => openUsage());
+$("#usage-scope").addEventListener("change", () => { usageScope = $("#usage-scope").value; renderUsage(); });
+$("#usage-close").addEventListener("click", () => $("#usage-dialog").close());
+window.addEventListener("usage-ready", () => render());
+window.addEventListener("usage-error", () => { usageLoadError = true; render(); });
+
 // ---- 要約の鮮度と手動更新 ----
 const summaryRequests = new Set();
 const summaryFeedback = new Map();
@@ -1748,17 +1834,19 @@ $("#summary-retry").addEventListener("click", () => {
 });
 
 // ---- 応答メタ（コスト・トークン・所要時間）表示 ----
-function fmtTok(n) {
-  if (!n) return "0";
+function fmtTok(n, { exact = false } = {}) {
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) return "不明";
+  if (exact) return n.toLocaleString("ja-JP");
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
   if (n < 1000) return String(n);
   return (n / 1000).toFixed(n < 10000 ? 1 : 0) + "k";
 }
 
 function metaText(meta) {
   if (!meta) return "";
-  const u = meta.usage || meta; // 旧フラット形式フォールバック
-  const parts = ["⏱ " + fmtElapsed(meta.durationMs || 0)];
-  parts.push("in " + fmtTok(u.inTok) + (u.cacheTok ? "（+cache " + fmtTok(u.cacheTok) + "）" : "") + " / out " + fmtTok(u.outTok));
+  const u = window.Usage ? window.Usage.measuredTokenUsage(meta) : (meta.usage || {}); // module 未ロード/失敗時も素の実測でフッタを保つ
+  const parts = ["⏱ " + fmtElapsed(meta.durationMs)];
+  parts.push("in " + fmtTok(u.inTok) + (u.cacheTok ? "（cache別掲 " + fmtTok(u.cacheTok) + "）" : "") + " / out " + fmtTok(u.outTok));
   const usd = meta.billing && meta.billing.mode === "metered" ? meta.billing.usd : meta.costUsd;
   if (usd != null) parts.push("$" + usd.toFixed(4));
   else if (meta.billing?.mode === "unknown") parts.push("費用不明");
@@ -3336,6 +3424,7 @@ function render() {
   }
   renderQaBar();
   renderBudgetBar();
+  renderUsage();
   renderHealth();
   renderPool();
   if (nextView === "columns") {
@@ -3868,27 +3957,18 @@ $("#pool-detail").addEventListener("animationend", (e) => {
 function renderTopicDetail(box, t) {
   const msgs = (state.messages || []).filter((m) => m.topicId === t.id);
   const active = t.id === (currentTopic() || {}).id;
-  // トピック累計（コスト・トークン）
-  const tot = msgs.reduce(
-    (a, m) => {
-      if (m.meta) {
-        const u = m.meta.usage || m.meta;
-        a.cost += (m.meta.billing && m.meta.billing.mode === "metered" ? m.meta.billing.usd : m.meta.costUsd) || 0;
-        a.inTok += u.inTok || 0;
-        a.outTok += u.outTok || 0;
-      }
-      return a;
-    },
-    { cost: 0, inTok: 0, outTok: 0 }
-  );
+  const usage = window.Usage?.aggregateUsage({ topics: [t], messages: msgs, pool: (state.pool || []).filter(p => p.topicId === t.id) })?.total;
+  const known = usage ? [
+    usage.inTok.known ? "in " + fmtTok(usage.inTok.value, { exact: true }) : "",
+    usage.outTok.known ? "out " + fmtTok(usage.outTok.value, { exact: true }) : "",
+    usage.usd.known ? usageMetricText({ ...usage.usd, unknown: 0 }, "money") : "",
+  ].filter(Boolean).join(" / ") : "";
   box.appendChild(el("div", { class: "p-head" }, [
     el("span", { class: "origin", text: "🧵 スレッド履歴" }),
     el("span", { class: "p-title", text: t.title }),
     el("span", { class: "pf-size", text: msgs.length + " メッセージ" }),
-    el("span", {
-      class: "pf-size",
-      text: "累計 in " + fmtTok(tot.inTok) + " / out " + fmtTok(tot.outTok) + (tot.cost ? " / $" + tot.cost.toFixed(2) + "（実測分）" : ""),
-    }),
+    el("span", { class: "pf-size", text: known ? "保存済み実測分: " + known + "（欠測・対象外を除く）" : "" }),
+    el("button", { type: "button", class: "small", text: "使用量内訳", onclick: () => openUsage(t.id) }),
   ]));
   box.appendChild(projectDetailsEl(t.projectId));
   for (const id of participantsOf(t)) box.appendChild(el("div", { class: "p-file", text: NAMES[id] + ": " + (t.agents?.[id]?.sessionId || "セッション未開始") }));
@@ -4941,7 +5021,7 @@ $("#budget-btn").addEventListener("click", () => {
     ? (state.messages || []).reduce((a, m) => a + (m.topicId === t.id && m.meta && m.meta.billing && m.meta.billing.mode === "metered" ? m.meta.billing.usd : 0), 0)
     : 0;
   $("#budget-today").textContent =
-    "本日: " + (ud.runs || 0) + " 回 / " + Math.round((ud.ms || 0) / 60000) + " 分　｜　現在のトピック累計: $" + cost.toFixed(2);
+    "本日: " + (ud.runs || 0) + " 回 / " + Math.round((ud.ms || 0) / 60000) + " 分　｜　現在のトピックの発言実測: $" + cost.toFixed(2) + "（コピー含む・レビュー／修正／要約は除外。上限判定には要約累計も加算）";
   $("#budget-dialog").showModal();
 });
 $("#budget-cancel").addEventListener("click", () => $("#budget-dialog").close());
@@ -5009,6 +5089,12 @@ es.onmessage = (e) => {
 render();
 </script>
 <script type="module">
+  try {
+    window.Usage = await import("./usage.js");
+    window.dispatchEvent(new Event("usage-ready"));
+  } catch (error) {
+    window.dispatchEvent(new CustomEvent("usage-error", { detail: error }));
+  }
   try {
     window.FlowGraph = await import("./flow-graph.js");
     window.dispatchEvent(new Event("flowgraph-ready"));

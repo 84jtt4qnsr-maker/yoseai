@@ -158,6 +158,8 @@ function defaultTopic(title, participants = LEGACY_AGENTS) {
     projectId: null, // 対象プロジェクト（null = 未紐付け = Kometa リポジトリ）
     projectLocked: false, // 初回実行で立つ。以後は対象を変更できない（仕様: 実行後の変更は新規トピック）
     summaryState: defaultSummaryState(),
+    summaryUsage: [],
+    summaryUsageLegacyUnknown: false,
     relayHistory: [], // 終わった質疑リレーの確定記録（仕様: SPEC-relayHistory.md）
   };
 }
@@ -1266,7 +1268,7 @@ async function callClaude(prompt, sessionId, modelOverride, onStep, opts = {}) {
         status: "cancelled",
         model: modelOverride || "",
         durationMs: Date.now() - t0,
-        usage: { inTok: 0, outTok: 0, cacheTok: 0 },
+        usage: { inTok: null, outTok: null, cacheTok: null },
         billing: { mode: "unknown" },
       },
     });
@@ -1448,7 +1450,7 @@ async function callGrok(prompt, sessionId, modelOverride, onStep, opts = {}) {
   if (cancelled)
     throw Object.assign(new Error("キャンセルされました"), {
       cancelled: true,
-      meta: { status: "cancelled", model: modelOverride || "", durationMs: Date.now() - t0, usage: { inTok: 0, outTok: 0, cacheTok: 0 }, billing: { mode: "unknown" } },
+      meta: { status: "cancelled", model: modelOverride || "", durationMs: Date.now() - t0, usage: { inTok: null, outTok: null, cacheTok: null }, billing: { mode: "unknown" } },
     });
   const parsed = parseGrokStream(out.split("\n"));
   if (parsed.error) {
@@ -2148,6 +2150,7 @@ async function runReview(itemId, reviewer, ropts = {}) {
       text: "（レビュー失敗: " + String(e.message || e).slice(0, 300) + "）",
       verdict: "",
       error: true,
+      meta: e.meta || null,
       ts: Date.now(),
       ...reviewVersionFields(item, history),
     });
@@ -2191,7 +2194,7 @@ async function runFix(itemId, agent, fopts = {}) {
   const overBudget = budgetStatus(null);
   if (overBudget) {
     item.fixes = item.fixes || [];
-    item.fixes.push({ id: id(), agent, text: "（上限到達のためスキップ: " + overBudget + "）", error: true, ts: Date.now() });
+    item.fixes.push({ id: id(), agent, text: "（上限到達のためスキップ: " + overBudget + "）", error: true, skipped: true, ts: Date.now() });
     touch();
     return;
   }
@@ -2263,7 +2266,7 @@ async function runFix(itemId, agent, fopts = {}) {
       item.status = "submitted";
     }
   } catch (e) {
-    Object.assign(fix, { text: "（修正失敗: " + String(e.message || e).slice(0, 300) + "）", error: true });
+    Object.assign(fix, { text: "（修正失敗: " + String(e.message || e).slice(0, 300) + "）", error: true, meta: fix.meta || e.meta || null });
   }
   // 修正後の版を成否問わず保存（失敗・中断時は partial）→ ロック解除 → 正常完了かつ履歴保存に成功したときだけ自動再レビュー
   let historyOk = true;
@@ -2344,6 +2347,8 @@ async function runSummary(topic, msgs, trigger) {
   const prevLabel = projectLabel(carriedSummary ? prevOrigin : carriedConv ? inheritedOrigin : null);
   const nowLabel = projectLabel(originProjectId);
   const run = startRun("summary", "claude", { topicId });
+  let summaryMeta = null, summaryAttempted = false;
+  const legacySummaryUsage = !Array.isArray(topic.summaryUsage) && !!(topic.summaryTs || topic.summaryText || topic.summaryCostUsd);
   const actKey = "summary:" + topicId;
   actStart(actKey, "スレッド要約", run.runId);
   try {
@@ -2364,7 +2369,9 @@ async function runSummary(topic, msgs, trigger) {
           `各項目に「（旧対象「${prevLabel}」での合意）」と明記し、現在の対象「${nowLabel}」で改めて確認した事項と区別する。`
         : "") +
       `前置きなしで要約本文のみを出力。`;
+    summaryAttempted = true;
     const { text, meta } = await callClaude(prompt, null, "haiku", (s2) => actStep(actKey, s2), { ctl: run.ctl });
+    summaryMeta = meta || null;
     if (meta && meta.billing && meta.billing.mode === "metered") {
       topic.summaryCostUsd = (topic.summaryCostUsd || 0) + meta.billing.usd; // 計上漏れ防止
     }
@@ -2377,6 +2384,7 @@ async function runSummary(topic, msgs, trigger) {
     setSummaryState(topic, { phase: "idle", reason: null, detail: "", trigger }); // 成功の事実は summaryTs / summaryAt が表す
     touch();
   } catch (e) {
+    if (!summaryMeta) summaryMeta = e.meta || null;
     if (e.cancelled) {
       // 明示的な中断は失敗ではない（見送り扱い）
       setSummaryState(topic, { phase: "skipped", reason: "cancelled", detail: "", trigger });
@@ -2385,6 +2393,12 @@ async function runSummary(topic, msgs, trigger) {
       logEvent("summary", `スレッド要約の生成に失敗（${topic.title}）: ` + (e.message || e), "warn");
     }
   } finally {
+    if (summaryAttempted) {
+      if (!Array.isArray(topic.summaryUsage)) topic.summaryUsage = [];
+      if (legacySummaryUsage) topic.summaryUsageLegacyUnknown = true;
+      topic.summaryUsage.push({ id: run.runId, agent: "claude", ts: Date.now(), trigger, meta: summaryMeta });
+      touch();
+    }
     endRun(run.runId);
     actEnd(actKey);
     summaryPending.delete(topicId);

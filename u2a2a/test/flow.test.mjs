@@ -1,3 +1,4 @@
+import * as Usage from "../public/usage.js";
 // フロービューのグラフ導出（SPEC-フロービュー.md「テスト」1〜17 ＋ fixture スナップショット）。jsdom 不要
 // fixture の更新: FLOW_FIXTURES_UPDATE=1 node --test test/flow.test.mjs
 import { test } from "node:test";
@@ -519,13 +520,13 @@ for(const id of ['topic-bar','pool-dialog','pool-search'])body.appendChild(make(
 const messagesBoxes=new Map();
 for(const agent of ['claude','codex','grok']){const col=make('section',{class:'thread-col','data-agent':agent});const box=make('div',{class:'messages',id:'messages-'+agent});col.appendChild(box);col.appendChild(make('span',{id:'count-'+agent}));main.appendChild(col);messagesBoxes.set(agent,box);}
 const timers=[];let now=1000;const raf=[];let currentId=fixture.topicId,poolRenders=0,threadRebuilds=0;
-const events=new Map();const win={addEventListener:(name,fn)=>events.set(name,fn),dispatchEvent:e=>events.get(e.type)?.(e)};
+const events=new Map();const win={Usage,addEventListener:(name,fn)=>events.set(name,fn),dispatchEvent:e=>events.get(e.type)?.(e)};
 const context=vm.createContext({console,Map,Set,JSON,Math,Error,Element,Date:{now:()=>now},state:fixture,window:win,document:{body,getElementById:id=>body.querySelector('#'+id),querySelector:s=>body.querySelector(s),querySelectorAll:s=>body.querySelectorAll(s),createElementNS:(_,tag)=>make(tag)},
  el:make,$:s=>body.querySelector(s),NAMES:{claude:'Claude Code',codex:'Codex',grok:'Grok',user:'ユーザー'},STATUS_LABEL:{queued:'キュー'},STOP_LABELS:{agreed:'合意成立'},
  currentTopic:()=>fixture.topics.find(t=>t.id===currentId),participantsOf:t=>(t||fixture.topics.find(t=>t.id===currentId))?.participants||['claude','codex'],agentIds:()=>['claude','codex','grok'],
  columnTopic:fixture.topicId,foldedColumns:new Map(),narrowColumnLayout:{matches:false},
  requestAnimationFrame:fn=>{raf.push(fn);return raf.length;},cancelAnimationFrame:()=>{},setTimeout:fn=>{timers.push(fn);return timers.length;},clearTimeout(){},
- ensureTopic(){},syncAgentDefinitions(){},ensureAgentColumns(){context.columnTopic=currentId;for(const col of main.querySelectorAll(".thread-col"))col.classList.toggle("is-folded",!!context.foldedColumns.get(currentId)?.has(col.dataset.agent));},syncSendTargets(){},renderAuthControls(){},syncAgentAction(){},syncPoolReviewers(){},renderTopicBar(){body.querySelector('#topic-bar').replaceChildren();},renderProjectUI(){},renderTasks(){},renderAgentStatus(){},renderQaBar(){},renderBudgetBar(){},renderHealth(){},renderPool(){poolRenders++;},scheduleLinks(){},
+ ensureTopic(){},syncAgentDefinitions(){},ensureAgentColumns(){context.columnTopic=currentId;for(const col of main.querySelectorAll(".thread-col"))col.classList.toggle("is-folded",!!context.foldedColumns.get(currentId)?.has(col.dataset.agent));},syncSendTargets(){},renderAuthControls(){},syncAgentAction(){},syncPoolReviewers(){},renderTopicBar(){body.querySelector('#topic-bar').replaceChildren();},renderProjectUI(){},renderTasks(){},renderAgentStatus(){},renderQaBar(){},renderBudgetBar(){},renderUsage(){},renderHealth(){},renderPool(){poolRenders++;},scheduleLinks(){},
  toast:text=>context.lastToast=text,rawView:new Set(),expandedRelays:new Set(),mediaFailed:new Set(),provOf:m=>m.provenance||{},isRelayCopy:m=>!!m.provenance?.source,fmtTime:()=>'',renderMarkdown:text=>text,metaEl:()=>make('div'),isRunning:()=>false,
  poolSelectedId:null,poolCurrentDir:'',poolFocus:null,togglePool:collapse=>body.classList.toggle('pool-collapsed',collapse),
  chooseDestination(){},openTaskDialog(){},openPoolDialog(){},copy(){},ctxItems:()=>[],openCtxMenu(){},
@@ -600,6 +601,10 @@ sourceMessages[0].meta.billing.usd=0.0456;context.render();
 check('タイトル不変のmeta更新を反映',replyCard._flowParts.meta.textContent.includes('$0.0456'));
 sourceMessages[0].meta.billing={mode:'unknown'};context.render();
 check('費用不明を0円にしない',replyCard._flowParts.meta.textContent.includes('費用不明')&&!replyCard._flowParts.meta.textContent.includes('$0.0000'));
+check('欠測トークンを0表示にしない',context.fmtTok(null)==='不明'&&context.fmtTok(0)==='0');
+check('合計は同じフォーマッタで桁区切り',context.fmtTok(35900000,{exact:true})==='35,900,000'&&context.fmtElapsed(18360000,{total:true})==='5時間 6分');
+check('取消の仮0はフッタでも不明',context.metaText({status:'cancelled',usage:{inTok:0,outTok:0},billing:{mode:'unknown'}}).includes('in 不明 / out 不明'));
+
 replyCard._flowParts.toggle.click();
 check('本文展開中は要約を隠す',replyCard._flowParts.meta.hidden);
 check('列で開くは既存actions行に配置',replyCard._flowParts.detail.querySelectorAll('.flow-open-column').every(b=>b.parentElement.classes.includes('actions')));
@@ -672,7 +677,7 @@ const searchTimers = new Map(); let searchTimerId = 0;
 context.setTimeout = fn => { searchTimers.set(++searchTimerId, fn); return searchTimerId; };
 context.clearTimeout = id => searchTimers.delete(id);
 const flushSearchTimers = () => { const jobs = [...searchTimers.values()]; searchTimers.clear(); jobs.forEach(fn => fn()); };
-vm.runInContext(source.slice(source.indexOf('// ---- トピック横断の発言検索'), source.indexOf('// ---- 要約の鮮度')), context);
+vm.runInContext(source.slice(source.indexOf('// ---- トピック横断の発言検索'), source.indexOf('// ---- 保存済み使用量の内訳')), context);
 const searchTopic = { id: 'search-topic', title: '<script>search</script>', participants: ['claude','codex','grok'] };
 fixture.topics.push(searchTopic);
 for (let i = 0; i < 55; i++) fixture.messages.push({ id: 'search-' + i, topicId: searchTopic.id, thread: 'claude', author: 'claude', text: 'needle <img onerror=evil()> ' + i, ts: i + 1 });

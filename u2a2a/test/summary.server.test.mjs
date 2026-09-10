@@ -110,7 +110,7 @@ before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u2a2a-summary-"));
   appDir = path.join(tmp, "u2a2a");
   fs.mkdirSync(path.join(appDir, "public"), { recursive: true });
-  for (const f of ["server.mjs", "lib.mjs", "package.json", "public/flow-graph.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
+  for (const f of ["server.mjs", "lib.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
   fs.writeFileSync(path.join(appDir, "public", "index.html"), "<html></html>");
   poolDir = path.join(appDir, "pool");
   fs.mkdirSync(poolDir);
@@ -146,6 +146,9 @@ test("8. 手動更新: 走って phase が idle に戻り、summaryTs / summaryA
     const x = await getTopic();
     return x.summaryState.phase === "idle" && x.summaryTs ? x : null;
   }, "summary done");
+  assert.equal(t.summaryUsage.length, before.summaryUsage.length + 1);
+  assert.equal(t.summaryUsage.at(-1).meta.usage.inTok, 1);
+  assert.equal(t.summaryUsageLegacyUnknown, false);
   assert.equal(t.summaryState.reason, null);
   assert.equal(t.summaryState.trigger, "manual");
   assert.ok(t.summaryText.includes("合意済み"));
@@ -204,6 +207,8 @@ test("10. 失敗すると phase failed・detail に理由。summaryTs は進ま�
     const x = await getTopic();
     return x.summaryState.phase === "failed" ? x : null;
   }, "summary failed");
+  assert.equal(t.summaryUsage.length, before.summaryUsage.length + 1);
+  assert.equal(t.summaryUsage.at(-1).meta, null);
   assert.equal(t.summaryState.reason, "error");
   assert.ok(t.summaryState.detail.length > 0, "detail が空でない");
   assert.equal(t.summaryTs, before.summaryTs); // 進んでいない
@@ -225,6 +230,7 @@ test("6. 予算上限中は走らず、budget-cap が残る", async () => {
   assert.equal(capped.body.state.reason, "budget-cap");
   assert.ok(capped.body.state.detail.length > 0);
   const after = await getTopic();
+  assert.deepEqual(after.summaryUsage, before.summaryUsage);
   assert.equal(after.summaryState.reason, "budget-cap"); // 見送りはトピックにも残る（無言で消えない）
   assert.equal(after.summaryTs, before.summaryTs); // 要約は走っていない
   await api("PATCH", "/api/budgets", { runCount: 0 });
@@ -233,9 +239,17 @@ test("6. 予算上限中は走らず、budget-cap が残る", async () => {
 // 7. 予算停止（安全ラッチ）
 test("7. budgetHalt 中は走らず、budget-halt と理由が残る", async () => {
   // halt を立てる API は無い（triggerBudgetHalt は上限到達時のみ）。state.json に書いて再起動する
+  // 保存はdebounceされるため、終了前に今回の履歴がディスクへ届くまで待つ。
+  const expectedUsage = (await getTopic()).summaryUsage;
+  await waitFor(() => {
+    const saved = JSON.parse(fs.readFileSync(path.join(appDir, "data", "state.json"), "utf8"));
+    return JSON.stringify(saved.topics.find(t => t.id === topicId).summaryUsage) === JSON.stringify(expectedUsage);
+  }, "summaryUsageの永続化");
   await stopServer();
   const file = path.join(appDir, "data", "state.json");
   const st = JSON.parse(fs.readFileSync(file, "utf8"));
+  const savedUsage = st.topics.find(t => t.id === topicId).summaryUsage;
+  assert.ok(savedUsage.length >= 3);
   st.budgetHalt = { reason: "テスト用の上限到達", ts: Date.now() };
   fs.writeFileSync(file, JSON.stringify(st, null, 2));
   await startServer();
@@ -243,6 +257,7 @@ test("7. budgetHalt 中は走らず、budget-halt と理由が残る", async () 
   fs.writeFileSync(logFile, "");
   const before = await getTopic();
   const halted = await api("POST", "/api/topics/" + topicId + "/summarize");
+  assert.deepEqual(before.summaryUsage, savedUsage, "要約metaがstate.json保存・再起動を通して復元される");
   assert.equal(halted.body.started, false);
   assert.equal(halted.body.state.phase, "skipped");
   assert.equal(halted.body.state.reason, "budget-halt");
@@ -266,6 +281,7 @@ test("11. 分岐先は summaryLastMsgId がコピー後の末尾 ID になり、
   const b = await api("POST", "/api/topics/" + topicId + "/branch", { messageId: at.id, participants: ["claude", "codex"] });
   assert.equal(b.status, 201);
   const child = b.body;
+  assert.deepEqual(child.summaryUsage, [], "要約metaは分岐先へ複製しない");
   const copies = (await getState()).messages.filter((m) => m.topicId === child.id);
   assert.equal(child.summaryAt, copies.length);
   assert.equal(child.summaryLastMsgId, sortByTsId(copies).pop().id);
@@ -281,6 +297,8 @@ test("12. schemaVersion 7 の state を読むと summaryState が補われ、run
   const st = JSON.parse(fs.readFileSync(file, "utf8"));
   st.schemaVersion = 7;
   delete st.topics[0].summaryState;
+  delete st.topics[0].summaryUsage;
+  delete st.topics[0].summaryUsageLegacyUnknown;
   if (st.topics[1]) st.topics[1].summaryState = { phase: "running", reason: null, detail: "", ts: 1, startedTs: 1, trigger: "auto" };
   fs.writeFileSync(file, JSON.stringify(st, null, 2));
   await startServer();
@@ -298,4 +316,42 @@ test("12. schemaVersion 7 の state を読むと summaryState が補われ、run
     return j.schemaVersion === 9 ? j : null;
   }, "schemaVersion 9 が保存される");
   assert.ok(saved.topics.every((t) => t.summaryState && t.summaryState.phase !== "running"));
+});
+
+
+test("要約取消: metaを保持し未計測トークンはnull", async () => {
+  const t = (await api("POST", "/api/topics", { title: "取消テスト" })).body;
+  await api("POST", "/api/messages", { author: "user", thread: "claude", text: "要約対象", topicId: t.id });
+  await api("PATCH", "/api/budgets", { runCount: 0 });
+  await api("POST", "/api/budgets/resume", {});
+  writeCtl({ claude: { delayMs: 5000 } });
+  const result = await api("POST", "/api/topics/" + t.id + "/summarize");
+  assert.equal(result.body.started, true);
+  const run = await waitFor(async () => (await getState()).runs.find(r => r.kind === "summary" && r.topicId === t.id), "summary run");
+  await api("POST", "/api/runs/" + run.runId + "/cancel", {});
+  const after = await waitFor(async () => {
+    const x = await getTopic(t.id);
+    return x.summaryUsage?.length ? x : null;
+  }, "cancelled usage saved");
+  assert.equal(after.summaryUsage.length, 1);
+  assert.equal(after.summaryUsage[0].meta.status, "cancelled");
+  assert.equal(after.summaryUsage[0].meta.billing.mode, "unknown");
+  assert.deepEqual(after.summaryUsage[0].meta.usage, { inTok: null, outTok: null, cacheTok: null });
+  writeCtl({});
+});
+
+
+test("旧要約: 新しい実測を保存しても過去の欠測は消えない", async () => {
+  writeCtl({});
+  const before = await getTopic();
+  assert.equal(before.summaryUsage, undefined);
+  assert.ok(before.summaryTs);
+  assert.equal((await api("POST", "/api/topics/" + topicId + "/summarize")).body.started, true);
+  const after = await waitFor(async () => {
+    const x = await getTopic();
+    return x.summaryUsage?.length ? x : null;
+  }, "legacy summary usage");
+  assert.equal(after.summaryUsage.length, 1);
+  assert.equal(after.summaryUsageLegacyUnknown, true);
+  assert.equal(after.summaryUsage[0].meta.usage.inTok, 1);
 });
