@@ -1138,7 +1138,7 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo 
   const artifactNote =
     rootCwd
       ? `\n\n（成果物ファイルの保存先は ${saveDir}/ です（書き込みは u2a2a/pool/ 配下のみ許可）。` +
-        `中間生成物は ${saveDir}/.work/ へ。画像・音声・動画は python3 / ffmpeg による描画・変換で作れます（拡散モデル等の「画像生成」ツールはこの環境に無いので、生成が必要なら得意な参加者（Codex / Grok）への引き継ぎを提案してください）。` +
+        `中間生成物は ${saveDir}/.work/ へ。画像・音声・動画は python3 / ffmpeg による描画・変換で作れます。いわゆる「画像生成」は python3 u2a2a/tools/nanobanana.py "プロンプト" 保存先.png で可能です（Nano Banana / Gemini。キー未設定だとその旨のエラーになるので、その場合は得意な参加者（Codex / Grok）への引き継ぎを提案してください）。` +
         `保存したら本文にそのパスを書いてください — アプリがインライン表示します）`
       : `\n\n（カレントディレクトリ＝ ${saveDir}/ が成果物の保存先です（書き込みはここのみ）。` +
         `中間生成物は .work/ へ。python3 / ffmpeg で画像・音声・動画を生成できます。` +

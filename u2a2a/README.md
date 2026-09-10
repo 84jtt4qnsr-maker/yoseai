@@ -321,3 +321,12 @@ Claude／GrokのCLI中断（cancelledかつbilling.mode=unknown）の仮の0は�
 - 折りたたみは既定値だけ返す（先頭・末尾 2 束・実行中・分岐点を含む束は開く）。1 行の件数は応答・成果物・タスク・外部同期・リレー
 - fixture: `test/fixtures/flow-*.json`（入力→出力の組。描画側の先行実装用）。更新は `FLOW_FIXTURES_UPDATE=1 node --test test/flow.test.mjs`
 
+
+## Claude 用の画像生成（Nano Banana）
+
+Claude CLI には生成メディアのツールが無いため、Gemini の画像生成（Nano Banana）を薄い CLI で提供する。
+
+- 使い方: `python3 u2a2a/tools/nanobanana.py "プロンプト" 保存先.png [--model MODEL]`
+- キー: 環境変数 `GEMINI_API_KEY`、または `u2a2a/data/gemini.key` の 1 行目（`data/` は gitignore 済み。キーはリポジトリに入れない）。取得は https://aistudio.google.com/apikey
+- モデルは新しい順（`gemini-3.1-flash-image` → `gemini-2.5-flash-image`）に試し、最初に成功したものを使う
+- 依存なし（Python 標準ライブラリのみ）。キー未設定時は明確なエラーを返し、スレッドの Claude は Codex / Grok への引き継ぎを提案する
