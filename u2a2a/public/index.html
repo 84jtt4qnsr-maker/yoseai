@@ -2205,7 +2205,8 @@ function ensureAgentColumns() {
   }
   for (const col of main.querySelectorAll(".thread-col")) if (!ids.includes(col.dataset.agent)) col.remove();
   for (const id of ids) {
-    let col = main.querySelector('[data-agent="' + id + '"]');
+    // .thread-col 限定: フローのペットも data-agent を持つため、無限定だとペットに先へマッチして null 参照になる
+    let col = main.querySelector('.thread-col[data-agent="' + id + '"]');
     const created = !col;
     if (created) { col = createThreadColumn(id); main.appendChild(col); wireAgent(id); }
     col.querySelector(".agent-title").textContent = NAMES[id] + " 側スレッド";
@@ -2219,7 +2220,7 @@ function ensureAgentColumns() {
   }
   // 同じ列構成のSSE更新ではDOMを移動しない（フォーカス・選択を保持）。
   const order = [...main.querySelectorAll(".thread-col")].map((col) => col.dataset.agent);
-  if (order.join() !== ids.join()) for (const id of ids) main.appendChild(main.querySelector('[data-agent="' + id + '"]'));
+  if (order.join() !== ids.join()) for (const id of ids) main.appendChild(main.querySelector('.thread-col[data-agent="' + id + '"]'));
   applyColumnLayout();
 }
 
