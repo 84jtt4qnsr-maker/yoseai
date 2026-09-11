@@ -992,6 +992,21 @@
   #flow-episodes, #flow-empty, #flow-warnings { position:relative; z-index:2; }
   .flow-episode-toggle, .flow-branch, #flow-empty, #flow-warnings { background:var(--bg); }
   .flow-pet.is-roaming { pointer-events:none; }
+  .verification-panel { margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+  .verification-stages { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+  .verification-aggregate { display: block; color: var(--text); }
+  .verification-aggregate[data-complete="true"] { color: #63c993; }
+  .verification-panel p, .verification-panel li, .verification-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .verification-hashes { font-size: 11px; }
+  .verification-panel details { margin-top: 10px; }
+  .verification-panel summary { cursor: pointer; }
+  .verification-panel label { display: block; margin: 8px 0; }
+  .verification-panel input:not([type="checkbox"]), .verification-panel textarea, .verification-panel select { display: block; width: 100%; box-sizing: border-box; margin-top: 4px; }
+  .verification-panel input[type="checkbox"] { margin-left: 8px; }
+  .verification-panel fieldset { min-width: 0; border: 1px solid var(--line); border-radius: 6px; margin: 8px 0; }
+  .verification-panel fieldset:disabled { opacity: .65; }
+  .verification-check { border-top: 1px solid var(--line); padding: 8px 0; }
+  .verification-notice { color: var(--dim); }
 </style>
 </head>
 <body>
@@ -1277,6 +1292,7 @@
 <div id="toast"></div>
 
 <script src="/avatars.js"></script>
+<script src="/verification-ui.js"></script>
 <script>
 const NAMES = Object.assign(Object.create(null), { user: "ユーザー" });
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
@@ -4100,6 +4116,12 @@ function renderTopicDetail(box, t) {
   }
 }
 
+const verificationUI = typeof U2AVerification !== "undefined" && typeof U2AVerification?.Controller === "function"
+  ? new U2AVerification.Controller()
+  : { panel: () => el("section", { class: "verification-panel", role: "status",
+      text: "検証UIを読み込めません。ページを再読込してください。"
+    }) };
+
 function renderPoolDetail(box, p) {
   {
     const pending = (state.reviewPending || {})[p.id] || [];
@@ -4126,6 +4148,7 @@ function renderPoolDetail(box, p) {
       ]);
       kids.push(fileRow);
     }
+    kids.push(verificationUI.panel(p));
     kids.push(poolPreviewEl(p));
     const history = poolHistoryState(p);
     kids.push(poolHistoryEl(p, history));

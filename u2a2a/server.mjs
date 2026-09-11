@@ -57,6 +57,8 @@ import {
   validateV2Format,
   isSafeSpriteName,
 } from "./lib.mjs";
+// 成果物の版と必須検証の共通モジュール（契約: 契約-成果物検証API.md）。名前の衝突を避けるため名前空間で読む
+import * as verif from "./verification.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -1965,6 +1967,7 @@ function registerDeclaredArtifacts(text, agent, topicId, msgId) {
         ...statPoolFile(rel),
         ts: Date.now(),
       });
+      verifQueueAutoImport(state.pool[state.pool.length - 1]);
       changed = true;
     } else if (item.via === "inferred" || item.via === "unknown" || (item.via === "folder" && item.origin === "user")) {
       // 宣言は推定より強い
@@ -2029,6 +2032,7 @@ function scanPoolDir() {
         ...statPoolFile(name),
         ts: Date.now(),
       });
+      verifQueueAutoImport(state.pool[state.pool.length - 1]);
       changed = true;
     }
   }
@@ -3501,6 +3505,34 @@ async function handleApi(req, res, url) {
   }
 
   // 版一覧（仕様: 削除済みアイテムでも manifest があれば返す。対象外の理由は現状のファイルから判定）
+  // 成果物の版と必須検証（契約: 契約-成果物検証API.md §4）
+  if (req.method === "GET" && url.pathname === "/api/verification/history") {
+    const r = verifHistory(url);
+    return json(res, r.status, r.body);
+  }
+  if (parts[0] === "api" && parts[1] === "pool" && parts[2] && parts[3] === "verification" && parts.length <= 5) {
+    const item = state.pool.find((p) => p.id === parts[2]);
+    if (!item) return json(res, 404, { error: "pool item not found", code: "item-not-found" });
+    const op = parts[4] || null;
+    if (req.method === "GET" && !op) return json(res, 200, await verifEvaluate(item)); // 読取専用。申告は受理しない
+    if (req.method === "POST" && op === "import") {
+      await verifDrainBody(req); // 本文は使わない（§4.2「送っても無視」）。JSON として解釈せず、読み捨ててから応答する
+      const r = await verifImport(item);
+      return json(res, r.status, r.body);
+    }
+    if (req.method === "POST" && (op === "confirm" || op === "classify")) {
+      let body;
+      try {
+        body = await readBody(req);
+      } catch (e) {
+        return json(res, 400, { error: "本文を JSON として読めません: " + (e.message || e), code: "invalid-json" });
+      }
+      const r = op === "confirm" ? await verifConfirm(item, body) : await verifClassify(item, body);
+      return json(res, r.status, r.body);
+    }
+    return json(res, 404, { error: "not found" });
+  }
+
   if (req.method === "GET" && parts[0] === "api" && parts[1] === "pool" && parts[2] && parts[3] === "versions" && parts.length === 4) {
     const item = state.pool.find((p) => p.id === parts[2]);
     let manifest;
@@ -3874,6 +3906,347 @@ function serveAvatarImage(req, res, pathname) {
   fs.createReadStream(asset.abs).pipe(res);
 }
 
+// ---- 成果物の版と必須検証（仕様: SPEC-成果物検証.md／契約: 契約-成果物検証API.md 契約版 2）----
+// スキーマ・ハッシュ・分類・判定はすべて verification.mjs。ここはファイルの読み書き、基点の確認、受付の直列化だけを行う。
+// data/checks.jsonl はアプリの追記専用実装であり、OS 上の削除・改ざんを防ぐものではない（SPEC §4）
+const CHECKS_LOG = path.join(DATA_DIR, "checks.jsonl");
+const verifLog = { ok: true, errors: [], lastSeq: 0, records: [], manifestHashes: new Set() };
+const verifBaseCache = new Set(); // "<repo>\0<commit>"。確認できたものだけ覚える（存在しない・確認できないは毎回確かめ直す）
+const VERIF_REJECT_MESSAGES = {
+  "manifest-invalid": "manifest.json がスキーマに合わないため取り込めません",
+  "subject-unavailable": "現行版を計算できません",
+  "subject-mismatch": "申告の対象版が現行版と違います",
+  "policy-unsupported": "未対応の policyVersion です",
+  "requirements-mismatch": "申告の必須集合が現行と違います",
+  "evidence-missing": "証跡のファイルがありません",
+  "evidence-mismatch": "証跡の SHA-256 が違います",
+  "evidence-unreadable": "証跡を読めません",
+  "evidence-outside": "証跡の実体が impl フォルダの外にあります",
+};
+const VERIF_SHA_RE = /^[0-9a-f]{64}$/;
+const VERIF_COMMIT_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const verifProjectKey = (item) => (item.projectId ? "project:" + item.projectId : "default");
+const verifHealth = () => ({ ok: verifLog.ok, errors: verifLog.errors, lastSeq: verifLog.lastSeq });
+const verifUnavailable = () => ({ status: 503, body: { error: "追記ログが不健全なため受け付けられません（修復は API の外で行ってください）", code: "log-unavailable", log: verifHealth() } });
+const verifNotApplicable = () => ({ status: 400, body: { error: "impl フォルダ（manifest.json を持つフォルダ）に属していません", code: "not-applicable" } });
+
+// 本文を使わない POST でも読み切ってから応答する（JSON として解釈しないので、不正な本文でも拒否しない）
+function verifDrainBody(req) {
+  if (req.readableEnded) return Promise.resolve();
+  return new Promise((resolve) => {
+    req.on("end", resolve);
+    req.on("error", resolve);
+    req.on("close", resolve);
+    req.resume();
+  });
+}
+
+// 起動時の復元。読めない行があれば以後の書込を止め、評価は必ず未充足にする（読み落とした失敗がありうるため）
+function verifLoadLog() {
+  let text = "";
+  try {
+    text = fs.readFileSync(CHECKS_LOG, "utf8");
+  } catch (e) {
+    if (!(e && e.code === "ENOENT")) {
+      Object.assign(verifLog, { ok: false, errors: [{ line: 0, code: "log-unreadable", message: String(e.message || e).slice(0, 200) }], lastSeq: 0, records: [], manifestHashes: new Set() });
+      logEvent("verification", "checks.jsonl を読めません。検証の受付を止めます: " + (e.message || e));
+      return;
+    }
+  }
+  const r = verif.parseChecksLog(text);
+  Object.assign(verifLog, {
+    ok: r.ok,
+    errors: r.errors,
+    lastSeq: r.lastSeq,
+    records: r.records,
+    manifestHashes: new Set(r.records.filter((x) => x.source === "manifest").map((x) => x.recordSha256)),
+  });
+  if (!r.ok) logEvent("verification", `checks.jsonl に検査を通らない行があります（${r.errors.length} 件）。検証の受付を止めます`);
+}
+
+// 受理連番の採番から fsync までを同期で行う（間に await を挟まないので、同時の受付と連番・重複判定が混ざらない）。
+// 永続化できてから索引を更新する。書き込みの途中で失敗したら、壊れた行に続けて書かないよう受付を止める
+function verifAppend(entries, receivedAt = new Date().toISOString()) {
+  let seq = verifLog.lastSeq;
+  const recs = entries.map((e) => verif.buildLogRecord({ ...e, seq: ++seq, receivedAt }));
+  const buf = Buffer.from(recs.map(verif.formatChecksLogLine).join(""), "utf8");
+  let fd = null;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fd = fs.openSync(CHECKS_LOG, "a");
+    for (let off = 0; off < buf.length; ) off += fs.writeSync(fd, buf, off, buf.length - off);
+    fs.fsyncSync(fd);
+  } catch (e) {
+    if (fd !== null) {
+      verifLog.ok = false;
+      verifLog.errors = [...verifLog.errors, { line: 0, code: "log-unreadable", message: "追記に失敗しました: " + String(e.message || e).slice(0, 200) }];
+    }
+    logEvent("verification", "checks.jsonl への追記に失敗しました: " + (e.message || e));
+    throw e;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // close の失敗は書込結果に影響しない
+      }
+    }
+  }
+  for (const r of recs) {
+    verifLog.records.push(r);
+    if (r.source === "manifest") verifLog.manifestHashes.add(r.recordSha256);
+  }
+  verifLog.lastSeq = seq;
+  return recs;
+}
+
+// 基点コミットの確認（契約 §4）。manifest の argv は使わず、固定の git cat-file だけを実行する
+async function verifCheckBase(item, baseCommit) {
+  if (typeof baseCommit !== "string" || !VERIF_COMMIT_RE.test(baseCommit)) {
+    return { value: typeof baseCommit === "string" ? baseCommit : null, status: "invalid", detail: "形式が不正です" };
+  }
+  const repo = item.projectId ? (findProject(item.projectId) || {}).path : REPO_ROOT;
+  if (!repo) return { value: baseCommit, status: "unverifiable", detail: "対象プロジェクトが登録されていません" };
+  const key = repo + "\0" + baseCommit;
+  if (verifBaseCache.has(key)) return { value: baseCommit, status: "verified", detail: "" };
+  const r = await gitExec(repo, ["cat-file", "-e", baseCommit + "^{commit}"]);
+  if (r.ok) {
+    verifBaseCache.add(key);
+    return { value: baseCommit, status: "verified", detail: "" };
+  }
+  // 「コミットが無い」と「git を使えない・リポジトリでない」を分ける
+  const probe = await gitExec(repo, ["rev-parse", "--git-dir"]);
+  return probe.ok
+    ? { value: baseCommit, status: "not-found", detail: "対象リポジトリにこのコミットがありません" }
+    : { value: baseCommit, status: "unverifiable", detail: probe.err || r.err || "" };
+}
+
+function verifContext(item) {
+  const implDir = item && item.file ? verif.resolveImplDir(POOL_DIR, item.file) : null;
+  if (!implDir) return null;
+  return { implDir, abs: path.join(POOL_DIR, ...implDir.split("/")), projectKey: verifProjectKey(item) };
+}
+
+// 非同期の基点確認。受付では、この後の verifSnapshot から追記までを同期で行う
+async function verifBase(ctx, item) {
+  const folder = verif.readImplFolder(ctx.abs);
+  return folder.manifest.ok ? verifCheckBase(item, folder.manifest.manifest.baseCommit) : { value: null, status: "invalid", detail: "manifest を読めません" };
+}
+
+function verifSnapshot(ctx, item, base) {
+  const folder = verif.readImplFolder(ctx.abs);
+  let baseCommit = base;
+  if (folder.manifest.ok && base.value !== folder.manifest.manifest.baseCommit) {
+    baseCommit = { value: folder.manifest.manifest.baseCommit, status: "unverifiable", detail: "確認中に基点が変わりました。再読込してください" };
+  }
+  const current = folder.currentSubjectSha256;
+  const records = verifLog.records.filter((r) => r.projectKey === ctx.projectKey);
+  const evidenceStatus = {};
+  for (const r of records) {
+    if (r.type === "check" && r.subjectSha256 === current && r.payload.evidence) evidenceStatus[r.seq] = verif.evidenceStatusOf(ctx.abs, r.payload.evidence);
+  }
+  const manifestEvidenceStatus = {};
+  if (folder.manifest.ok) folder.manifest.manifest.checks.forEach((c, i) => (manifestEvidenceStatus[i] = verif.evidenceStatusOf(ctx.abs, c.evidence)));
+  const evaluation = verif.evaluateVerification({ itemId: item.id, implDir: ctx.implDir, projectKey: ctx.projectKey, folder, baseCommit, records, log: verifHealth(), evidenceStatus, manifestEvidenceStatus });
+  return { folder, evaluation, manifestEvidenceStatus };
+}
+
+async function verifEvaluate(item) {
+  const ctx = verifContext(item);
+  if (!ctx) return { applicable: false, itemId: item.id, implDir: null };
+  const base = await verifBase(ctx, item);
+  return verifSnapshot(ctx, item, base).evaluation;
+}
+
+// 申告取込（§4.2）。現行版に合う行だけを source:manifest で追記し、同じ正規化済み申告は重複として数えるだけにする
+async function verifImport(item) {
+  const ctx = verifContext(item);
+  if (!ctx) return verifNotApplicable();
+  if (!verifLog.ok) return verifUnavailable();
+  const base = await verifBase(ctx, item);
+  if (!verifLog.ok) return verifUnavailable();
+  const snap = verifSnapshot(ctx, item, base);
+  const { folder, evaluation } = snap;
+  if (!folder.manifest.ok) {
+    return { status: 200, body: { added: 0, duplicates: 0, rejected: [{ index: null, id: null, code: "manifest-invalid", message: VERIF_REJECT_MESSAGES["manifest-invalid"] }], records: [], evaluation } };
+  }
+  const entries = [];
+  const rejected = [];
+  const batch = new Set();
+  let duplicates = 0;
+  folder.manifest.manifest.checks.forEach((payload, index) => {
+    const hash = verif.recordSha256({ type: "check", source: "manifest", projectKey: ctx.projectKey, payload });
+    if (verifLog.manifestHashes.has(hash) || batch.has(hash)) {
+      duplicates++;
+      return;
+    }
+    const code = verif.importRejection(payload, { currentSubjectSha256: folder.currentSubjectSha256, requirementsSha256: evaluation.requirements.sha256, evidenceStatus: snap.manifestEvidenceStatus[index] });
+    if (code) {
+      rejected.push({ index, id: payload.id, code, message: VERIF_REJECT_MESSAGES[code] || code });
+      return;
+    }
+    batch.add(hash);
+    entries.push({ source: "manifest", type: "check", projectKey: ctx.projectKey, subjectSha256: payload.subjectSha256, policyVersion: payload.policyVersion, implDir: ctx.implDir, itemId: item.id, payload });
+  });
+  let records = [];
+  if (entries.length) {
+    try {
+      records = verifAppend(entries);
+    } catch (e) {
+      return { status: 500, body: { error: "追記ログへの書き込みに失敗しました: " + (e.message || e), code: "log-write-failed" } };
+    }
+    broadcast();
+  }
+  return { status: 200, body: { added: records.length, duplicates, rejected, records, evaluation: verifSnapshot(ctx, item, base).evaluation } };
+}
+
+// 自動取込（契約 §4.2）: manifest.json がプール項目として新規登録された時点で 1 回だけ
+const verifAutoQueue = [];
+function verifQueueAutoImport(item) {
+  if (!item || !item.file || path.posix.basename(item.file) !== "manifest.json") return;
+  verifAutoQueue.push(item.id);
+  if (verifAutoQueue.length === 1) setImmediate(verifDrainAutoImports);
+}
+
+async function verifDrainAutoImports() {
+  while (verifAutoQueue.length) {
+    const item = state.pool.find((p) => p.id === verifAutoQueue[0]);
+    try {
+      if (item) {
+        const r = await verifImport(item);
+        if (r.status >= 400 && r.body.code !== "not-applicable") logEvent("verification", `manifest の自動取込に失敗しました（${item.file}）: ${r.body.error}`, "warn");
+      }
+    } catch (e) {
+      logEvent("verification", `manifest の自動取込に失敗しました（${item && item.file}）: ` + (e.message || e), "warn");
+    }
+    verifAutoQueue.shift();
+  }
+}
+
+// 確認記録（§4.3）。受付直前に現行版・必須集合を再照合し、各項目を別々の source:ui 記録として保存する（重複排除しない）
+async function verifConfirm(item, body) {
+  const ctx = verifContext(item);
+  if (!ctx) return verifNotApplicable();
+  const errors = verif.validateConfirmRequest(body);
+  if (errors.length) return { status: 400, body: { error: "要求の形式が不正です", code: "invalid-request", errors } };
+  if (!verifLog.ok) return verifUnavailable();
+  const base = await verifBase(ctx, item);
+  if (!verifLog.ok) return verifUnavailable();
+  // ここから追記まで await を挟まない
+  const snap = verifSnapshot(ctx, item, base);
+  const current = { subjectSha256: snap.folder.currentSubjectSha256, requirementsSha256: snap.evaluation.requirements.sha256, policyVersion: verif.POLICY_VERSION };
+  if (body.subjectSha256 !== current.subjectSha256 || body.requirementsSha256 !== current.requirementsSha256 || body.policyVersion !== current.policyVersion) {
+    return { status: 409, body: { error: "表示した版または必須集合が現在と違います。再読込してください", code: "version-conflict", current, evaluation: snap.evaluation } };
+  }
+  for (const [index, c] of body.checks.entries()) {
+    if (c.evidence == null) continue;
+    const st = verif.evidenceStatusOf(ctx.abs, c.evidence);
+    if (st !== "ok") return { status: 422, body: { error: "証跡を照合できません", code: "evidence-" + (st === "none" ? "missing" : st), index } };
+  }
+  const receivedAt = new Date().toISOString();
+  const entries = body.checks.map((c) => ({
+    source: "ui",
+    type: "check",
+    projectKey: ctx.projectKey,
+    subjectSha256: current.subjectSha256,
+    policyVersion: current.policyVersion,
+    implDir: ctx.implDir,
+    itemId: item.id,
+    payload: verif.normalizeCheck({
+      id: c.id,
+      subjectSha256: current.subjectSha256,
+      policyVersion: current.policyVersion,
+      requirementsSha256: current.requirementsSha256,
+      actor: body.actor ?? "user",
+      method: c.method,
+      result: c.result,
+      executedAt: c.result === "not_run" ? null : c.executedAt || receivedAt,
+      evidence: c.evidence ?? null,
+      reason: c.reason ?? null,
+    }),
+  }));
+  let records;
+  try {
+    records = verifAppend(entries, receivedAt);
+  } catch (e) {
+    return { status: 500, body: { error: "追記ログへの書き込みに失敗しました: " + (e.message || e), code: "log-write-failed" } };
+  }
+  broadcast();
+  return { status: 201, body: { records, evaluation: verifSnapshot(ctx, item, base).evaluation } };
+}
+
+// 分類記録（§4.4）。解除できるのは現行版の保留候補だけ。分類だけではテストの成功にならない
+async function verifClassify(item, body) {
+  const ctx = verifContext(item);
+  if (!ctx) return verifNotApplicable();
+  const errors = verif.validateClassifyRequest(body);
+  if (errors.length) return { status: 400, body: { error: "要求の形式が不正です", code: "invalid-request", errors } };
+  if (!verifLog.ok) return verifUnavailable();
+  const base = await verifBase(ctx, item);
+  if (!verifLog.ok) return verifUnavailable();
+  // ここから追記まで await を挟まない
+  const snap = verifSnapshot(ctx, item, base);
+  const req = snap.evaluation.requirements;
+  if (body.subjectSha256 !== snap.folder.currentSubjectSha256 || body.policyVersion !== verif.POLICY_VERSION) {
+    const current = { subjectSha256: snap.folder.currentSubjectSha256, requirementsSha256: req.sha256, policyVersion: verif.POLICY_VERSION };
+    return { status: 409, body: { error: "表示した版が現在と違います。再読込してください", code: "version-conflict", current, evaluation: snap.evaluation } };
+  }
+  if (![...req.pending, ...req.resolved].some((x) => x.path === body.path)) {
+    return { status: 409, body: { error: "このパスは現行版の保留候補ではありません", code: "not-classifiable", pending: req.pending, resolved: req.resolved } };
+  }
+  // 解決済みのパスの再分類も許すため、分類を適用しない導出から許される分類を取る
+  const parsed = verif.parseUnifiedDiff(snap.folder.patchText);
+  const allowedDecisions = parsed.ok
+    ? [...new Set(verif.deriveRequirements({ files: parsed.files }).pending.filter((x) => x.path === body.path).flatMap((x) => x.allowedDecisions))]
+    : [];
+  if (!allowedDecisions.includes(body.decision)) {
+    return { status: 422, body: { error: "この保留には指定できない分類です", code: "decision-not-allowed", allowedDecisions } };
+  }
+  const entry = {
+    source: "ui",
+    type: "classification",
+    projectKey: ctx.projectKey,
+    subjectSha256: snap.folder.currentSubjectSha256,
+    policyVersion: verif.POLICY_VERSION,
+    implDir: ctx.implDir,
+    itemId: item.id,
+    payload: verif.normalizeClassification({ path: body.path, decision: body.decision, reason: body.reason, method: body.method ?? null }),
+  };
+  let records;
+  try {
+    records = verifAppend([entry]);
+  } catch (e) {
+    return { status: 500, body: { error: "追記ログへの書き込みに失敗しました: " + (e.message || e), code: "log-write-failed" } };
+  }
+  broadcast();
+  const evaluation = verifSnapshot(ctx, item, base).evaluation;
+  return { status: 201, body: { record: records[0], requirements: evaluation.requirements, evaluation } };
+}
+
+// 履歴取得（§4.5）。プール項目に依存しないので、項目を削除しても引ける。ログが不健全でも読めた行は返す
+function verifHistory(url) {
+  const q = url.searchParams;
+  const bad = (message) => ({ status: 400, body: { error: message, code: "invalid-request" } });
+  const projectKey = q.get("projectKey");
+  if (!projectKey || !/^(?:default|project:[A-Za-z0-9_-]{1,80})$/.test(projectKey)) return bad("projectKey は default か project:<id> です");
+  const subject = q.get("subjectSha256");
+  if (subject !== null && !VERIF_SHA_RE.test(subject)) return bad("subjectSha256 は 64 桁の小文字 hex です");
+  const int = (name, def, min, max) => {
+    const v = q.get(name);
+    if (v === null) return def;
+    if (!/^\d+$/.test(v)) return NaN;
+    const n = Number(v);
+    return n >= min && n <= max ? n : NaN;
+  };
+  const afterSeq = int("afterSeq", 0, 0, Number.MAX_SAFE_INTEGER);
+  const limit = int("limit", 200, 1, 1000);
+  if (Number.isNaN(afterSeq)) return bad("afterSeq は 0 以上の整数です");
+  if (Number.isNaN(limit)) return bad("limit は 1〜1000 の整数です");
+  const all = verifLog.records.filter((r) => r.projectKey === projectKey && (subject === null || r.subjectSha256 === subject) && r.seq > afterSeq);
+  const page = all.slice(0, limit);
+  return { status: 200, body: { log: verifHealth(), records: page, nextAfterSeq: all.length > limit ? page[page.length - 1].seq : null } };
+}
+
 // ---- static ----
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -3913,6 +4286,7 @@ const server = http.createServer(async (req, res) => {
 
 fs.mkdirSync(POOL_TRASH, { recursive: true });
 fs.mkdirSync(POOL_VERSIONS, { recursive: true });
+verifLoadLog(); // 検証の追記ログを先に復元する（起動時の走査で登録された manifest.json の自動取込が使う）
 migratePoolItems();
 syncVersionsFromManifests();
 scanPoolDir();

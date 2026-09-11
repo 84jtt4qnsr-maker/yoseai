@@ -305,6 +305,23 @@ UI（アバター・列ヘッダ）が読む状態をサーバで 1 本に正規
 - 資産の生成・検証: `python3 u2a2a/tools/avatar-assets.py`（Pillow。アトラスの各行のコマ数を定義と突き合わせてから
   `pool/avatars/v2-format.json` と `still-r0c0.webp` を書く。`--check` は検証のみ）
 
+## 成果物の版と必須検証（仕様: SPEC-成果物検証.md／契約: 契約-成果物検証API.md）
+
+impl フォルダ（`manifest.json` を持つフォルダ）の差分について、「どの版に対して、どの必須検証が、どの経路で記録されたか」を判定する。
+スキーマ・ハッシュ・diff 分類・判定は `verification.mjs`（サーバと `tools/render-apply.mjs` が共有）。UI は複製せず API の応答を使う。
+
+- 集約状態は `unsatisfied`（未充足）/ `pending`（判定保留）/ `declared`（必須検証：申告で充足）/ `confirmed`（必須検証：確認済み（UI経路））。
+  「完了」の表示は `aggregate.complete`（= confirmed）だけ。UI 経路は人間が操作した証明ではない
+- 必須は常に `apply`、`u2a2a/test/*.test.mjs` の追加・変更があれば `tests`。テストの削除・対象外パス・実行設定の変更は分類まで保留
+- API: `GET /api/pool/:id/verification`（評価。受理しない）／`POST …/import`（申告取込）／`POST …/confirm`（確認記録）／
+  `POST …/classify`（分類）／`GET /api/verification/history?projectKey=…`（履歴。項目を消しても引ける）
+- 記録は `u2a2a/data/checks.jsonl` に追記（受理連番・fsync 後に応答）。起動時に検査して復元し、読めない行があれば評価は必ず未充足・書込は 503。
+  手で編集したときの空行・BOM・末尾の改行欠落も読めない行になり、受付が止まる（修復は API の外で行う）。
+  アプリの追記専用実装であって、OS 上の削除・改ざんを防ぐものではない
+- `manifest.json` がプール項目として新規登録されたときに 1 回だけ自動取込する。基点は `git cat-file -e <commit>^{commit}` で確認し、成功だけを覚える。
+  すでに登録済みの項目（この機能より前からある impl、`checks.jsonl` を消した後など）と、登録後の manifest 編集は自動では取り込まないので、
+  `POST …/import`（UI の取込ボタン）を使う。manifest の argv は記録であり、サーバは実行しない
+
 ## 質疑リレーの履歴（仕様: SPEC-relayHistory.md）
 
 `topic.relay` は現在の 1 本しか持たないため、次の質疑が始まると前のリレーの結末が消える。
