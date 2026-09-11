@@ -984,6 +984,14 @@
   .pet-fallback { position:absolute; left:calc(50% - 11px); top:calc(50% - 11px); }
   .pet-off { opacity:.5; }
 
+
+  /* The roaming layer cannot paint over text, arrows or controls. */
+  #flow-canvas { isolation:isolate; }
+  #flow-roam { position:absolute; inset:0; z-index:0; overflow:hidden; pointer-events:none; contain:layout paint; }
+  #flow-links { z-index:1; }
+  #flow-episodes, #flow-empty, #flow-warnings { position:relative; z-index:2; }
+  .flow-episode-toggle, .flow-branch, #flow-empty, #flow-warnings { background:var(--bg); }
+  .flow-pet.is-roaming { pointer-events:none; }
 </style>
 </head>
 <body>
@@ -1051,6 +1059,7 @@
     </div>
   <section id="flow-zone" aria-label="会話のフロー" tabindex="0" hidden>
     <div id="flow-canvas">
+      <div id="flow-roam" aria-hidden="true"></div>
       <svg id="flow-links" aria-hidden="true"></svg>
       <div id="flow-empty">まだ発言がありません</div>
       <details id="flow-warnings" hidden><summary></summary><div class="flow-text"></div></details>
