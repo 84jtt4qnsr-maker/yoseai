@@ -51,6 +51,11 @@ import {
   relayRecord,
   reconstructRelays,
   sortByTsId,
+  deriveAgentState,
+  nextOutcome,
+  sanitizeOutcomes,
+  validateV2Format,
+  isSafeSpriteName,
 } from "./lib.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -161,6 +166,7 @@ function defaultTopic(title, participants = LEGACY_AGENTS) {
     summaryUsage: [],
     summaryUsageLegacyUnknown: false,
     relayHistory: [], // 終わった質疑リレーの確定記録（仕様: SPEC-relayHistory.md）
+    agentOutcomes: {}, // エージェント別の最新の終了状態（仕様: SPEC-アバター状態.md §4。分岐先には引き継がない）
   };
 }
 
@@ -179,6 +185,7 @@ function emptyState() {
     budgets: defaultBudgets(),
     usageDay: null,
     budgetHalt: null,
+    unattributedOutcomes: {}, // トピックに帰属しない review / fix の終了状態（仕様: SPEC-アバター状態.md §4.3）
   };
 }
 
@@ -286,6 +293,10 @@ function loadState() {
       parsed.budgets = { ...defaultBudgets(), ...(parsed.budgets || {}) };
       parsed.usageDay = parsed.usageDay || null;
       parsed.budgetHalt = parsed.budgetHalt || null;
+      // schemaVersion 10: 終了状態の保持先（仕様: SPEC-アバター状態.md §4.5）。
+      // 過去の停止・失敗からは復元しない（解除の履歴が無く、解決済みの停止を蘇らせるため）
+      parsed.unattributedOutcomes = sanitizeOutcomes(parsed.unattributedOutcomes, AGENTS);
+      for (const t of parsed.topics) t.agentOutcomes = sanitizeOutcomes(t.agentOutcomes, AGENTS);
       for (const m of parsed.messages) migrateMeta(m);
       // schemaVersion 5: 既存プールアイテムへ所属（topicId）と作者（origin）を補完する
       // （合意事項: 既存ファイルは動かさない。情報の補完のみ）
@@ -394,7 +405,7 @@ function persistState() {
   const t0 = Date.now();
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    state.schemaVersion = 9;
+    state.schemaVersion = 10;
     const jsonStr = JSON.stringify(state, null, 2);
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, jsonStr);
@@ -631,6 +642,41 @@ function publicRuns() {
   return Object.values(runs).map(({ ctl, ...r }) => r);
 }
 
+// エージェント状態の正規化（仕様: SPEC-アバター状態.md）。UI はこれだけを読み、業務データを再解釈しない
+function agentStateNow() {
+  return deriveAgentState({
+    agentIds: AGENTS,
+    agents: state.agents,
+    budgetHalt: state.budgetHalt,
+    runs: publicRuns(),
+    topics: state.topics,
+    pool: state.pool,
+    unattributedOutcomes: state.unattributedOutcomes,
+  });
+}
+
+// 終了状態の記録（§4）。topicId: 文字列=そのトピック／null=帰属なし／undefined=記録しない（帰属先が削除済み）
+function noteOutcome(topicId, agent, ev) {
+  if (topicId === undefined) return;
+  let store;
+  if (topicId === null) {
+    store = state.unattributedOutcomes ||= {};
+  } else {
+    const t = findTopic(topicId);
+    if (!t) return; // 実行中にトピックが削除された。null に付け替えると帰属を偽る
+    store = t.agentOutcomes ||= {};
+  }
+  const next = nextOutcome(store[agent] || null, { id: id(), ts: Date.now(), ...ev });
+  if (next) store[agent] = next;
+  else delete store[agent];
+}
+
+// review / fix の帰属（§4.3）: 項目のトピック。項目がトピック外なら null、指すトピックが削除済みなら undefined
+function itemOutcomeTopic(item) {
+  if (!item || !item.topicId) return null;
+  return findTopic(item.topicId) ? item.topicId : undefined;
+}
+
 // 実行中 CLI の進捗実況（永続化しない）。key: "thread:claude" / "review:<itemId>:<reviewer>"
 const activity = {};
 
@@ -655,7 +701,7 @@ function actEnd(key) {
 
 function publicState() {
   // running / reviewPending / fixPending は互換用の派生値。正は runs レジストリ
-  return { ...state, agentDefs: AGENT_DEFS, running, reviewPending, fixPending, activity, poolDirs, runs: publicRuns(), events, storageMetrics };
+  return { ...state, agentDefs: AGENT_DEFS, running, reviewPending, fixPending, activity, poolDirs, runs: publicRuns(), agentState: agentStateNow(), events, storageMetrics };
 }
 
 function broadcast() {
@@ -2109,6 +2155,7 @@ async function runReview(itemId, reviewer, ropts = {}) {
       ...reviewVersionFields(item, null),
     });
     logEvent("project", pc.blockReason, "warn");
+    noteOutcome(itemOutcomeTopic(item), reviewer, { type: "failed", kind: "review", reason: "project-blocked", runId: run.runId, itemId, detail: pc.blockReason });
     finish();
     return;
   }
@@ -2134,6 +2181,7 @@ async function runReview(itemId, reviewer, ropts = {}) {
       ...reviewVersionFields(item, null),
     });
     logEvent("versions", `レビュー対象版の保存に失敗（${item.file}）: ` + (e.message || e));
+    noteOutcome(itemOutcomeTopic(item), reviewer, { type: "failed", kind: "review", reason: "history", runId: run.runId, itemId, detail: historyError });
     finish();
     return;
   }
@@ -2145,6 +2193,7 @@ async function runReview(itemId, reviewer, ropts = {}) {
     // 権限要求・中断で止まった応答（meta.status === "stopped"）は本文・費用を残すが、判定は抽出しない（途中の文言を判定として扱わない）
     const stopped = !!(meta && meta.status === "stopped");
     item.reviews.push({ id: id(), reviewer, text, verdict: stopped ? "" : verdictFrom(text), meta, ts: Date.now(), ...(stopped ? { stopped: true } : {}), ...reviewVersionFields(item, history) });
+    noteOutcome(itemOutcomeTopic(item), reviewer, stopped ? { type: "stopped", kind: "review", runId: run.runId, itemId } : { type: "completed", kind: "review" });
   } catch (e) {
     item.reviews.push({
       id: id(),
@@ -2156,6 +2205,13 @@ async function runReview(itemId, reviewer, ropts = {}) {
       ts: Date.now(),
       ...reviewVersionFields(item, history),
     });
+    noteOutcome(
+      itemOutcomeTopic(item),
+      reviewer,
+      e.cancelled
+        ? { type: "stopped", kind: "review", reason: "cancelled", runId: run.runId, itemId } // キャンセルは失敗として表示しない（合意§3）
+        : { type: "failed", kind: "review", reason: "error", runId: run.runId, itemId, detail: String(e.message || e) }
+    );
   } finally {
     finish();
   }
@@ -2220,6 +2276,7 @@ async function runFix(itemId, agent, fopts = {}) {
     fix.error = true;
     item.fixes.push(fix);
     logEvent("project", pc.blockReason, "warn");
+    noteOutcome(itemOutcomeTopic(item), agent, { type: "failed", kind: "fix", reason: "project-blocked", runId: run.runId, itemId, detail: pc.blockReason });
     finish();
     return;
   }
@@ -2243,6 +2300,7 @@ async function runFix(itemId, agent, fopts = {}) {
     fix.error = true;
     item.fixes.push(fix);
     logEvent("versions", `修正前の版の保存に失敗（${item.file}）: ` + (e.message || e));
+    noteOutcome(itemOutcomeTopic(item), agent, { type: "failed", kind: "fix", reason: "history", runId: run.runId, itemId, detail: fix.historyError });
     finish();
     return;
   }
@@ -2268,7 +2326,7 @@ async function runFix(itemId, agent, fopts = {}) {
       item.status = "submitted";
     }
   } catch (e) {
-    Object.assign(fix, { text: "（修正失敗: " + String(e.message || e).slice(0, 300) + "）", error: true, meta: fix.meta || e.meta || null });
+    Object.assign(fix, { text: "（修正失敗: " + String(e.message || e).slice(0, 300) + "）", error: true, cancelled: !!e.cancelled, meta: fix.meta || e.meta || null });
   }
   // 修正後の版を成否問わず保存（失敗・中断時は partial）→ ロック解除 → 正常完了かつ履歴保存に成功したときだけ自動再レビュー
   let historyOk = true;
@@ -2288,6 +2346,18 @@ async function runFix(itemId, agent, fopts = {}) {
     }
   }
   item.fixes.push(fix);
+  // 結末の優先: 停止 > 失敗 > 修正後の版の保存失敗 > 正常完了（§4.1・§4.4）
+  noteOutcome(
+    itemOutcomeTopic(item),
+    agent,
+    fix.stopped || fix.cancelled
+      ? { type: "stopped", kind: "fix", ...(fix.cancelled ? { reason: "cancelled" } : {}), runId: run.runId, itemId }
+      : fix.error
+        ? { type: "failed", kind: "fix", reason: "error", runId: run.runId, itemId, detail: fix.text }
+        : !historyOk
+          ? { type: "failed", kind: "fix", reason: "history", runId: run.runId, itemId, detail: fix.historyError }
+          : { type: "completed", kind: "fix" }
+  );
   finish();
   if (cliOk && historyOk) {
     // 実際にレビューした人（修正者以外）が自動で再レビュー。無ければ保存済みの依頼先（旧成果物は既定から導出）
@@ -2657,6 +2727,7 @@ async function agentLoop(topicId, agent) {
           ts: Date.now(),
         });
         logEvent("project", pc.blockReason, "warn");
+        noteOutcome(topicId, agent, { type: "failed", kind: "thread", reason: "project-blocked", detail: pc.blockReason, messageId: state.messages[state.messages.length - 1].id });
         touch();
         break; // 既読位置は進めない（登録先を戻せば同じメッセージから再開できる）
       }
@@ -2709,6 +2780,7 @@ async function agentLoop(topicId, agent) {
           ts: Date.now(),
         };
         state.messages.push(replyMsg);
+        noteOutcome(topicId, agent, stopped ? { type: "stopped", kind: "thread", runId: run.runId, messageId: replyMsg.id } : { type: "completed", kind: "thread" });
         // 質疑の論点が未定なら、先手の応答冒頭の起案を採用（ユーザーは qa バーで修正可能）。同じリレーの手番の応答に限る
         if (relayLive && !stopped && !topic.relay.agenda) {
           // 「今回決めること: 〜」形式にも「## 今回決めること」見出し＋次行にも対応
@@ -2758,6 +2830,7 @@ async function agentLoop(topicId, agent) {
           });
         } else {
           a.lastError = String(e.message || e);
+          noteOutcome(topicId, agent, { type: "failed", kind: "thread", reason: "error", runId: run.runId, detail: String(e.message || e) });
         }
       } finally {
         endRun(run.runId);
@@ -2903,6 +2976,30 @@ async function handleApi(req, res, url) {
     maybeTrigger(created);
     return json(res, 201, created);
   }
+
+  // エージェント状態（仕様: SPEC-アバター状態.md §6）。SSE を待たずに取るための補助
+  if (req.method === "GET" && url.pathname === "/api/agent-state") return json(res, 200, agentStateNow());
+  if (req.method === "POST" && url.pathname === "/api/agent-state/ack") {
+    const body = await readBody(req);
+    if (!AGENTS.includes(body.agent)) return json(res, 400, { error: "agent が不正です" });
+    if (body.topicId !== null && typeof body.topicId !== "string") return json(res, 400, { error: "topicId は文字列か null です" });
+    let store;
+    if (body.topicId === null) {
+      store = state.unattributedOutcomes ||= {};
+    } else {
+      const t = findTopic(body.topicId);
+      if (!t) return json(res, 404, { error: "topic not found" });
+      store = t.agentOutcomes ||= {};
+    }
+    const cleared = !!store[body.agent];
+    delete store[body.agent];
+    if (cleared) touch();
+    return json(res, 200, { ok: true, cleared });
+  }
+
+  // アバター配信（§7）: manifest は再検証、画像は内容ハッシュ付き URL で immutable
+  if (req.method === "GET" && url.pathname === "/api/avatars") return serveAvatarManifest(req, res);
+  if (req.method === "GET" && url.pathname.startsWith("/api/avatars/")) return serveAvatarImage(req, res, url.pathname);
 
   // 実行のキャンセル（初版は thread 実行のみ。SIGTERM→3秒→SIGKILL・プロセスグループ停止）
   if (req.method === "POST" && parts[0] === "api" && parts[1] === "runs" && parts[2] && parts[3] === "cancel") {
@@ -3646,6 +3743,119 @@ async function handleApi(req, res, url) {
   return json(res, 404, { error: "not found" });
 }
 
+// ---- アバター配信（仕様: SPEC-アバター状態.md §7）----
+// 対象は AGENTS の id だけ。pet.json は読むだけで書き換えない
+const AVATAR_DIR = path.join(POOL_DIR, "avatars");
+const avatarHashCache = new Map(); // 絶対パス -> { mtimeMs, size, sha256 }。変わったときだけ読み直す
+
+function avatarFileInfo(abs) {
+  let st;
+  try {
+    st = fs.statSync(abs);
+  } catch {
+    return null;
+  }
+  if (!st.isFile()) return null;
+  const c = avatarHashCache.get(abs);
+  if (c && c.mtimeMs === st.mtimeMs && c.size === st.size) return c;
+  const info = { mtimeMs: st.mtimeMs, size: st.size, sha256: sha256Hex(fs.readFileSync(abs)) };
+  avatarHashCache.set(abs, info);
+  return info;
+}
+
+const avatarUrl = (agent, which, info) => `/api/avatars/${agent}/${which}.${info.sha256.slice(0, 16)}.webp`;
+
+// 画像の実体。sprite は pet.json の spritesheetPath（同じフォルダの basename.webp のみ）、still は固定名
+function avatarAsset(agent, which) {
+  const dir = path.join(AVATAR_DIR, agent);
+  if (which === "still") return { abs: path.join(dir, "still-r0c0.webp"), pet: null, error: null };
+  let pet;
+  try {
+    pet = JSON.parse(fs.readFileSync(path.join(dir, "pet.json"), "utf8"));
+  } catch (e) {
+    return e && e.code === "ENOENT" ? { abs: null, pet: null, missing: true } : { abs: null, pet: null, error: "pet.json を読めません" };
+  }
+  if (!pet || typeof pet !== "object" || Array.isArray(pet)) return { abs: null, pet: null, error: "pet.json がオブジェクトではありません" };
+  if (pet.spriteVersionNumber !== 2) return { abs: null, pet, error: "spriteVersionNumber が 2 ではありません" };
+  if (!isSafeSpriteName(pet.spritesheetPath)) return { abs: null, pet, error: "spritesheetPath が不正です" };
+  return { abs: path.join(dir, pet.spritesheetPath), pet, error: null };
+}
+
+function avatarManifest() {
+  let format = null;
+  let formatError = null;
+  try {
+    format = JSON.parse(fs.readFileSync(path.join(AVATAR_DIR, "v2-format.json"), "utf8"));
+    formatError = validateV2Format(format);
+    if (formatError) format = null;
+  } catch (e) {
+    format = null;
+    formatError = e && e.code === "ENOENT" ? null : "v2-format.json を読めません";
+  }
+  const agents = {};
+  for (const agent of AGENTS) {
+    const sp = avatarAsset(agent, "sprite");
+    if (sp.missing) {
+      agents[agent] = null;
+      continue;
+    }
+    const pet = sp.pet || {};
+    const spInfo = sp.abs ? avatarFileInfo(sp.abs) : null;
+    const stillInfo = avatarFileInfo(avatarAsset(agent, "still").abs);
+    agents[agent] = {
+      id: typeof pet.id === "string" ? pet.id : agent,
+      displayName: typeof pet.displayName === "string" ? pet.displayName : null,
+      description: typeof pet.description === "string" ? pet.description : null,
+      spriteVersionNumber: pet.spriteVersionNumber ?? null,
+      sprite: spInfo ? { url: avatarUrl(agent, "sprite", spInfo), sha256: spInfo.sha256, bytes: spInfo.size } : null,
+      still: stillInfo ? { url: avatarUrl(agent, "still", stillInfo), sha256: stillInfo.sha256, bytes: stillInfo.size } : null,
+      error: sp.error || (sp.abs && !spInfo ? "スプライトシートがありません" : null),
+    };
+  }
+  return { version: 1, format, formatError, agents };
+}
+
+function etagMatches(req, etag) {
+  const h = req.headers["if-none-match"];
+  if (!h) return false;
+  return h.split(",").map((s) => s.trim().replace(/^W\//, "")).some((t) => t === etag || t === "*");
+}
+
+function serveAvatarManifest(req, res) {
+  const body = JSON.stringify(avatarManifest());
+  const headers = { "Cache-Control": "no-cache", ETag: '"' + sha256Hex(body).slice(0, 32) + '"' };
+  if (etagMatches(req, headers.ETag)) {
+    res.writeHead(304, headers);
+    res.end();
+    return;
+  }
+  res.writeHead(200, { ...headers, "Content-Type": "application/json; charset=utf-8" });
+  res.end(body);
+}
+
+// 同じ URL に別の内容を返さない（RFC 8246）。hash が古ければ 404 で現在の URL を知らせる
+function serveAvatarImage(req, res, pathname) {
+  const m = /^\/api\/avatars\/([a-z]+)\/(sprite|still)\.([0-9a-f]{16})\.webp$/.exec(pathname);
+  if (!m || !AGENTS.includes(m[1])) return json(res, 404, { error: "not found" });
+  const [, agent, which, hash] = m;
+  const asset = avatarAsset(agent, which);
+  const info = asset.abs ? avatarFileInfo(asset.abs) : null;
+  if (!info) return json(res, 404, { error: "not found" });
+  if (info.sha256.slice(0, 16) !== hash) {
+    res.writeHead(404, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ error: "stale", current: avatarUrl(agent, which, info) }));
+    return;
+  }
+  const headers = { "Cache-Control": "public, max-age=31536000, immutable", ETag: '"' + hash + '"' };
+  if (etagMatches(req, headers.ETag)) {
+    res.writeHead(304, headers);
+    res.end();
+    return;
+  }
+  res.writeHead(200, { ...headers, "Content-Type": "image/webp", "Content-Length": info.size });
+  fs.createReadStream(asset.abs).pipe(res);
+}
+
 // ---- static ----
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -3697,6 +3907,6 @@ saveState();
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`U2A2A Orchestration: http://127.0.0.1:${PORT}`);
-  logEvent("system", "サーバー起動（schemaVersion 9）", "info");
+  logEvent("system", "サーバー起動（schemaVersion 10）", "info");
   if (state.agents.grok) checkGrokAuth().catch((e) => logEvent("cli", "Grok の認証確認に失敗: " + (e.message || e), "warn"));
 });

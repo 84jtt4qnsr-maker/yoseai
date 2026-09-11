@@ -605,6 +605,151 @@ export function isGrokUnauthedError(text) {
   return /not signed in|unauthenticated|please (log|sign) ?in/i.test(String(text || ""));
 }
 
+// ---- エージェント状態の正規化（仕様: SPEC-アバター状態.md。純関数のみ、I/O は server 側）----
+export const AGENT_PHASES = ["idle", "working", "reviewing", "waiting", "halted", "failed", "off"];
+// 同一トピック・同一エージェントの複数実行から表示に出す順（§3.3）
+export const RUN_KIND_ORDER = ["thread", "fix", "review", "summary"];
+export const OUTCOME_REASONS = ["stopped-unknown", "error", "project-blocked", "history"];
+const RUN_PHASE = { thread: "working", fix: "working", review: "reviewing", summary: "working" };
+
+// トピック横断の状態（§2）。off > halted(budget) > waiting(unauthed) > idle。authed === null（確認中）は idle
+export function agentGlobalState(agent, budgetHalt) {
+  const a = agent || {};
+  if (a.auto === false) return { phase: "off", reason: "auto-off", since: null };
+  if (budgetHalt) return { phase: "halted", reason: "budget", since: budgetHalt.ts || null };
+  if (a.authed === false) return { phase: "waiting", reason: "unauthed", since: a.authCheckedTs || null };
+  return { phase: "idle", reason: null, since: null };
+}
+
+// kind の優先 → 開始の古い順 → runId（§3.3）
+export function compareRuns(x, y) {
+  const rank = (k) => {
+    const i = RUN_KIND_ORDER.indexOf(k);
+    return i < 0 ? RUN_KIND_ORDER.length : i;
+  };
+  return rank(x.kind) - rank(y.kind) || (x.since || 0) - (y.since || 0) || String(x.runId).localeCompare(String(y.runId));
+}
+
+// 終了状態の遷移（§4.4）。ev.type: completed | stopped | failed | cancelled | ack。戻り値 null は「保持しない」
+// summary は記録も解除もしない。キャンセルは残す（中断は問題が直ったことを意味しない）
+export function nextOutcome(prev, ev) {
+  const p = prev || null;
+  const e = ev || {};
+  if (e.type === "ack") return null;
+  if (e.kind === "summary") return p;
+  if (e.type === "completed") return null;
+  if (e.type === "stopped" || e.type === "failed") {
+    const stopped = e.type === "stopped";
+    return {
+      id: e.id || null,
+      kind: e.kind || null,
+      phase: stopped ? "halted" : "failed",
+      reason: stopped ? "stopped-unknown" : OUTCOME_REASONS.includes(e.reason) && e.reason !== "stopped-unknown" ? e.reason : "error",
+      ts: e.ts || null,
+      runId: e.runId || null,
+      itemId: e.itemId || null,
+      messageId: e.messageId || null,
+      detail: String(e.detail || "").slice(0, 200),
+    };
+  }
+  return p;
+}
+
+// 保存値の検査（§4.5）。対応エージェントで phase が failed / halted のものだけ残す
+export function sanitizeOutcomes(store, agentIds) {
+  const out = {};
+  if (!store || typeof store !== "object" || Array.isArray(store)) return out;
+  for (const a of agentIds) {
+    const o = store[a];
+    if (o && typeof o === "object" && (o.phase === "failed" || o.phase === "halted")) out[a] = o;
+  }
+  return out;
+}
+
+// agentState 本体（§1）。入力は変更しない
+export function deriveAgentState({ agentIds, agents, budgetHalt, runs, topics, pool, unattributedOutcomes }) {
+  const topicIds = new Set((topics || []).map((t) => t.id));
+  const itemById = new Map((pool || []).map((p) => [p.id, p]));
+  const result = {};
+  for (const agent of agentIds || []) {
+    const global = agentGlobalState((agents || {})[agent], budgetHalt);
+    const myRuns = (runs || [])
+      .filter((r) => r.agent === agent)
+      .map((r) => {
+        const viaItem = r.kind === "review" || r.kind === "fix";
+        const item = viaItem ? itemById.get(r.itemId) : null;
+        return {
+          runId: r.runId,
+          kind: r.kind,
+          phase: RUN_PHASE[r.kind] || "working",
+          topicId: viaItem ? (item && item.topicId) || null : r.topicId || null,
+          itemId: r.itemId || null,
+          since: r.startedAt || null,
+        };
+      })
+      .sort(compareRuns);
+    const outcomes = [];
+    for (const t of topics || []) {
+      const o = t.agentOutcomes && t.agentOutcomes[agent];
+      if (o) outcomes.push({ ...o, topicId: t.id });
+    }
+    const un = unattributedOutcomes && unattributedOutcomes[agent];
+    if (un) outcomes.push({ ...un, topicId: null });
+    outcomes.sort((x, y) => (y.ts || 0) - (x.ts || 0) || String(x.id).localeCompare(String(y.id)));
+    const byTopic = {};
+    for (const tid of new Set([...myRuns.map((r) => r.topicId), ...outcomes.map((o) => o.topicId)])) {
+      if (!tid || !topicIds.has(tid)) continue; // 帰属なし・削除済みトピックはどのトピックにも出さない
+      const tr = myRuns.filter((r) => r.topicId === tid);
+      const o = outcomes.find((x) => x.topicId === tid) || null;
+      const outcomeId = o ? o.id || null : null;
+      if (tr.length) {
+        byTopic[tid] = { phase: tr[0].phase, kind: tr[0].kind, reason: null, since: tr[0].since, source: "run", runId: tr[0].runId, runCount: tr.length, outcomeId };
+      } else if (global.phase !== "idle") {
+        byTopic[tid] = { ...global, kind: null, source: "global", runId: null, runCount: 0, outcomeId };
+      } else {
+        byTopic[tid] = { phase: o.phase, kind: o.kind, reason: o.reason, since: o.ts || null, source: "outcome", runId: o.runId || null, runCount: 0, outcomeId };
+      }
+    }
+    result[agent] = { global, runs: myRuns, outcomes, byTopic };
+  }
+  return { version: 1, agents: result };
+}
+
+// 視線方向（0°=上・時計回り）→ look 行のセル（§8）
+export function lookCell(deg) {
+  const d = Number(deg);
+  if (!Number.isFinite(d)) return null;
+  const i = ((Math.round(d / 22.5) % 16) + 16) % 16;
+  return { row: i < 8 ? 9 : 10, col: i % 8 };
+}
+
+// pet.json の spritesheetPath は同じフォルダの basename.webp だけ許す（§7.1）
+export function isSafeSpriteName(name) {
+  return typeof name === "string" && /^[A-Za-z0-9_-]+\.webp$/.test(name);
+}
+
+// v2-format.json の検査。問題なければ null、あれば理由
+export function validateV2Format(fmt) {
+  if (!fmt || typeof fmt !== "object" || Array.isArray(fmt)) return "オブジェクトではありません";
+  if (fmt.spriteVersionNumber !== 2) return "spriteVersionNumber が 2 ではありません";
+  const a = fmt.atlas || {};
+  for (const k of ["width", "height", "columns", "rows", "cellWidth", "cellHeight"]) {
+    if (!Number.isInteger(a[k]) || a[k] <= 0) return `atlas.${k} が正の整数ではありません`;
+  }
+  if (a.width !== a.columns * a.cellWidth || a.height !== a.rows * a.cellHeight) return "atlas の寸法とセル数が一致しません";
+  if (!Array.isArray(fmt.animations) || !fmt.animations.length) return "animations がありません";
+  for (const an of fmt.animations) {
+    if (!an || typeof an.name !== "string" || !Number.isInteger(an.row) || an.row < 0 || an.row >= a.rows) return "animations の row / name が不正です";
+    if (!Number.isInteger(an.frames) || an.frames < 1 || an.frames > a.columns) return `${an.name}: frames が不正です`;
+    if (!Array.isArray(an.durationsMs) || an.durationsMs.length !== an.frames || an.durationsMs.some((v) => !(Number.isFinite(v) && v > 0))) {
+      return `${an.name}: durationsMs が frames と一致しません`;
+    }
+  }
+  const l = fmt.look;
+  if (l && (!Array.isArray(l.rows) || l.rows.some((r) => !Number.isInteger(r) || r < 0 || r >= a.rows))) return "look.rows が不正です";
+  return null;
+}
+
 // フロービューのグラフ導出（仕様: SPEC-フロービュー.md）。本体は public/flow-graph.js（ブラウザも同じファイルを読む）。ここはテスト用の再 export
 export * from "./public/flow-graph.js";
 

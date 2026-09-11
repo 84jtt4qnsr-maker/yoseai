@@ -521,7 +521,8 @@ const messagesBoxes=new Map();
 for(const agent of ['claude','codex','grok']){const col=make('section',{class:'thread-col','data-agent':agent});const box=make('div',{class:'messages',id:'messages-'+agent});col.appendChild(box);col.appendChild(make('span',{id:'count-'+agent}));main.appendChild(col);messagesBoxes.set(agent,box);}
 const timers=[];let now=1000;const raf=[];let currentId=fixture.topicId,poolRenders=0,threadRebuilds=0;
 const events=new Map();const win={Usage,addEventListener:(name,fn)=>events.set(name,fn),dispatchEvent:e=>events.get(e.type)?.(e)};
-const context=vm.createContext({console,Map,Set,JSON,Math,Error,Element,Date:{now:()=>now},state:fixture,window:win,document:{body,getElementById:id=>body.querySelector('#'+id),querySelector:s=>body.querySelector(s),querySelectorAll:s=>body.querySelectorAll(s),createElementNS:(_,tag)=>make(tag)},
+const U2AAvatarStub={badge:(a)=>{const n=make('span',{class:'role-dot'});n.dataset={agent:a};return n;},Controller:class{constructor(){this.context=null;}update(c){this.context=c;}measure(){}paint(){}setVisible(){}}};
+const context=vm.createContext({console,U2AAvatar:U2AAvatarStub,Map,Set,JSON,Math,Error,Element,Date:{now:()=>now},state:fixture,window:win,document:{body,getElementById:id=>body.querySelector('#'+id),querySelector:s=>body.querySelector(s),querySelectorAll:s=>body.querySelectorAll(s),createElementNS:(_,tag)=>make(tag),createTextNode:text=>make('span',{text:String(text)})},
  el:make,$:s=>body.querySelector(s),NAMES:{claude:'Claude Code',codex:'Codex',grok:'Grok',user:'ユーザー'},STATUS_LABEL:{queued:'キュー'},STOP_LABELS:{agreed:'合意成立'},
  currentTopic:()=>fixture.topics.find(t=>t.id===currentId),participantsOf:t=>(t||fixture.topics.find(t=>t.id===currentId))?.participants||['claude','codex'],agentIds:()=>['claude','codex','grok'],
  columnTopic:fixture.topicId,foldedColumns:new Map(),narrowColumnLayout:{matches:false},

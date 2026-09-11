@@ -911,6 +911,8 @@
     background-size: 28px 28px;
   }
   #flow-zoom { margin-left: auto; display: inline-flex; gap: 4px; align-items: center; }
+  .pet-mode-setting { display: none; } /* ペット表示設定はフロー表示時のみ */
+  body.flow-view .pet-mode-setting { display: inline-flex; align-items: center; gap: 4px; }
   #flow-zoom-reset { min-width: 52px; font-variant-numeric: tabular-nums; }
   #flow-links { position: absolute; top: 0; left: 0; pointer-events: none; overflow: hidden; z-index: 0; }
   .flow-edge { fill: none; stroke: var(--dim); stroke-width: 1.5; opacity: .65; }
@@ -966,6 +968,22 @@
   @media (prefers-reduced-motion: reduce) {
     .flow-card[data-glow="run"] { animation: none; box-shadow: inset 0 0 0 1px var(--user); }
   }
+
+  .agent-avatar { display:inline-flex; position:relative; width:22px; height:22px; flex:none; align-items:center; justify-content:center; vertical-align:middle; border:2px solid var(--avatar-color); border-radius:50%; color:var(--text); background:var(--panel); font:600 12px/1 sans-serif; overflow:hidden; text-decoration:none; }
+  .agent-avatar-face { width:28px; height:28px; }
+  .agent-avatar-face img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; object-position:center 30%; }
+  .agent-avatar:focus-visible,.flow-pet:focus-visible { outline:2px solid var(--text); outline-offset:2px; }
+  .flow-card-toggle > .agent-avatar { margin-right:6px; }
+  .avatar-setting { display:inline-flex; align-items:center; gap:4px; white-space:nowrap; font-size:12px; }
+  .avatar-setting select { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:4px; }
+  .avatar-band { height:64px; position:relative; min-width:0; overflow:hidden; background:var(--panel-2); }
+  .flow-pet { position:absolute; top:4px; width:51.7px; height:56px; border-radius:10px; outline:2px solid var(--avatar-color); outline-offset:-2px; background:var(--panel-2); overflow:hidden; contain:layout paint; }
+  .pet-still,.pet-frame { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  .pet-sprite { display:block; position:absolute; width:192px; height:208px; transform-origin:0 0; background-size:1536px 2288px; background-repeat:no-repeat; }
+  .pet-sprite[hidden],.pet-still[hidden],.pet-fallback[hidden] { display:none; }
+  .pet-fallback { position:absolute; left:calc(50% - 11px); top:calc(50% - 11px); }
+  .pet-off { opacity:.5; }
+
 </style>
 </head>
 <body>
@@ -1249,6 +1267,7 @@
 
 <div id="toast"></div>
 
+<script src="/avatars.js"></script>
 <script>
 const NAMES = Object.assign(Object.create(null), { user: "ユーザー" });
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
@@ -2121,7 +2140,7 @@ function syncParticipantChoice() {
 
 function createThreadColumn(agent) {
   const head = el("div", { class: "thread-head" }, [
-    el("span", { class: "role-dot" }), el("span", { class: "agent-title", text: NAMES[agent] + " 側スレッド" }),
+    AV.badge(agent, true), el("span", { class: "agent-title", text: NAMES[agent] + " 側スレッド" }),
     el("input", { class: "model-chip", id: "model-" + agent, list: "models-" + agent, "aria-label": NAMES[agent] + " のモデル", title: "使用モデル（空欄=CLI既定）" }),
     el("datalist", { id: "models-" + agent }), el("span", { class: "count", id: "count-" + agent }),
     el("span", { class: "agent-status", id: "status-" + agent }),
@@ -2131,7 +2150,7 @@ function createThreadColumn(agent) {
     el("button", { class: "small fold-column", text: "折りたたむ", onclick: () => toggleColumn(agent) }),
   ]);
   const rail = el("button", { class: "thread-rail", hidden: "", onclick: () => toggleColumn(agent) }, [
-    el("span", { class: "role-dot" }), el("span", { class: "rail-name", text: NAMES[agent] }), el("span", { class: "rail-unread" }),
+    AV.badge(agent), el("span", { class: "rail-name", text: NAMES[agent] }), el("span", { class: "rail-unread" }),
   ]);
   const messages = el("div", { class: "messages", id: "messages-" + agent });
   messages.addEventListener("scroll", scheduleLinks, { passive: true });
@@ -2876,6 +2895,18 @@ const flowViewControls = el("div", { id: "view-controls", role: "group", "aria-l
   el("span", { id: "flow-load-note", role: "status" }),
 ]);
 
+// avatars.js が読めない環境でもアプリ本体は生かす（列は既存の role-dot が識別を担う）
+const AV = typeof U2AAvatar !== "undefined" && U2AAvatar ? U2AAvatar : { badge: () => el("span", { class: "role-dot" }), Controller: null };
+const flowAvatars = AV.Controller ? new AV.Controller({ zone: $("#flow-zone"), controls: flowViewControls, changed: () => render() }) : { update() {}, setVisible() {}, paint() {}, applyZoom() {} };
+function updateFlowAvatars() {
+  const topic = currentTopic(), relay = topic?.relay;
+  const order = relay?.participants || [];
+  const lookAgent = relay?.active && order.length ? order[(relay.turn || 0) % order.length] : null;
+  flowAvatars.update({ view: displayedView, topicId: topic?.id, graph: flowGraph,
+    messages: (state.messages || []).filter(m => !isRelayCopy(m)), agentState: state.agentState, cards: flowCards,
+    resolve: (key) => key ? flowNodeKey(key) : null, participants: topic ? participantsOf(topic) : [], lookAgent, zoom: flowZoom });
+}
+
 function renderViewControls() {
   // 単独のトピックバー再描画（リネーム）でも、操作要素を付け直す。
   $("#topic-bar").appendChild(flowViewControls);
@@ -3116,7 +3147,7 @@ function updateFlowCard(card, node, saved, origin) {
   const parts = card._flowParts;
   const label = flowKindLabels[node.kind] || node.kind;
   const agent = node.agent ? (NAMES[node.agent] || node.agent) + " · " : "";
-  parts.toggle.textContent = agent + label + (preview ? " — " + preview : "");
+  parts.toggle.replaceChildren(...(node.agent ? [AV.badge(node.agent)] : []), document.createTextNode(agent + label + (preview ? " — " + preview : "")));
   parts.toggle.setAttribute("aria-expanded", String(expanded));
   parts.toggle.onclick = () => {
     if (node.kind === "artifact") return openFlowArtifact(node);
@@ -3276,6 +3307,7 @@ function renderFlow(graph, userAction = false, restoring = false) {
   reconcileFlowChildren($("#flow-episodes"), sections);
   $("#flow-empty").textContent = filtering ? "条件に一致するカードはありません。絞り込みを解除するとすべて表示できます。" : "まだ発言がありません";
   $("#flow-empty").hidden = visibleKeys.size > 0;
+  updateFlowAvatars();
   const warnings = $("#flow-warnings");
   warnings.hidden = !(graph.warnings || []).length;
   warnings.querySelector("summary").textContent = "一部の参照を確認できません（" + (graph.warnings || []).length + "件）";
@@ -3332,6 +3364,7 @@ let flowZoom = 1;
 function applyFlowZoom(next) {
   flowZoom = Math.min(1.5, Math.max(0.5, Math.round(next * 10) / 10));
   $("#flow-canvas").style.zoom = flowZoom;
+  if (flowAvatars.context) { flowAvatars.context.zoom = flowZoom; flowAvatars.measure?.(); flowAvatars.paint?.(); }
   $("#flow-zoom-reset").textContent = Math.round(flowZoom * 100) + "%";
   requestAnimationFrame(drawFlowLinks); // レイアウトが変わるので接続線を引き直す
 }
@@ -3433,6 +3466,7 @@ function render() {
   }
   if (nextView !== "flow") { $("#flow-new").hidden = true; flowJump = null; }
   else if (flowJump && flowJump.topicId !== topicId) flowJump = null;
+  updateFlowAvatars();
   syncSendTargets();
   renderAuthControls();
   syncAgentAction();
@@ -4335,6 +4369,7 @@ function applyThreadGlow(agent, a, ta) {
 function messageEl(m, { onChange, onOpenColumn }) {
   const agent = m.thread;
   const meta = el("div", { class: "meta" }, [
+    ...(agentIds().includes(m.author) ? [AV.badge(m.author, true)] : []),
     el("span", { class: "who", text: NAMES[m.author] }),
     el("span", { text: fmtTime(m.ts) }),
   ]);

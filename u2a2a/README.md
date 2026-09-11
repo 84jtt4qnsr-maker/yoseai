@@ -289,6 +289,22 @@ Claude／GrokのCLI中断（cancelledかつbilling.mode=unknown）の仮の0は�
 - `u2a2a/data/state.json` に自動保存（git 管理外）。
 - 複数ウィンドウで開いても SSE でライブ同期。
 
+## エージェント状態とアバター配信（仕様: SPEC-アバター状態.md）
+
+UI（アバター・列ヘッダ）が読む状態をサーバで 1 本に正規化する。UI は `runs`・`budgetHalt`・プール status・`auto`・`authed` を再解釈しない。
+
+- `publicState().agentState`（SSE）と `GET /api/agent-state`。表示は `agents[a].byTopic[topicId] ?? global`
+- phase は `idle / working / reviewing / waiting / halted / failed / off` の 7 値
+- `global`: `off`（auto OFF）> `halted`（上限停止）> `waiting`（Grok 未認証）> `idle`。`authed: null`（確認中）は idle
+- `byTopic`: 実行 > global の非 idle > 終了状態。同一トピックの複数実行は `thread > fix > review > summary`、同 kind は古い順
+- 終了状態（`topic.agentOutcomes[agent]`／帰属なしは `state.unattributedOutcomes`、schemaVersion 10）:
+  理由不明の停止は `halted/stopped-unknown`、失敗は `failed/error|project-blocked|history`。
+  正常完了・`POST /api/agent-state/ack` で消える。キャンセル・summary・再起動では変わらない。過去データからは復元しない
+- `GET /api/avatars`（`no-cache`＋ETag）が `pool/avatars/<agent>/pet.json` と `v2-format.json` をまとめ、
+  画像は `/api/avatars/<agent>/(sprite|still).<sha256先頭16桁>.webp`（`immutable`）。古い hash は 404 で現在の URL を返す
+- 資産の生成・検証: `python3 u2a2a/tools/avatar-assets.py`（Pillow。アトラスの各行のコマ数を定義と突き合わせてから
+  `pool/avatars/v2-format.json` と `still-r0c0.webp` を書く。`--check` は検証のみ）
+
 ## 質疑リレーの履歴（仕様: SPEC-relayHistory.md）
 
 `topic.relay` は現在の 1 本しか持たないため、次の質疑が始まると前のリレーの結末が消える。

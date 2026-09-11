@@ -218,7 +218,7 @@ test("移行と起動: 旧トピックは 2 名、grok の定義と認証判定�
   assert.equal(s.agents.grok.authed, true);
   assert.deepEqual(Object.keys(s.agentDefs), ["claude", "codex", "grok"]);
   assert.equal(s.agentDefs.grok.name, "Grok");
-  assert.equal(s.schemaVersion, 9); // schemaVersion 9: topic.relayHistory（仕様: SPEC-relayHistory.md） // schemaVersion 8: topic.summaryState（仕様: SPEC-要約鮮度.md）
+  assert.equal(s.schemaVersion, 10); // schemaVersion 10: agentOutcomes（仕様: SPEC-アバター状態.md） // schemaVersion 9: topic.relayHistory（仕様: SPEC-relayHistory.md） // schemaVersion 8: topic.summaryState（仕様: SPEC-要約鮮度.md）
   const models = (await api("GET", "/api/models")).body;
   assert.ok(models.grok.includes("grok-4.6-build"));
 });

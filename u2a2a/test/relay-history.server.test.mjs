@@ -253,12 +253,12 @@ test("5. 移行: 過去の配送コピーから復元し、停止理由は不明
   assert.equal((await getState()).schemaVersion, undefined ?? (await getState()).schemaVersion); // 参照のみ
 });
 
-test("6. 保存ファイルの schemaVersion が 9 になる", async () => {
+test("6. 保存ファイルの schemaVersion が 10 になる（relayHistory は 9 で導入）", async () => {
   await api("POST", "/api/messages", { author: "user", thread: "claude", text: "保存を起こす", topicId });
   const saved = await waitFor(() => {
     const j = readSaved();
-    return j.schemaVersion === 9 ? j : null;
-  }, "schemaVersion 9");
+    return j.schemaVersion === 10 ? j : null;
+  }, "schemaVersion 10");
   const t = saved.topics.find((x) => x.id === topicId);
   assert.ok(Array.isArray(t.relayHistory));
   for (const rec of t.relayHistory) {

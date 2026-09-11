@@ -313,8 +313,8 @@ test("12. schemaVersion 7 の state を読むと summaryState が補われ、run
   await api("POST", "/api/messages", { author: "user", thread: "claude", text: "移行後の発言", topicId });
   const saved = await waitFor(() => {
     const j = JSON.parse(fs.readFileSync(file, "utf8"));
-    return j.schemaVersion === 9 ? j : null;
-  }, "schemaVersion 9 が保存される");
+    return j.schemaVersion === 10 ? j : null;
+  }, "schemaVersion 10 が保存される");
   assert.ok(saved.topics.every((t) => t.summaryState && t.summaryState.phase !== "running"));
 });
 
