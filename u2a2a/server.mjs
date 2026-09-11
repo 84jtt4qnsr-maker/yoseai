@@ -518,7 +518,7 @@ function buildThreadMirror(t, msgs) {
   return (
     fm +
     `# ${t.title}\n\n` +
-    `（U2A2A スレッド履歴 — 自動生成ミラー。編集しても会話には反映されません）\n\n` +
+    `（U2A2A スレッド履歴 — 自動生成ミラー。スレッドID: \`${t.id}\`。編集しても会話には反映されません）\n\n` +
     summarySec + artifactSec + taskSec +
     `## 💬 履歴\n\n` + history
   );
@@ -527,15 +527,31 @@ function buildThreadMirror(t, msgs) {
 function writeThreadMirrors() {
   fs.mkdirSync(POOL_THREADS, { recursive: true });
   const valid = new Set();
+  const index = [];
   for (const t of state.topics) {
     const rel = threadMirrorName(t);
     valid.add(rel);
     t.mirrorFile = rel;
     const msgs = state.messages.filter((m) => m.topicId === t.id);
+    const updated = msgs.length ? msgs[msgs.length - 1].ts : t.ts;
+    index.push(
+      `- \`${t.id}\` — ${t.title} → \`u2a2a/pool/${rel}\`` +
+        `（参加者: ${(t.participants || LEGACY_AGENTS).join("・")}／${msgs.length} 件／更新 ${new Date(updated).toLocaleString("ja-JP")}）`
+    );
     const body = buildThreadMirror(t, msgs);
     if (mirrorCache[rel] === body) continue;
     fs.writeFileSync(path.join(POOL_DIR, rel), body);
     mirrorCache[rel] = body;
+  }
+  // スレッドID → ミラーファイルの対応表。タイトル改名でファイル名が変わっても ID から辿れる
+  const indexRel = "threads/INDEX.md";
+  valid.add(indexRel);
+  const indexBody =
+    `# スレッド索引\n\n（U2A2A 自動生成 — スレッドIDからミラーファイルを引く対応表。編集しても反映されません）\n\n` +
+    index.join("\n") + "\n";
+  if (mirrorCache[indexRel] !== indexBody) {
+    fs.writeFileSync(path.join(POOL_DIR, indexRel), indexBody);
+    mirrorCache[indexRel] = indexBody;
   }
   // 改名・削除で不要になった古いミラーは片付ける
   for (const f of fs.readdirSync(POOL_THREADS)) {
@@ -764,7 +780,7 @@ const DEFAULT_RULES = `# U2A2A 共通ルール
 - パスは常に \`u2a2a/pool/\` 起点で書く（本文に書けばアプリがインライン表示する）
 - 成果物はトピック別フォルダ \`u2a2a/pool/topics/<topicId>/\` に保存する
 - 中間生成物・一時ファイルは \`.work/\` サブフォルダへ（一覧に表示されない）
-- 他スレッドの経緯は \`u2a2a/pool/threads/\` のミラーで参照できる
+- 他スレッドの経緯は \`u2a2a/pool/threads/\` のミラーで参照できる（スレッドID→ファイルの対応表は \`u2a2a/pool/threads/INDEX.md\`）
 
 ## 成果物の提出
 
