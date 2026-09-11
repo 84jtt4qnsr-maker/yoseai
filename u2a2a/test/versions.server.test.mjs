@@ -327,11 +327,14 @@ test("7. 再起動後: manifest から履歴が復元される", async () => {
 });
 
 test("10. 対象外（バイナリ・256 KiB 超）: unsupportedReason を返し、修正は従来の .trash バックアップで動く", async () => {
+  const { createHash } = await import("node:crypto");
+  const binSha = createHash("sha256").update(fs.readFileSync(path.join(poolDir, "bin.dat"))).digest("hex");
   const vb = await api("GET", "/api/pool/" + binItemId + "/versions");
   assert.equal(vb.status, 200);
-  assert.deepEqual(vb.body, { versions: [], unsupportedReason: "binary" });
+  // バイナリは版管理対象外でも実ファイルは読めるので currentSha は返す。サイズ超過は読まないので null
+  assert.deepEqual(vb.body, { versions: [], unsupportedReason: "binary", currentSha: binSha });
   const vl = await api("GET", "/api/pool/" + bigItemId + "/versions");
-  assert.deepEqual(vl.body, { versions: [], unsupportedReason: "too-large" });
+  assert.deepEqual(vl.body, { versions: [], unsupportedReason: "too-large", currentSha: null });
   writeCtl({ codex: { text: "done" }, claude: { text: "【判定】承認" } });
   assert.equal((await api("POST", "/api/pool/" + binItemId + "/fix", { agent: "codex" })).status, 202);
   const it = await waitFor(async () => {
@@ -673,4 +676,25 @@ test("8. 削除後: 版ディレクトリは残り、versions / diff API が引�
   assert.equal(d.status, 200);
   assert.equal(d.body.to.id, last.id);
   assert.equal((await api("GET", "/api/pool/nonexistent/versions")).status, 404);
+});
+
+test("19. versions API の currentSha: 実ファイルと一致し、変更で変わり、読めない対象と削除済みは null", async () => {
+  const { createHash } = await import("node:crypto");
+  const sha = (buf) => createHash("sha256").update(buf).digest("hex");
+  // 現在の実ファイルの sha を返す（レビュー記録の sha256 と描画時に比較する材料。合意メモ-成果物検証 §4）
+  const v1 = await api("GET", "/api/pool/" + binItemId + "/versions");
+  assert.equal(v1.status, 200);
+  assert.equal(v1.body.currentSha, sha(fs.readFileSync(path.join(poolDir, "bin.dat"))));
+  fs.writeFileSync(path.join(poolDir, "bin.dat"), "changed after review\n");
+  const v2 = await api("GET", "/api/pool/" + binItemId + "/versions");
+  assert.equal(v2.body.currentSha, sha(Buffer.from("changed after review\n")));
+  assert.notEqual(v2.body.currentSha, v1.body.currentSha);
+  // 読めない対象（サイズ超過）は null = 比較不能。一致として扱わない側に倒す
+  const big = await api("GET", "/api/pool/" + bigItemId + "/versions");
+  assert.equal(big.status, 200);
+  assert.equal(big.body.currentSha, null);
+  // テスト 8 で削除済みのアイテムも null（版一覧は引き続き返る）
+  const gone = await api("GET", "/api/pool/" + itemId + "/versions");
+  assert.equal(gone.status, 200);
+  assert.equal(gone.body.currentSha, null);
 });

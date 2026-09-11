@@ -3563,6 +3563,7 @@ function poolHistoryState(p) {
     unsupportedReason: p.versionsUnsupported !== undefined ? p.versionsUnsupported : previous?.unsupportedReason,
     selectedToId: previous ? previous.selectedToId : null,
     diff: previous ? previous.diff : null,
+    currentSha: previous ? previous.currentSha : undefined, // undefined = 未取得。null = ファイルなし・読めない
   };
   // ファイル実体のない旧形式はサーバに聞くまでもなく対象外（選択のたびの往復を省く）
   if (!p.file) {
@@ -3575,6 +3576,7 @@ function poolHistoryState(p) {
       if (!Array.isArray(data.versions)) throw new Error("履歴の応答形式を確認してください");
       history.versions = [...data.versions].sort((a, b) => a.n - b.n);
       history.unsupportedReason = data.unsupportedReason;
+      history.currentSha = data.currentSha ?? null;
     })
     .catch((e) => { history.error = e.message; })
     .finally(() => {
@@ -4152,6 +4154,12 @@ function renderPoolDetail(box, p) {
       if (r.stale) rHead.appendChild(el("span", {
         class: "history-warning", text: "⚠ レビュー中に変更あり",
         title: "レビュー開始時と終了時でファイル内容が異なります。この判定は現在の内容を保証しません。",
+      }));
+      // レビュー終了後の変更（合意メモ-成果物検証 §4）。記録済み sha256 と現在の実ファイルを描画のたびに比較する。
+      // currentSha が null（ファイルなし・読めない）のときも「一致」とはみなさず表示する
+      if (r.sha256 && history.currentSha !== undefined && history.currentSha !== r.sha256) rHead.appendChild(el("span", {
+        class: "history-warning", text: "⚠ レビュー対象から変更あり",
+        title: "レビューした版と現在の内容が異なります。このレビューの判定は現行版を保証しません。",
       }));
       if (r.meta) rHead.appendChild(metaEl(r.meta));
       const reviewKids = [rHead];

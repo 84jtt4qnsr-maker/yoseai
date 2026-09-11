@@ -3520,7 +3520,9 @@ async function handleApi(req, res, url) {
         logEvent("versions", `実ファイルを読めません（${item.file}）: ` + (e.message || e), "warn");
       }
     }
-    return json(res, 200, { versions, unsupportedReason });
+    // currentSha: 現在の実ファイルの sha256（不存在・読めない場合は null）。
+    // レビュー記録の sha256 と描画のたびに比べ、レビュー終了後の変更を表示するために返す（合意メモ-成果物検証 §4）
+    return json(res, 200, { versions, unsupportedReason, currentSha: item ? currentSha(item) : null });
   }
 
   // 指定版間の unified diff（from 省略時は to の直前の版。256 KiB 超は truncated）
