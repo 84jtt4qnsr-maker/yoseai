@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>U2A2A Orchestration</title>
+<title>Yoseai</title>
 <style>
   :root {
     --bg: #0e1116;
@@ -1045,8 +1045,8 @@
 </head>
 <body>
 <header>
-  <h1>U2A2A Orchestration</h1>
-  <span class="sub">ユーザー ⇄ 参加エージェント ／ やり取りから生まれたタスクを各アプリで作業し、結果を再入力する</span>
+  <h1>Yoseai</h1>
+  <span class="sub">よせあい ／ ユーザー ⇄ 参加エージェント ／ やり取りから生まれたタスクを各アプリで作業し、結果を再入力する</span>
   <button id="budget-btn" class="small" style="margin-left:auto" title="実行の上限設定（コスト・回数・時間）">⚙ 上限</button>
   <button type="button" id="usage-btn" class="small" title="発言・レビュー・修正・要約の使用量内訳">📊 使用量</button>
   <button id="projects-btn" class="small">📁 プロジェクト</button>
@@ -4640,9 +4640,9 @@ function renderThread(agent, savedAtBottom) {
 
 function taskPrompt(t) {
   return [
-    "【U2A2A タスク】" + t.title,
+    "【Yoseai タスク】" + t.title,
     t.detail ? "\n" + t.detail : "",
-    "\n\n完了したら結果テキストを U2A2A アプリのタスク「" + t.title + "」に再入力してください。",
+    "\n\n完了したら結果テキストを Yoseai のタスク「" + t.title + "」に再入力してください。",
   ].join("");
 }
 

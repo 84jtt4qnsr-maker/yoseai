@@ -1,6 +1,8 @@
-# U2A2A Orchestration
+# Yoseai
 
-Canvas「U2A2A app イメージ」を実装したローカルアプリ。
+人とエージェントが話し合い、決めて、作って、突き合わせる場。
+
+旧称 U2A2A Orchestration。Canvas「U2A2A app イメージ」を実装したローカルアプリ。
 ユーザー ⇄ Claude Code ⇄ Codex ⇄ Grok のテキストオーケストレーション＋タスクキュー（参加者はトピックごとに選ぶ）。
 
 ## 起動

@@ -1,4 +1,4 @@
-// U2A2A — フロービューのグラフ導出（仕様: pool/topics/9a299f1bac1a09fb/SPEC-フロービュー.md）
+// Yoseai — フロービューのグラフ導出（仕様: pool/topics/9a299f1bac1a09fb/SPEC-フロービュー.md）
 // ブラウザ（index.html の <script type="module">）と Node（lib.mjs から再 export、test/flow.test.mjs）が同じファイルを読む。
 // import なし・DOM / fs / タイマー不使用。入力は変更しない（Object.freeze された配列でも動く）。
 // 例外は投げず、壊れた要素は warnings[] に残して読み飛ばす。同じ入力からは同じ出力（ts 昇順、同 ts は id 昇順）。

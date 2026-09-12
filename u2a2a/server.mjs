@@ -1,4 +1,4 @@
-// U2A2A Orchestration — zero-dependency local server
+// Yoseai — zero-dependency local server
 // User <-> Claude Code <-> Codex message hub + task queue.
 // State persists to data/state.json; clients sync over SSE.
 // Agent auto-reply: spawns `claude -p` / `codex exec` CLIs (read-only) when available.
@@ -220,11 +220,11 @@ function fatalStateLoad(reason) {
   try {
     const backup = STATE_FILE + ".broken-" + Date.now();
     fs.copyFileSync(STATE_FILE, backup);
-    console.error("[U2A2A] 原本をコピー退避しました:", backup);
+    console.error("[Yoseai] 原本をコピー退避しました:", backup);
   } catch {
     // 退避できなくても原本はそのまま残る
   }
-  console.error("[U2A2A] state.json を読み込めないため、履歴保護のため起動を中止します:", reason);
+  console.error("[Yoseai] state.json を読み込めないため、履歴保護のため起動を中止します:", reason);
   process.exit(1);
 }
 
@@ -539,7 +539,7 @@ function buildThreadMirror(t, msgs) {
   return (
     fm +
     `# ${t.title}\n\n` +
-    `（U2A2A スレッド履歴 — 自動生成ミラー。スレッドID: \`${t.id}\`。編集しても会話には反映されません）\n\n` +
+    `（Yoseai スレッド履歴 — 自動生成ミラー。スレッドID: \`${t.id}\`。編集しても会話には反映されません）\n\n` +
     summarySec + artifactSec + taskSec +
     `## 💬 履歴\n\n` + history
   );
@@ -568,7 +568,7 @@ function writeThreadMirrors() {
   const indexRel = "threads/INDEX.md";
   valid.add(indexRel);
   const indexBody =
-    `# スレッド索引\n\n（U2A2A 自動生成 — スレッドIDからミラーファイルを引く対応表。編集しても反映されません）\n\n` +
+    `# スレッド索引\n\n（Yoseai 自動生成 — スレッドIDからミラーファイルを引く対応表。編集しても反映されません）\n\n` +
     index.join("\n") + "\n";
   if (mirrorCache[indexRel] !== indexBody) {
     fs.writeFileSync(path.join(POOL_DIR, indexRel), indexBody);
@@ -789,9 +789,9 @@ function readBody(req, limit = 1_000_000) {
 // アプリ専用の CLAUDE.md × AGENTS.md。DAS 内に住むのでユーザーはプールから閲覧・編集でき、
 // エージェントはパスで参照できる。CLI のネイティブ読み込みには依存せず、サーバが全プロンプト経路へ注入する
 const RULES_FILE = path.join(POOL_DIR, "U2A2A_RULES.md");
-const DEFAULT_RULES = `# U2A2A 共通ルール
+const DEFAULT_RULES = `# Yoseai 共通ルール
 
-このファイルは U2A2A オーケストレーションの全エージェント（Claude Code / Codex / Grok）に、
+このファイルは Yoseai の全エージェント（Claude Code / Codex / Grok）に、
 通常応答・レビュー・修正のすべての実行で自動的に読み込まれます。編集すれば次の実行から反映されます。
 
 ## 役割（実行種別ごと）
@@ -827,7 +827,7 @@ function commonRulesBlock(kind) {
       rulesCache = { mtime: st.mtimeMs, text: fs.readFileSync(RULES_FILE, "utf8").slice(0, 4000) };
     }
     return (
-      `\n\n--- U2A2A 共通ルール（u2a2a/pool/U2A2A_RULES.md／実行種別: ${kind}）---\n` +
+      `\n\n--- Yoseai 共通ルール（u2a2a/pool/U2A2A_RULES.md／実行種別: ${kind}）---\n` +
       rulesCache.text +
       `\n--- 共通ルールここまで ---`
     );
@@ -1200,7 +1200,7 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo 
   const backlogNote = extra.dropped ? `（これ以前の未読 ${extra.dropped} 件は${mirrorRefText}を参照）\n\n` : "";
   const participantList = participants.map((a) => NAMES[a] + (a === agent ? "（あなた）" : "")).join("・");
   const preamble = isFirst
-    ? `あなたは「U2A2Aオーケストレーション」アプリの ${NAMES[agent]} 側スレッドの担当エージェントです。` +
+    ? `あなたは「Yoseai」アプリの ${NAMES[agent]} 側スレッドの担当エージェントです。` +
       `このスレッドのトピックは「${topic.title}」です。` +
       `参加者はユーザー・${participantList} です。` +
       workNote +
@@ -2192,7 +2192,7 @@ function buildReviewPrompt(item, reviewer, history = null, pc = null, offline = 
       (history.verdicts ? `\n前回までの判定: ${history.verdicts}` : "");
   }
   return (
-    `あなたは「U2A2Aオーケストレーション」の共有タスクプール（u2a2a/pool/ = アプリ専用の成果物置き場）のレビュアー（${NAMES[reviewer]}）です。` +
+    `あなたは「Yoseai」の共有タスクプール（u2a2a/pool/ = アプリ専用の成果物置き場）のレビュアー（${NAMES[reviewer]}）です。` +
     `以下の成果物を、${targetPhrase(pc)}の実態と照らして、忖度なく具体的にレビューしてください。\n` +
     targetLine(pc) +
     `- 問題点・リスク・改善案を挙げる\n` +
@@ -2329,7 +2329,7 @@ function buildFixPrompt(item, agent, pc = null, offline = false) {
   // Claude は cwd=リポジトリルート（書き込み規則 Edit(u2a2a/pool/**) が効く配置）、Codex は cwd=pool
   const fileRef = agent !== "codex" ? `u2a2a/pool/${item.file}（リポジトリルートからの相対パス）` : `${item.file}（カレントディレクトリ＝ u2a2a/pool）`;
   return (
-    `あなたは U2A2A 共有タスクプールの成果物を修正する担当（${NAMES[agent]}）です。` +
+    `あなたは Yoseai の共有タスクプールの成果物を修正する担当（${NAMES[agent]}）です。` +
     `成果物ファイル ${fileRef} を、以下のレビューを踏まえて修正し、` +
     `**同じファイル名で上書き保存**してください。新しいファイルは作らないこと。` +
     `照合先は${targetPhrase(pc)}。\n` +
@@ -2529,7 +2529,7 @@ async function runSummary(topic, msgs, trigger) {
       .map((m) => `[${NAMES[m.author]}→${NAMES[m.thread]}側] ${m.text.slice(0, 500)}`)
       .join("\n\n");
     const prompt =
-      `以下は「U2A2Aオーケストレーション」のスレッド「${topic.title}」の会話です。` +
+      `以下は「Yoseai」のスレッド「${topic.title}」の会話です。` +
       `対象プロジェクトは「${nowLabel}」です。` +
       (topic.summaryText ? `\n\n--- 前回までの要約${carriedSummary ? `（対象「${projectLabel(prevOrigin)}」の時点のもの）` : ""} ---\n${topic.summaryText}\n` : "") +
       (carriedConv ? `\n（この会話には、分岐で引き継いだ対象「${projectLabel(inheritedOrigin)}」の時点の内容が含まれます）\n` : "") +
@@ -5036,7 +5036,7 @@ try {
 saveState();
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`U2A2A Orchestration: http://127.0.0.1:${PORT}`);
+  console.log(`Yoseai: http://127.0.0.1:${PORT}`);
   logEvent("system", "サーバー起動（schemaVersion 10）", "info");
   if (state.agents.grok) checkGrokAuth().catch((e) => logEvent("cli", "Grok の認証確認に失敗: " + (e.message || e), "warn"));
 });

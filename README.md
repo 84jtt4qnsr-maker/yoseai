@@ -1,4 +1,6 @@
-# U2A2A Orchestration
+# Yoseai
+
+A place where people and agents talk, decide, make things, and check them together.
 
 A local, zero-dependency app that puts you and several coding-agent CLIs — **Claude Code**, **Codex**,
 and **Grok** — into one conversation, with a shared artifact pool, a task queue, and a decision tray.
