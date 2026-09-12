@@ -525,6 +525,7 @@ const U2AAvatarStub={badge:(a)=>{const n=make('span',{class:'role-dot'});n.datas
 const context=vm.createContext({console,U2AAvatar:U2AAvatarStub,Map,Set,JSON,Math,Error,Element,Date:{now:()=>now},state:fixture,window:win,document:{body,getElementById:id=>body.querySelector('#'+id),querySelector:s=>body.querySelector(s),querySelectorAll:s=>body.querySelectorAll(s),createElementNS:(_,tag)=>make(tag),createTextNode:text=>make('span',{text:String(text)})},
  el:make,$:s=>body.querySelector(s),NAMES:{claude:'Claude Code',codex:'Codex',grok:'Grok',user:'ユーザー'},STATUS_LABEL:{queued:'キュー'},STOP_LABELS:{agreed:'合意成立'},
  currentTopic:()=>fixture.topics.find(t=>t.id===currentId),participantsOf:t=>(t||fixture.topics.find(t=>t.id===currentId))?.participants||['claude','codex'],agentIds:()=>['claude','codex','grok'],
+ U2AOnboarding:{NOTICE:'',authLabel:()=>'',emptyState:()=>make('div'),guide:()=>make('span')},showAgentInput(){},agentReady:()=>true,authLabel:()=>'',NAMES:{claude:'Claude Code',codex:'Codex',grok:'Grok'},
  columnTopic:fixture.topicId,foldedColumns:new Map(),narrowColumnLayout:{matches:false},
  requestAnimationFrame:fn=>{raf.push(fn);return raf.length;},cancelAnimationFrame:()=>{},setTimeout:fn=>{timers.push(fn);return timers.length;},clearTimeout(){},
  ensureTopic(){},syncAgentDefinitions(){},ensureAgentColumns(){context.columnTopic=currentId;for(const col of main.querySelectorAll(".thread-col"))col.classList.toggle("is-folded",!!context.foldedColumns.get(currentId)?.has(col.dataset.agent));},syncSendTargets(){},renderAuthControls(){},syncAgentAction(){},syncPoolReviewers(){},renderTopicBar(){body.querySelector('#topic-bar').replaceChildren();},renderProjectUI(){},renderTasks(){},renderAgentStatus(){},renderQaBar(){},renderBudgetBar(){},renderUsage(){},renderHealth(){},renderPool(){poolRenders++;},scheduleLinks(){},
@@ -534,7 +535,7 @@ const context=vm.createContext({console,U2AAvatar:U2AAvatarStub,Map,Set,JSON,Mat
  switchTopic:id=>{currentId=id;context.render();},
 });
 function extract(name){const match=source.match(new RegExp('^function '+name+'\\([^]*?^}', 'm'));assert.ok(match,name);return match[0];}
-vm.runInContext(['messageEl','renderThread','captureThreadBottoms','restoreThreadBottoms','metaText','fmtTok','fmtElapsed','metaEl','taskEl','threadActivity'].map(extract).join('\n'),context);
+vm.runInContext(['messageEl','renderThread','captureThreadBottoms','restoreThreadBottoms','metaText','fmtTok','fmtElapsed','metaEl','taskEl','threadActivity','manualEmpty'].map(extract).join('\n'),context);
 const originalRenderThread=context.renderThread;context.renderThread=(...args)=>{threadRebuilds++;return originalRenderThread(...args);};
 vm.runInContext(source.slice(source.indexOf('const viewModes ='),source.indexOf('// ---- render ----'))+'\n'+extract('render'),context);
 const run=s=>vm.runInContext(s,context);const flush=()=>{const jobs=raf.splice(0);jobs.forEach(fn=>fn());};

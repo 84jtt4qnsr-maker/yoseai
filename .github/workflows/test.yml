@@ -1,0 +1,39 @@
+name: test
+
+# クリーンチェックアウトで u2a2a のテストを通す。
+# 依存パッケージは無いので package-lock.json も無く、npm ci は使えない（npm install を使う）。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      # 依存は無いが、package.json が壊れていればここで落ちる
+      - name: Install
+        working-directory: u2a2a
+        run: npm install --no-audit --no-fund
+
+      # サーバ統合テストが基点コミットの確認に git を使うので、コミットできる設定を入れておく
+      - name: Configure git for tests
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+
+      - name: Test
+        working-directory: u2a2a
+        run: npm test
