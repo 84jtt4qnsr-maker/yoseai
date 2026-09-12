@@ -386,6 +386,9 @@ function loadState() {
         // 要約の出所（要約生成時の対象）。未記録なら「現在の対象で作られた要約」とみなす
         if (t.summaryProjectId === undefined) t.summaryProjectId = t.summaryText ? t.projectId : null;
       }
+      // 移行はここまでで完了している。メモリ上の版も現行へ揃える
+      // （persistState 任せだと初回保存までの間、API が旧版を返す。CI で実測）
+      parsed.schemaVersion = 11;
       return parsed;
     }
   } catch (e) {
