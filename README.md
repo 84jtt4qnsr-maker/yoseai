@@ -8,7 +8,7 @@ and **Grok** — into one conversation, with a shared artifact pool, a task queu
 > **The interface is in Japanese.** This README is the only English document; an English UI is not part
 > of the first release. If you cannot read Japanese, the screen will be hard to use.
 
-> **Repository:** `TODO — fill in the public URL before publishing.`
+> **Repository:** <https://github.com/84jtt4qnsr-maker/yoseai>
 
 ---
 
