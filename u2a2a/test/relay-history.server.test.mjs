@@ -114,6 +114,8 @@ before(async () => {
   ctlFile = path.join(tmp, "ctl.json");
   writeCtl({});
   await startServer();
+  // 新規環境の既定は自動応答 OFF。このファイルは質疑リレーを駆動するので、ここで明示的に ON にする
+  for (const a of ["claude", "codex"]) await api("PATCH", "/api/agents/" + a, { auto: true });
   topicId = (await getState()).topics[0].id;
 });
 

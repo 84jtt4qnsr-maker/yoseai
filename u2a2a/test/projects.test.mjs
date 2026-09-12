@@ -108,10 +108,10 @@ test("projectDigest: 直下エントリ（.git / node_modules 除外・50 件ま
 });
 
 test("projectPromptLine: ok / not-git / unavailable の文言", () => {
-  const pj = { name: "kometa", path: "/x/kometa" };
+  const pj = { name: "sample", path: "/x/sample" };
   assert.equal(
     projectPromptLine(pj, { status: "ok", branch: "main", head: "abc1234", dirty: 2 }),
-    "対象プロジェクトは「kometa」（/x/kometa、閲覧のみ・変更不可）。Git: main@abc1234、未コミット変更 2 件。"
+    "対象プロジェクトは「sample」（/x/sample、閲覧のみ・変更不可）。Git: main@abc1234、未コミット変更 2 件。"
   );
   assert.match(projectPromptLine(pj, { status: "not-git" }), /Git 管理外のフォルダ。$/);
   assert.match(projectPromptLine(pj, { status: "unavailable", note: "確認不可: タイムアウト（3秒）" }), /Git 情報は確認不可: タイムアウト（3秒）。$/);
@@ -123,7 +123,7 @@ test("PROJECT_README_MAX_BYTES: 4,000 文字ぶんの UTF-8 最大長（読み�
 });
 
 test("summaryOriginNote: 要約の出所が現在の対象と違うときだけ注記する", () => {
-  const label = (pid) => (pid ? "P:" + pid : "Kometa リポジトリ");
+  const label = (pid) => (pid ? "P:" + pid : "アプリのリポジトリ（既定）");
   // 要約なし → なし
   assert.equal(summaryOriginNote({ summaryText: "", summaryProjectId: "a", projectId: "b" }, label), "");
   // 同じ対象（null 同士・id 同士・undefined は null 扱い）→ なし
@@ -135,6 +135,6 @@ test("summaryOriginNote: 要約の出所が現在の対象と違うときだけ�
     summaryOriginNote({ summaryText: "s", summaryProjectId: "a", projectId: "b" }, label),
     "（注意: 以下の要約は対象「P:a」の時点のものです。現在の対象は「P:b」です）\n"
   );
-  assert.match(summaryOriginNote({ summaryText: "s", summaryProjectId: "a", projectId: null }, label), /現在の対象は「Kometa リポジトリ」/);
-  assert.match(summaryOriginNote({ summaryText: "s", summaryProjectId: null, projectId: "b" }, label), /対象「Kometa リポジトリ」の時点/);
+  assert.match(summaryOriginNote({ summaryText: "s", summaryProjectId: "a", projectId: null }, label), /現在の対象は「アプリのリポジトリ（既定）」/);
+  assert.match(summaryOriginNote({ summaryText: "s", summaryProjectId: null, projectId: "b" }, label), /対象「アプリのリポジトリ（既定）」の時点/);
 });

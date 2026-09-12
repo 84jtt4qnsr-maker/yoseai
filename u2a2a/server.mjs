@@ -92,8 +92,10 @@ const MAX_BACKLOG = 10;
 
 // エージェントのグローバル設定（トピック横断）
 function defaultAgent(agentId = "claude") {
+  // auto: 新しい環境は OFF から始める（最初の発言で CLI が走って課金されないように。ON は画面から選ぶ）。
+  //   既存の state.json は loadState の移行で保存値を維持する（ここの既定値は新規作成時だけ効く）
   // authed: grok のみ判定する（null = 確認中）。claude / codex は従来どおり true 扱い
-  return { auto: true, lastError: "", model: "", modelOverride: "", authed: agentId === "grok" ? null : true, authCheckedTs: 0 };
+  return { auto: false, lastError: "", model: "", modelOverride: "", authed: agentId === "grok" ? null : true, authCheckedTs: 0 };
 }
 
 // 参加・宛先として選べるか（自動応答 ON かつ認証済み）
@@ -162,7 +164,7 @@ function defaultTopic(title, participants = LEGACY_AGENTS) {
     relay: defaultRelay(),
     participants: list.length ? list : LEGACY_AGENTS.slice(), // 順序付き。作成時に固定
     agents: Object.fromEntries((list.length ? list : LEGACY_AGENTS).map((a) => [a, topicAgent()])),
-    projectId: null, // 対象プロジェクト（null = 未紐付け = Kometa リポジトリ）
+    projectId: null, // 対象プロジェクト（null = 未紐付け = アプリのリポジトリ）
     projectLocked: false, // 初回実行で立つ。以後は対象を変更できない（仕様: 実行後の変更は新規トピック）
     summaryState: defaultSummaryState(),
     summaryUsage: [],
@@ -248,10 +250,13 @@ function loadState() {
         for (const t of parsed.tasks) t.topicId = t.topicId || main.id;
       }
       for (const a of AGENTS) {
+        // キー無し（後から増えたエージェント）と、キーはあるが auto が無い（旧形式）を区別する。
+        // 旧形式は従来どおり ON で復元し、保存済みの boolean はそのまま維持する（全件 OFF へ倒す移行はしない）
+        const hasKey = Object.prototype.hasOwnProperty.call(parsed.agents, a);
         const old = parsed.agents[a] || {};
         parsed.agents[a] = {
           ...defaultAgent(a),
-          auto: old.auto !== false,
+          auto: hasKey ? (typeof old.auto === "boolean" ? old.auto : true) : false,
           lastError: "",
           model: old.model || "",
           modelOverride: old.modelOverride || "",
@@ -717,9 +722,13 @@ function actEnd(key) {
   broadcast();
 }
 
+// 未紐付け（projectId = null）のときの既定対象。画面の詳細欄がフォルダ名と絶対パスを出せるように渡す
+// （合意: 表示名は「アプリのリポジトリ（既定）」で固定し、実体は詳細で示す）。起動中は変わらないので定数
+const REPO_ROOT_INFO = { name: path.basename(REPO_ROOT), path: REPO_ROOT };
+
 function publicState() {
   // running / reviewPending / fixPending は互換用の派生値。正は runs レジストリ
-  return { ...state, agentDefs: AGENT_DEFS, running, reviewPending, fixPending, activity, poolDirs, runs: publicRuns(), agentState: agentStateNow(), events, storageMetrics };
+  return { ...state, agentDefs: AGENT_DEFS, running, reviewPending, fixPending, activity, poolDirs, repoRoot: REPO_ROOT_INFO, runs: publicRuns(), agentState: agentStateNow(), events, storageMetrics };
 }
 
 function broadcast() {
@@ -820,8 +829,8 @@ function commonRulesBlock(kind) {
 
 const PROJECT_PROBE_TIMEOUT_MS = 3000;
 const findProject = (pid) => (pid ? state.projects.find((p) => p.id === pid) || null : null);
-// 対象の表示名（null = Kometa リポジトリ、解決できない id = 登録解除済み）
-const projectLabel = (pid) => (pid ? (findProject(pid) || { name: "(登録解除済み)" }).name : "Kometa リポジトリ");
+// 対象の表示名（null = このアプリのリポジトリ、解決できない id = 登録解除済み）
+const projectLabel = (pid) => (pid ? (findProject(pid) || { name: "(登録解除済み)" }).name : "アプリのリポジトリ（既定）");
 // トピックの対象プロジェクト id（成果物登録時に写す）
 const projectIdOfTopic = (tid) => {
   const t = tid ? findTopic(tid) : null;
@@ -984,7 +993,7 @@ function claudeToolArgs(project) {
 // ---- ファイル変更スナップショット（合意事項: レビュアーの根拠が黙って失効しないように）----
 // 前回プロンプト生成時点のファイル状態（mtime/size）を (topic, agent) ごとに保存し、
 // 次回プロンプトに「変更・追加・削除されたパス」を一行添える。対象は固定リストで有界
-// poolOnly: 紐付けありトピック用。Kometa 側（server.mjs / public / runtime / ルートの .md）は走査せず、
+// poolOnly: 紐付けありトピック用。アプリのリポジトリ側（server.mjs / public / runtime / ルートの .md）は走査せず、
 // プール内（共通ルールとこのトピックの成果物）だけを見る（対象プロジェクト側の変化は probe で注記する）
 function takeFileSnapshot(topicId, { poolOnly = false } = {}) {
   const snap = {};
@@ -1135,12 +1144,12 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo 
   const project = projectInfo && projectInfo.project ? projectInfo.project : null;
   // 対象プロジェクトの 1 行（name・path・branch・HEAD・未コミット数、または確認不可）。probe は毎回取り直すので初回に限らず毎回添える
   const projectLine = project ? projectPromptLine(project, projectInfo.probe) : "";
-  // 作業範囲の説明: 紐付けありなら対象プロジェクト（閲覧のみ）、未紐付けは従来どおり Kometa リポジトリ
+  // 作業範囲の説明: 紐付けありなら対象プロジェクト（閲覧のみ）、未紐付けはこのアプリのリポジトリ
   const workNote = project
     ? (rootCwd ? "" : `作業ディレクトリは u2a2a/pool（成果物置き場・書き込み可）。`) + projectLine
     : rootCwd
-      ? `作業ディレクトリは Kometa リポジトリ（閲覧のみ、変更は不可）。` // 書き込み先（u2a2a/pool/ 配下のみ）は artifactNote で示す。文言は既存テストが照合している
-      : `作業ディレクトリは u2a2a/pool（成果物置き場・書き込み可）。Kometa リポジトリ本体（${REPO_ROOT}）は閲覧のみ。`;
+      ? `作業ディレクトリはアプリのリポジトリ（${REPO_ROOT}、閲覧のみ、変更は不可）。` // 書き込み先（u2a2a/pool/ 配下のみ）は artifactNote で示す。文言は既存テストが照合している
+      : `作業ディレクトリは u2a2a/pool（成果物置き場・書き込み可）。アプリのリポジトリ本体（${REPO_ROOT}）は閲覧のみ。`;
   const activeRelayId = topic.relay.active ? topic.relay.id : null;
   const lines = msgs
     .map((m) => {
@@ -2067,10 +2076,10 @@ function verdictFrom(text) {
   return m ? m[1] : "";
 }
 
-// 成果物の対象を表す文言（item.projectId があればそのプロジェクト、なければ従来の Kometa リポジトリ）。
+// 成果物の対象を表す文言（item.projectId があればそのプロジェクト、なければこのアプリのリポジトリ）。
 // Git 情報は文章を再解析して取り出さず（名前に「。」があると崩れる）、probe から整形した 1 行を targetLine で別に添える
 function targetPhrase(pc) {
-  if (!pc || !pc.project) return `Kometa リポジトリ（閲覧のみ可）`;
+  if (!pc || !pc.project) return `アプリのリポジトリ（閲覧のみ可）`;
   return `対象プロジェクト「${pc.project.name}」（${pc.project.path}、閲覧のみ可）`;
 }
 // 対象プロジェクトの現況 1 行（name・path・branch・HEAD・未コミット数／確認不可）＋改行。未紐付けなら空
@@ -2761,7 +2770,7 @@ async function agentLoop(topicId, agent) {
         triggerBudgetHalt(topicId, agent, overBudget);
         break;
       }
-      // 紐付けありでは Kometa 側は走査せず、プール内（このトピックの成果物・共通ルール）の変化と対象の未コミット変更を注記する
+      // 紐付けありではアプリのリポジトリ側は走査せず、プール内（このトピックの成果物・共通ルール）の変化と対象の未コミット変更を注記する
       const curSnapshot = takeFileSnapshot(topicId, { poolOnly: !!pc.project });
       const changesNote = fileChangeNote(ta.fileSnapshot, curSnapshot) + (pc.project ? projectChangeNote(pc.probe) : "");
       const projectInfo = pc.project ? { ...pc, digest: !ta.sessionId ? projectDigestFor(pc.project) : "" } : null;
@@ -3163,7 +3172,7 @@ async function handleApi(req, res, url) {
       return json(res, 200, { project });
     }
     if (req.method === "DELETE" && parts.length === 3) {
-      // 参照されている登録は削除できない（強制削除は設けない — 合意「Kometa へ自動で戻さない」）
+      // 参照されている登録は削除できない（強制削除は設けない — 合意「既定のリポジトリへ自動で戻さない」）
       const topics = state.topics.filter((t) => t.projectId === project.id).map((t) => t.id);
       const items = state.pool.filter((it) => it.projectId === project.id).map((it) => it.id);
       if (topics.length || items.length) return json(res, 409, { error: "トピックまたは成果物から参照されているため削除できません", topics, items });
@@ -4277,8 +4286,34 @@ function serveStatic(res, url) {
   });
 }
 
+// ---- 出所の検査（ローカル専用アプリの最低限の防御）----
+// Host: DNS リバインディング対策。GET も含めて全要求で見る。
+// Origin: CSRF 対策。GET / HEAD 以外で見る。enctype="text/plain" のフォームは
+//   プリフライト無しで本文全体を妥当な JSON にできるので、Content-Type や JSON.parse を防御の根拠にしない。
+// Origin 欠席（curl・テスト・他のローカルツール）は Host が正しければ通す。
+// "null"（file:// や sandbox の iframe）は拒否する。正規の画面は必ず http://127.0.0.1:<PORT> から開く。
+// 待ち受けは 127.0.0.1 だけ（末尾の listen）。localhost / [::1] を許可しているのはヘッダの綴りの話で、
+// 到達性は別問題 — localhost が ::1 に解決される環境では、この検査より前に TCP 接続が失敗する
+const ALLOWED_HOSTS = [`127.0.0.1:${PORT}`, `localhost:${PORT}`, `[::1]:${PORT}`];
+const ALLOWED_ORIGINS = ALLOWED_HOSTS.map((h) => "http://" + h);
+
+function checkRequestOrigin(req) {
+  if (!ALLOWED_HOSTS.includes(req.headers.host || "")) return "host";
+  const method = (req.method || "GET").toUpperCase();
+  if (method === "GET" || method === "HEAD") return null;
+  const origin = req.headers.origin;
+  if (origin === undefined) return null; // ブラウザ以外からの要求
+  return ALLOWED_ORIGINS.includes(origin) ? null : "origin";
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
+  // 本文を読む前に拒否する（読んでしまうと、拒否しても副作用の判断材料が増えるだけで意味がない）
+  const denied = checkRequestOrigin(req);
+  if (denied) {
+    logEvent("security", `ローカル以外からの要求を拒否しました（${denied}）: ${req.method} ${url.pathname}`, "warn");
+    return json(res, 403, { error: "このアプリはローカル（127.0.0.1 / localhost / [::1]）からのアクセスだけを受け付けます", code: "forbidden-origin", reason: denied });
+  }
   try {
     if (url.pathname.startsWith("/api/")) return await handleApi(req, res, url);
     return serveStatic(res, url);

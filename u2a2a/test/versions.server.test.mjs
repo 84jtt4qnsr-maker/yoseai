@@ -141,6 +141,8 @@ before(async () => {
   fs.writeFileSync(logFile, "");
   writeCtl({});
   await startServer();
+  // 新規環境の既定は自動応答 OFF。このファイルは修正後の自動再レビューを見るので、ここで明示的に ON にする
+  for (const a of ["claude", "codex"]) await api("PATCH", "/api/agents/" + a, { auto: true });
   const s = await getState();
   itemId = s.pool.find((p) => p.file === "art.md").id;
   binItemId = s.pool.find((p) => p.file === "bin.dat").id;

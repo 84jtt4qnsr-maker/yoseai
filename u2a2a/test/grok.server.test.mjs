@@ -200,6 +200,9 @@ before(async () => {
   fs.mkdirSync(logDir);
   writeCtl({});
   await startServer();
+  // claude / codex は移行元の state.json が ON。grok はキーが無いので新規扱い（既定 OFF）になる。
+  // このファイルは grok の自動応答を駆動するので、ここで明示的に ON にする
+  await api("PATCH", "/api/agents/grok", { auto: true });
   topicOld = (await getState()).topics[0].id;
 });
 

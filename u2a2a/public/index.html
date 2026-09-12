@@ -2488,7 +2488,14 @@ const projectNameDrafts = new Map();
 const projectMutating = new Set();
 
 const findProject = (id) => (state.projects || []).find((p) => p.id === id);
-const projectName = (id) => !id ? "Kometa（既定）" : findProject(id)?.name || "登録解除済み";
+const projectName = (id) => !id ? "アプリのリポジトリ（既定）" : findProject(id)?.name || "登録解除済み";
+// 詳細欄に出す実体。紐付けありは登録の絶対パス、未紐付けはサーバが渡す既定リポジトリの
+// 「フォルダ名 — 絶対パス」（表示名は固定なので、どのフォルダかは詳細でしか分からない）
+const projectPathText = (id) => {
+  if (id) return findProject(id)?.path || "";
+  const root = state.repoRoot;
+  return root?.path ? (root.name ? root.name + " — " + root.path : root.path) : "";
+};
 const projectUrl = (id) => "/api/projects/" + encodeURIComponent(id);
 
 const projectRequest = (url, method = "GET", body) => api(url, method, body, { silent: true });
@@ -2576,7 +2583,7 @@ function refreshProjectProbeViews() {
 function projectBadge(id) {
   return el("span", {
     class: "project-chip" + (id && !findProject(id) ? " project-unregistered" : ""),
-    text: "📁 " + projectName(id), title: findProject(id)?.path || (id ? "登録ID: " + id : "従来のKometaリポジトリ"),
+    text: "📁 " + projectName(id), title: projectPathText(id) || (id ? "登録ID: " + id : "このアプリ自身のリポジトリ（未紐付けの既定）"),
   });
 }
 
@@ -2586,7 +2593,8 @@ function projectRecheckButton(id) {
 
 function projectDetailsEl(id) {
   const box = el("div", { class: "project-details" }, [projectBadge(id)]);
-  if (findProject(id)) box.appendChild(el("div", { class: "project-path", text: findProject(id).path }));
+  const pathText = projectPathText(id);
+  if (pathText) box.appendChild(el("div", { class: "project-path", text: pathText }));
   box.appendChild(projectProbeEl(id));
   if (findProject(id)) box.appendChild(projectRecheckButton(id));
   return box;
@@ -2761,7 +2769,7 @@ function syncProjectChoice() {
   const key = JSON.stringify([(state.projects || []).map((p) => [p.id, p.name]), choice.selected]);
   if (choice.optionsKey !== key) {
     choice.optionsKey = key;
-    select.replaceChildren(el("option", { value: "", text: "Kometa（既定）" }));
+    select.replaceChildren(el("option", { value: "", text: "アプリのリポジトリ（既定）" }));
     for (const p of state.projects || []) select.appendChild(el("option", { value: p.id, text: p.name }));
     if (choice.selected && !findProject(choice.selected)) select.appendChild(el("option", { value: choice.selected, text: "登録解除済み（別の対象を選択してください）", disabled: "" }));
     select.value = choice.selected;
@@ -2780,7 +2788,8 @@ function syncProjectChoice() {
   $("#project-choice-note").textContent = note;
   const preview = $("#project-choice-preview");
   preview.replaceChildren();
-  if (findProject(choice.selected)) preview.appendChild(el("div", { class: "project-path", text: findProject(choice.selected).path }));
+  const previewPath = choice.selected && !findProject(choice.selected) ? "" : projectPathText(choice.selected);
+  if (previewPath) preview.appendChild(el("div", { class: "project-path", text: previewPath }));
   preview.appendChild(projectProbeEl(choice.selected));
   syncParticipantChoice();
 }

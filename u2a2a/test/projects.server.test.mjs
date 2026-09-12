@@ -319,7 +319,7 @@ test("4. プロンプト: 紐付けありの初回は対象・Git・概要が入
   assert.ok(call.prompt.includes("--- 対象プロジェクトの概要（初回のみ） ---"));
   assert.ok(call.prompt.includes("README.md, src/"));
   assert.ok(call.prompt.includes("# Ext Project"));
-  assert.ok(!call.prompt.includes("Kometa リポジトリ（閲覧のみ、変更は不可）"));
+  assert.ok(!call.prompt.includes("作業ディレクトリはアプリのリポジトリ（"));
   const i = call.argv.indexOf("--add-dir");
   assert.ok(i >= 0 && call.argv[i + 1] === fs.realpathSync(projDir), "--add-dir <path>: " + JSON.stringify(call.argv));
   assert.ok(call.argv.includes("Edit(u2a2a/pool/**)"));
@@ -345,7 +345,7 @@ test("4. プロンプト: 紐付けありの初回は対象・Git・概要が入
   clearCalls();
   await say(plain.body.id, "claude", "hi");
   call = cliCalls("claude")[0];
-  assert.ok(call.prompt.includes("作業ディレクトリは Kometa リポジトリ（閲覧のみ、変更は不可）"));
+  assert.ok(call.prompt.includes("作業ディレクトリはアプリのリポジトリ（") && call.prompt.includes("、閲覧のみ、変更は不可）"), call.prompt.slice(0, 400));
   assert.ok(!call.argv.includes("--add-dir"));
   // Codex 側: 対象パスを絶対パスで参照する文言
   clearCalls();
@@ -431,7 +431,7 @@ test("6. 成果物: 登録時に projectId が写り、レビュー・修正は�
   assert.equal((await api("POST", "/api/pool/" + pi.body.id + "/review", { reviewer: "claude" })).status, 202);
   await idle();
   call = cliCalls("claude")[0];
-  assert.ok(call.prompt.includes("Kometa リポジトリ（閲覧のみ可）の実態と照らして"));
+  assert.ok(call.prompt.includes("アプリのリポジトリ（閲覧のみ可）の実態と照らして"));
   assert.ok(!call.argv.includes("--add-dir"));
   // 紐付け先が消えたときのレビュー・修正は中止して理由を残す
   const moved = projDir + "-moved";
@@ -528,14 +528,14 @@ test("11. 要約の出所: 分岐後に対象を変えると初回プロンプ�
   await say(moved.id, "claude", "続き");
   call = cliCalls("claude")[0];
   assert.ok(call.prompt.includes("（注意: 以下の要約は対象「ext-project」の時点のものです。現在の対象は「plain」です）\n## 合意済み"), call.prompt.slice(0, 900));
-  // 分岐 API で未紐付け（null）を指定: 現在の対象は「Kometa リポジトリ」
+  // 分岐 API で未紐付け（null）を指定: 現在の対象は「アプリのリポジトリ（既定）」
   const toNull = (await api("POST", "/api/topics/" + topicA + "/branch", { messageId: first.id, projectId: null })).body;
   assert.equal(toNull.projectId, null);
   assert.equal(toNull.summaryProjectId, pid);
   clearCalls();
   await say(toNull.id, "claude", "続き");
   call = cliCalls("claude")[0];
-  assert.ok(call.prompt.includes("現在の対象は「Kometa リポジトリ」です"), call.prompt.slice(0, 900));
+  assert.ok(call.prompt.includes("現在の対象は「アプリのリポジトリ（既定）」です"), call.prompt.slice(0, 900));
   // 要約のない分岐元からの分岐: 出所も null
   const fromPlain = (await getState()).topics.find((t) => t.title === "従来");
   const pm = (await getState()).messages.find((m) => m.topicId === fromPlain.id);

@@ -317,14 +317,14 @@ export function projectPromptLine(project, probe) {
   return "対象プロジェクトは「" + project.name + "」（" + project.path + "、閲覧のみ・変更不可）。" + git + "。";
 }
 
-// 紐付けありトピックの変更通知（Kometa の監視リストは使わず、対象の未コミット変更を注記する）
+// 紐付けありトピックの変更通知（アプリのリポジトリ側の監視リストは使わず、対象の未コミット変更を注記する）
 export function projectChangeNote(probe) {
   if (!probe || probe.status !== "ok" || !probe.dirty) return "";
   const rest = probe.dirty - probe.dirtyPaths.length;
   return "\n\n（対象プロジェクトの未コミット変更: " + probe.dirtyPaths.join(", ") + (rest > 0 ? " 他 " + rest + " 件" : "") + "）";
 }
 
-// 要約・引き継ぎ履歴の出所注記。要約は生成時の対象（topic.summaryProjectId、null = Kometa）を持ち、分岐で要約と一緒に引き継がれる。
+// 要約・引き継ぎ履歴の出所注記。要約は生成時の対象（topic.summaryProjectId、null = アプリのリポジトリ）を持ち、分岐で要約と一緒に引き継がれる。
 // 分岐で持ち込んだ会話の出所は topic.carriedProjectId（undefined = 引き継ぎなし）に恒久記録され、再要約しても消えない。
 // 現在の対象（topic.projectId）と違う出所があるときだけ注記を返す。label は id → 表示名
 export function summaryOriginNote(topic, label) {

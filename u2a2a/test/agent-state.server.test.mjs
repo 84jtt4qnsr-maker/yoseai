@@ -174,6 +174,8 @@ before(async () => {
   ctlFile = path.join(tmp, "ctl.json");
   writeCtl({});
   await startServer();
+  // 新規環境の既定は自動応答 OFF。このファイルは自動応答の状態を見るので、ここで明示的に ON にする
+  for (const a of AGENT_IDS) await api("PATCH", "/api/agents/" + a, { auto: true });
   T1 = await newTopic("状態 A");
   T2 = await newTopic("状態 B");
 });
