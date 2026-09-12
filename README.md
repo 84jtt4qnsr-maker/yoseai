@@ -21,8 +21,9 @@ and **Grok** — into one conversation, with a shared artifact pool, a task queu
 - **Task queue.** Turn any message into a task, copy its prompt into an agent app, paste the result back.
 - **Decision tray.** Agents can put a multiple-choice question or a start-work proposal in front of you
   as buttons instead of prose. Approving a proposal registers the tasks it names.
-- **Artifact verification.** Patches delivered into the pool carry a manifest; the server records which
-  mandatory checks were declared and which were actually confirmed.
+- **Artifact verification.** A patch delivered as an `impl-*` folder **can** carry a `manifest.json`;
+  when it does, the server records which mandatory checks were declared and which were actually
+  confirmed. Ordinary files dropped into the pool have no manifest and are not verified.
 
 ## Requirements
 
@@ -90,18 +91,21 @@ from adding them with `-f`, and nothing redacts what you paste into a conversati
 
 ### What leaves your machine
 
-Nothing is sent anywhere until you turn an agent on. After that:
-
-- **Agent CLIs.** When an agent's auto-reply is ON, the app spawns that vendor's CLI and hands it the
-  recent messages of the topic, the thread summary, file-change notes, and (for linked projects) the
-  project's name, path, branch and README excerpt. The CLI sends that to its vendor. Which vendor
-  depends on which agents you enable: Anthropic, OpenAI, and/or xAI.
-- **Google Gemini.** Only if you use image generation (`u2a2a/tools/nanobanana.py`), the prompt goes to
-  the Gemini API with the key described above.
+- **At startup, if Grok is already logged in.** If `~/.grok/auth.json` exists, the server runs one short
+  `grok` probe to find out whether the login still works. That request reaches xAI **before you turn
+  anything on**, and it does not depend on any auto-reply setting. If you have never logged into Grok,
+  nothing happens.
+- **Agent CLIs, when their auto-reply is ON.** The app spawns that vendor's CLI and hands it the recent
+  messages of the topic, the thread summary, file-change notes, and (for linked projects) the project's
+  name, path, branch and README excerpt. The CLI sends that to its vendor — Anthropic, OpenAI and/or
+  xAI, depending on which agents you enable.
+- **Google Gemini, only when you generate an image.** `u2a2a/tools/nanobanana.py` sends the prompt to
+  the Gemini API with the key described above. This is independent of the auto-reply switches.
 - Nothing else phones home. There is no telemetry.
 
-Agent runs cost money. The app has spend and runtime caps (`GET/PATCH /api/budgets`) and stops all
-automatic activity when a cap is reached, but the caps are off until you set them.
+Agent runs cost money. The app has spend and runtime caps — set them with `PATCH /api/budgets`, read
+them back from `GET /api/state` — and it stops all automatic activity when a cap is reached. The caps
+are off until you set them.
 
 ### The first run is deliberately quiet
 
@@ -110,8 +114,11 @@ automatic activity when a cap is reached, but the caps are off until you set the
   An existing `u2a2a/data/state.json` keeps whatever you had set.
 - While every agent is still OFF, a new thread is created with **Claude Code and Codex** as its
   participants. Once you enable auto-reply, new threads default to the agents that are both enabled and
-  authenticated.
-- Agents can only write inside `u2a2a/pool/`. The repository itself is read-only to them.
+  authenticated. (Only Grok's login is actually checked; Claude Code and Codex are treated as
+  authenticated without verifying it.)
+- The write permission handed to each agent CLI points at `u2a2a/pool/` only, and the repository is
+  passed as read-only. **This is not a sandbox.** The agents are also allowed to run `python3`, so a
+  shell command can still reach outside the pool — the server does not stop it.
 
 ---
 
@@ -119,8 +126,8 @@ automatic activity when a cap is reached, but the caps are off until you set the
 
 | | Verified | Not verified |
 |---|---|---|
-| Node | **22.x**, in CI on `ubuntu-latest` (see `.github/workflows/test.yml`) | Any other major version. `engines` says `>=22` because that is the API floor, not because 23+ was tested |
-| OS | Development and manual testing on macOS; the test suite in CI on Ubuntu | Windows — not tried at all |
+| Node | 22.x on macOS, by hand | **CI has never run.** `.github/workflows/test.yml` exists but no run has gone green yet — the Node and OS it proves will be written here once one does. Other major versions are untested; `engines` says `>=22` because that is the API floor, not because 23+ was tried |
+| OS | Development and manual testing on macOS | Linux — only through the CI workflow, which has not run. Windows — not tried at all |
 | Agent CLIs | Exercised by hand against the versions the authors happened to have | **No CLI version is pinned or verified.** The tests use fake CLIs on `PATH`, so a green CI says nothing about a real `claude` / `codex` / `grok` |
 | Browsers | The UI is developed against current Chromium-based browsers | Firefox, Safari, older browsers |
 

@@ -15,6 +15,9 @@ export const TERMINAL_STATES = ["answered", "approved", "rejected", "superseded"
 export const ACTIVE_STATES = ["pending", "parked", "revision-requested"];
 export const BASIS_KINDS = ["relay", "memo"];
 export const REVISION_TARGETS = ["scope", "assignee", "approach", "other"];
+// 修正依頼の送り先（§9.4）。proposer = 提案者へ 1 回返す（既定）／rediscuss = 3 人で再検討を始める
+export const REVISION_MODES = ["proposer", "rediscuss"];
+export const REVISION_TARGET_LABELS = Object.freeze({ scope: "範囲", assignee: "担当", approach: "進め方", other: "その他" });
 export const SYSTEM_OPTIONS = ["__other", "__defer"];
 export const PLAN_SEND_STATES = ["waiting", "ready", "sent", "failed", "blocked"];
 // tray.mjs は server.mjs を import できない（循環）。既定値を持ち、呼び出し側は options で上書きする

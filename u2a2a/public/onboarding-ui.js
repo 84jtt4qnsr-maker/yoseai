@@ -27,13 +27,15 @@
     const buttons = node('div', '', 'onboarding-actions');
     for (const a of agents) {
       const b = node('button', (flow ? a.name + ' — ' : '') + '列で手動入力');
-      b.type = 'button'; b.disabled = !a.ready;
+      b.type = 'button'; b.className = 'small'; b.disabled = !a.ready;
       b.setAttribute('aria-label', a.name + 'の列で手動入力');
       b.addEventListener('click', () => { if (!b.disabled) onManual(a.id); });
       buttons.append(b);
       if (!a.ready) buttons.append(node('span', a.name + ': ' + a.auth, 'onboarding-note'));
     }
-    box.append(buttons, guide());
+    const help = node('a', 'CLIの案内', 'onboarding-help'); help.href='#cli-guide';
+    help.addEventListener('click', () => {const d=document.getElementById('cli-guide');if(d){d.open=true;d.querySelector('summary')?.focus();}});
+    box.append(buttons, help);
     return box;
   }
   root.U2AOnboarding = {NOTICE, authLabel, emptyState, guide};

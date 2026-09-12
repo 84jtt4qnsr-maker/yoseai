@@ -51,6 +51,41 @@
     });
     return `@keyframes u2pet-${name}{${stops.join('')}100%{background-position:0px ${-a.row*208}px}}`;
   }
+  // One probe per agent per page. A failed probe is sticky until reload, so
+  // repeated flow renders and pet recreation cannot issue more missing-image requests.
+  const portraitCache = new Map();
+  function loadPortrait(agent, ready) {
+    let entry = portraitCache.get(agent);
+    if (entry) {
+      if (entry.status === 'loading') entry.waiters.push(ready);
+      else ready(entry);
+      return;
+    }
+    entry = {status:'loading', image:null, waiters:[ready]};
+    portraitCache.set(agent, entry);
+    const img = new Image(); entry.image=img; img.alt='';
+    const settle = status => {
+      if (entry.status !== 'loading') return;
+      entry.status=status;
+      const waiters=entry.waiters; entry.waiters=[];
+      for (const notify of waiters) notify(entry);
+      if (status === 'failed') entry.image=null;
+    };
+    img.onload=()=>settle('loaded'); img.onerror=()=>settle('failed');
+    img.src=ART+encodeURIComponent(PORTRAITS[agent][0]);
+  }
+  function enablePortraitLink(node, agent) {
+    node.href=ART+encodeURIComponent(PORTRAITS[agent][1]);
+    node.target='_blank'; node.rel='noopener';
+  }
+  function petTitle(p) {
+    const phase=p.phase;
+    p.node.title=(DISPLAY[p.agent] || p.agent)+' · '+(REASON[phase.reason] || TITLE[phase.phase] || '待機')+
+      (phase.kind==='summary'?'（要約中）':'')+
+      (phase.outcomeId && phase.source!=='outcome'?' · 未確認の終了状態あり':'')+
+      (p.portraitLoaded?' — 自画像を見る':'');
+    p.node.setAttribute('aria-label',p.node.title);
+  }
   function badge(agent, portrait = false) {
     const node = document.createElement(portrait ? 'a' : 'span');
     node.className = 'agent-avatar ' + (portrait ? 'agent-avatar-face' : 'agent-avatar-letter');
@@ -58,17 +93,15 @@
     node.textContent = LETTER[agent] || String(agent || '?').slice(0,1);
     node.setAttribute('aria-label', DISPLAY[agent] || agent || 'エージェント');
     if (portrait && known(agent)) {
-      const url = ART + encodeURIComponent(PORTRAITS[agent][0]);
-      const img = new Image(); img.alt=''; img.loading='lazy'; img.hidden=true;
-      img.onload = () => {
-        img.hidden=false; node.href=ART+encodeURIComponent(PORTRAITS[agent][1]); node.target='_blank'; node.rel='noopener';
+      loadPortrait(agent, entry => {
+        if (entry.status !== 'loaded') {
+          node.setAttribute('aria-label',(DISPLAY[agent] || agent)+'（画像なし）');
+          return;
+        }
+        const img=entry.image.cloneNode(false); img.alt='';
+        node.append(img); enablePortraitLink(node,agent);
         node.title=(DISPLAY[agent] || agent)+' の自画像を見る'; node.setAttribute('aria-label',node.title);
-      };
-      img.onerror = () => {
-        img.remove(); node.removeAttribute('href'); node.removeAttribute('title');
-        node.setAttribute('aria-label',(DISPLAY[agent] || agent)+'（画像なし）');
-      };
-      node.append(img); img.src=url;
+      });
     }
     return node;
   }
@@ -257,11 +290,12 @@
     }
     create(agent) {
       const node=document.createElement('a');node.className='flow-pet';node.style.setProperty('--avatar-color',`var(--${agent})`);
-      node.href=ART+encodeURIComponent(PORTRAITS[agent][1]);node.target='_blank';node.rel='noopener';
       const fallback=badge(agent);fallback.classList.add('pet-fallback');
       const still=new Image();still.alt='';still.hidden=true;still.className='pet-still';still.onload=()=>{still.hidden=false;fallback.hidden=true;};still.onerror=()=>{still.hidden=true;fallback.hidden=false;this.refreshStale(still.src);};
       const frame=document.createElement('span');frame.className='pet-frame';const spriteNode=document.createElement('span');spriteNode.className='pet-sprite';spriteNode.hidden=true;frame.append(spriteNode);
       node.append(fallback,still,frame);const p={agent,node,still,spriteNode,fallback,x:0,sign:1,visible:false,phase:{phase:'idle'},limit:0,cell:null};
+      petTitle(p);
+      loadPortrait(agent, entry=>{p.portraitLoaded=entry.status==='loaded';if(p.portraitLoaded)enablePortraitLink(node,agent);petTitle(p);});
       p.node.dataset.agent=agent;p.idleMs=0;p.restMs=0;p.roaming=false;this.pets.set(agent,p);this.io.observe(node);this.setAsset(p);return p;
     }
     update(context) {
@@ -282,8 +316,7 @@
         const oldPhase=p.phase;
         p.phase=selectState(context.agentState?.version===1 ? context.agentState.agents?.[agent] : null,context.topicId);
         if(!isIdle(p.phase)||!isIdle(oldPhase)){p.idleMs=0;p.restMs=0;this.home(p);}
-        p.node.title=`${DISPLAY[agent] || agent} · ${REASON[p.phase.reason] || TITLE[p.phase.phase] || '待機'}${p.phase.kind==='summary'?'（要約中）':''}${p.phase.outcomeId && p.phase.source!=='outcome'?' · 未確認の終了状態あり':''} — 自画像を見る`;
-        p.node.setAttribute('aria-label',p.node.title);
+        petTitle(p);
       }
       // Remove abandoned bands before link geometry is measured.
       for(const band of this.zone.querySelectorAll('.avatar-band'))if(!assigned.has(band)){this.resize.unobserve(band);band.remove();}

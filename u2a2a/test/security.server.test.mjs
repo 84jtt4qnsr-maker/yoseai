@@ -157,6 +157,10 @@ test("2. 手動の貼り付けでは CLI が起動しない。ON にすると起
   // OFF 側は起動しないことの確認なので待つしかないが、固定の秒数ではなく実測の 5 倍（最低 2 秒）待つ。
   // こうすると、機械が遅くて起動が間に合わないだけの偽合格にならない
   assert.equal((await api("PATCH", "/api/agents/claude", { auto: true })).status, 200);
+  // ON にすると参加トピックの lastSeenTs が Date.now() まで進む（ON より前の発言を拾わないため）。
+  // 未読判定は m.ts > lastSeenTs の「より大きい」なので、同じミリ秒に投げた発言は既読扱いになり、
+  // 応答が始まらないまま待ち続ける。ミリ秒をまたいでから投げる
+  await sleep(10);
   const t0 = Date.now();
   await api("POST", "/api/messages", { author: "user", thread: "claude", text: "自動で応答する", topicId });
   await waitFor(async () => cliCalls().length > 0, "ON なら CLI が起動する");

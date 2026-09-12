@@ -1258,6 +1258,55 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo 
   return preamble + contextNote + digestNote + qaJoinNote + backlogNote + lines + qaNote + changesNote + artifactNote + grokShellNote + commonRulesBlock("通常応答");
 }
 
+// 質疑リレーを 1 本開始する。/api/qa/start と、判断トレイの「3 人で再検討」（契約-判断トレイAPI.md §9.4）で共用する。
+// check: true なら検査だけして状態を変えない（押す前に「始められるか」を確かめるため）。
+// 検査に落ちたときは { error } を返し、そのときも状態は変えない
+function openRelay(topic, { first, order, hops = 6, agenda = "", text = "", check = false }) {
+  // 進行中のリレーを上書きするかどうかは呼び出し側の判断（/api/qa/start は従来どおり上書きする）
+  const tparts = topic.participants || LEGACY_AGENTS;
+  if (state.budgetHalt) return { error: "上限停止中です（バナーから解除してください）" };
+  if (!order.includes(first)) return { error: "first は参加者に含めてください" };
+  const ordered = [first, ...order.filter((a) => a !== first)];
+  if (ordered.length < 2) return { error: "質疑には 2 名以上の参加者が必要です" };
+  const outsider = ordered.find((a) => !tparts.includes(a));
+  if (outsider) return { error: `${NAMES[outsider] || outsider} はこのトピックの参加者ではありません` };
+  const off = ordered.find((a) => !state.agents[a].auto);
+  if (off) return { error: `質疑モードには参加者全員の自動応答を ON にしてください（${NAMES[off]} が OFF）` };
+  if (ordered.includes("grok") && state.agents.grok.authed !== true) {
+    return { error: "Grok が未認証（または確認中）のため質疑を開始できません", reason: "unauthed", agent: "grok" };
+  }
+  if (check) return { ok: true, participants: ordered };
+  topic.relay = {
+    ...defaultRelay(),
+    active: true,
+    remaining: hops,
+    hopsDone: 0,
+    startMessageId: null,
+    agenda: String(agenda || "").trim().slice(0, 120),
+    id: "r_" + id(),
+    startedTs: Date.now(),
+    participants: ordered,
+    turn: 0,
+    seq: 0,
+    spoken: Object.fromEntries(ordered.map((a) => [a, 0])),
+    stopReason: null,
+  };
+  topic.qaCount = (topic.qaCount || 0) + 1;
+  topic.projectLocked = true; // 質疑の開始も実行の開始
+  const msg = {
+    id: id(),
+    topicId: topic.id,
+    thread: first,
+    author: "user",
+    text,
+    provenance: { ingress: "ui", delivery: "direct", trigger: "manual", source: null },
+    ts: Date.now(),
+  };
+  topic.relay.startMessageId = msg.id;
+  state.messages.push(msg);
+  return { relay: topic.relay, message: msg, first };
+}
+
 // 質疑モード（仕様: SPEC-Grok参戦.md「リレー機構」）: 応答者以外の参加者全員へ配送し、手番の 1 名だけを起動する。
 // 2 名でも 3 名でも同じ機構。配送は常に先（終了宣言・最終手の発言も他の参加者へ届く）
 function qaHop(topic, agent, replyText, sourceMsgId) {
@@ -3699,48 +3748,13 @@ async function handleApi(req, res, url) {
     const text = typeof body.text === "string" ? body.text.trim() : "";
     const hops = Math.min(20, Math.max(1, Number(body.hops) || 6));
     if (!first || !text) return json(res, 400, { error: "first と text は必須です" });
-    if (state.budgetHalt) return json(res, 400, { error: "上限停止中です（バナーから解除してください）" });
     const qaTopic = findTopic(body.topicId) || state.topics[0];
     if (!qaTopic) return json(res, 400, { error: "トピックがありません" });
     // 参加者（順序付き）: 省略時はトピック参加者全員を first から始まる順に。指定時は first を先頭に置く
     const tparts = qaTopic.participants || LEGACY_AGENTS;
-    let order = Array.isArray(body.participants) && body.participants.length ? [...new Set(body.participants)] : tparts.slice();
-    if (!order.includes(first)) return json(res, 400, { error: "first は参加者に含めてください" });
-    order = [first, ...order.filter((a) => a !== first)];
-    if (order.length < 2) return json(res, 400, { error: "質疑には 2 名以上の参加者が必要です" });
-    const outsider = order.find((a) => !tparts.includes(a));
-    if (outsider) return json(res, 400, { error: `${NAMES[outsider] || outsider} はこのトピックの参加者ではありません` });
-    const off = order.find((a) => !state.agents[a].auto);
-    if (off) return json(res, 400, { error: `質疑モードには参加者全員の自動応答を ON にしてください（${NAMES[off]} が OFF）` });
-    if (order.includes("grok") && state.agents.grok.authed !== true) return json(res, 400, { error: "Grok が未認証（または確認中）のため質疑を開始できません", reason: "unauthed", agent: "grok" });
-    qaTopic.relay = {
-      ...defaultRelay(),
-      active: true,
-      remaining: hops,
-      hopsDone: 0,
-      startMessageId: null,
-      agenda: typeof body.agenda === "string" ? body.agenda.trim().slice(0, 120) : "",
-      id: "r_" + id(),
-      startedTs: Date.now(),
-      participants: order,
-      turn: 0,
-      seq: 0,
-      spoken: Object.fromEntries(order.map((a) => [a, 0])),
-      stopReason: null,
-    };
-    qaTopic.qaCount = (qaTopic.qaCount || 0) + 1;
-    qaTopic.projectLocked = true; // 質疑の開始も実行の開始
-    const msg = {
-      id: id(),
-      topicId: qaTopic.id,
-      thread: first,
-      author: "user",
-      text,
-      provenance: { ingress: "ui", delivery: "direct", trigger: "manual", source: null },
-      ts: Date.now(),
-    };
-    qaTopic.relay.startMessageId = msg.id;
-    state.messages.push(msg);
+    const order = Array.isArray(body.participants) && body.participants.length ? [...new Set(body.participants)] : tparts.slice();
+    const opened = openRelay(qaTopic, { first, order, hops, agenda: typeof body.agenda === "string" ? body.agenda : "", text });
+    if (opened.error) return json(res, 400, { error: opened.error, ...(opened.reason ? { reason: opened.reason, agent: opened.agent } : {}) });
     touch();
     agentLoop(qaTopic.id, first);
     return json(res, 201, { relay: qaTopic.relay });
@@ -4661,6 +4675,30 @@ function trayFireContinuation(topic) {
   agentLoop(topic.id, c.agent);
 }
 
+// 「3 人で再検討」（§9.4 の mode: "rediscuss"）。同じトピックで質疑リレーを 1 本開始する。
+// 旧依頼は revision-requested のまま履歴に残し、旧合意（relayHistory）には手を触れない。
+// check: true なら始められるかだけ確かめる（押した後に「やっぱり無理でした」にしないため）
+function trayRediscuss(topic, request, targets, note, { check = false } = {}) {
+  if (topic.relay.active) return { error: "このトピックでは質疑が進行中です。終わってから再検討を始めてください" };
+  const order = (topic.participants || LEGACY_AGENTS).slice();
+  const first = request.proposer; // 修正を受ける当人から始める
+  const labels = targets.map((t) => tray.REVISION_TARGET_LABELS[t] || t);
+  const title = (request.block || {}).title || "";
+  if (check) return openRelay(topic, { first, order, check: true });
+  const text = [
+    `【判断トレイ】「${title}」の進め方を、3 人で再検討してください。`,
+    `直してほしいところ: ${labels.join(" / ")}`,
+    note ? `補足: ${note}` : "",
+    `元の提案: ${request.id}（${NAMES[request.proposer] || request.proposer}の提案）`,
+    (request.block || {}).outcome ? `元の狙い: ${request.block.outcome}` : "",
+    (request.block || {}).baseCommit ? `元の基点: ${request.block.baseCommit}` : "",
+    "元の提案と合意はそのまま履歴に残してあります。結論が出たら、新しい依頼ブロックとして出し直してください。",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return openRelay(topic, { first, order, agenda: `${title} の再検討（${labels.join("・")}）`, text });
+}
+
 // ---- 承認計画の実行（§10）----
 
 function trayTaskFor(request, t) {
@@ -4893,26 +4931,52 @@ async function trayAction(req, res, requestId, action) {
     const note = typeof body.note === "string" ? body.note.trim() : "";
     if (Array.from(note).length > tray.LIMITS.note) return json(res, 400, { error: "note が長すぎます", code: "invalid-request", errors: [{ code: "note-too-long", path: "note", message: "2000 文字までです" }] });
     let targets = [];
+    let mode = "proposer";
     if (action === "revision") {
       targets = Array.isArray(body.targets) ? [...new Set(body.targets)] : [];
       if (!targets.length || targets.some((t) => !tray.REVISION_TARGETS.includes(t))) {
         return json(res, 400, { error: "どこを直してほしいかを 1 つ以上選んでください", code: "invalid-request", errors: [{ code: "targets-invalid", path: "targets", message: tray.REVISION_TARGETS.join(" / ") }] });
       }
       if (targets.includes("other") && !note) return json(res, 400, { error: "「その他」を選んだときは内容を書いてください", code: "invalid-request", errors: [{ code: "note-required", path: "note", message: "内容が要ります" }] });
+      mode = body.mode === undefined ? "proposer" : body.mode;
+      if (!tray.REVISION_MODES.includes(mode)) {
+        return json(res, 400, { error: "mode は proposer か rediscuss です", code: "invalid-request", errors: [{ code: "mode-invalid", path: "mode", message: tray.REVISION_MODES.join(" / ") }] });
+      }
+      // 始められないなら、押す前に断る（状態は変えない）。合意メモ §11「結果が明記された最後のボタンで確定」
+      if (mode === "rediscuss") {
+        const can = trayRediscuss(topic, request, targets, note, { check: true });
+        if (can.error) return json(res, 409, { error: can.error, code: "rediscuss-unavailable", ...(can.reason ? { reason: can.reason, agent: can.agent } : {}) });
+      }
     }
     request.status = action === "revision" ? "revision-requested" : "rejected";
-    request.decision = { kind: action, targets, note, ts: Date.now() };
+    request.decision = { kind: action, targets, note, mode: action === "revision" ? mode : undefined, ts: Date.now() };
     if (!trayWrite(request)) return json(res, 500, { error: "tray.jsonl へ書けませんでした", code: "log-write-failed" });
-    const LABEL = { scope: "範囲", assignee: "担当", approach: "進め方", other: "その他" };
+    const LABEL = tray.REVISION_TARGET_LABELS;
+    const where = targets.map((t) => LABEL[t] || t).join(" / ");
     const text =
       action === "revision"
-        ? `【判断トレイ】「${request.block.title}」に修正を依頼しました（${targets.map((t) => LABEL[t]).join(" / ")}）${note ? "\n" + note : ""}`
+        ? `【判断トレイ】「${request.block.title}」に修正を依頼しました（${where}${mode === "rediscuss" ? "／3 人で再検討" : ""}）${note ? "\n" + note : ""}`
         : `【判断トレイ】「${request.block.title}」は見送りにしました${note ? "\n" + note : ""}`;
-    const messages = trayShare(topic, text, { kind: action, requestId: request.id, proposalSha256: request.proposalSha256 });
-    // 修正は提案者へ 1 回だけ返す。見送りは続きを求めていないので予約しない（初版は 3 人での再検討を開始しない）
-    const cont = action === "revision" ? trayReserveContinuation(topic, request.proposer, request.id, "revision") : null;
+    const messages = trayShare(topic, text, { kind: action, requestId: request.id, proposalSha256: request.proposalSha256, mode: action === "revision" ? mode : undefined });
+    // 送り先は 2 通り（§9.4）。rediscuss は質疑に手番があるので継続予約はしない。
+    // 見送りは続きを求めていないので、どちらもしない
+    let cont = null;
+    let relay = null;
+    if (action === "revision" && mode === "rediscuss") {
+      const started = trayRediscuss(topic, request, targets, note);
+      if (started.error) {
+        // 直前の検査は通っているので、ここに来るのは競合したときだけ。依頼は修正待ちのまま残す
+        logEvent("tray", "3 人での再検討を開始できませんでした: " + started.error, "warn");
+        touch();
+        return json(res, 409, { error: started.error, code: "rediscuss-unavailable", request: view() });
+      }
+      relay = started.relay;
+      agentLoop(topic.id, started.first); // 先手の 1 名だけ
+    } else if (action === "revision") {
+      cont = trayReserveContinuation(topic, request.proposer, request.id, "revision");
+    }
     touch();
-    return json(res, 200, { request: view(), messages, continuation: cont });
+    return json(res, 200, { request: view(), messages, continuation: cont, relay, mode: action === "revision" ? mode : undefined });
   }
   return json(res, 400, { error: "不明な操作です", code: "invalid-request", errors: [] });
 }

@@ -1,4 +1,4 @@
-/* Judgment tray API contract v1. Render evaluated views; never derive permissions or hashes. */
+/* Judgment tray API contract v4: revision mode proposer/rediscuss. Render evaluated views; never derive permissions or hashes. */
 (() => {
   'use strict';
   const STATUS = {pending:'判断待ち', parked:'あとで', 'revision-requested':'修正待ち',
@@ -307,17 +307,42 @@
         }
         const label=n('label','補足（その他を選ぶ場合は必須）'),note=n('textarea',null,{maxlength:'2000'});
         label.append(note); fields.append(label);
-        fields.append(n('p',action==='revision' ? '参加者全員へ共有し、提案者へ修正を依頼します。3人の質疑は開始しません。' : '参加者全員へ共有します。継続は依頼しません。'));
-        fields.append(n('button',title+'を送る',{type:'submit'}));form.append(fields);
+        const effect=n('p',null,{'aria-live':'polite'});
+        const submit=n('button',action==='revision'?'修正を依頼して閉じる':title+'を送る',{type:'submit',class:'small'});
+        let selectedMode='proposer';
+        const eligible=()=>options.some(x=>x.input.checked && ['scope','assignee'].includes(x.value));
+        if(action==='revision') {
+          const modes=n('fieldset',null,{class:'tray-revision-mode'});
+          modes.append(n('legend','修正の進め方'));
+          const choices=[];
+          for(const [value,text] of [['proposer','提案者に修正を依頼'],['rediscuss','3人で再検討を開始']]) {
+            const row=n('label'),input=n('input',null,{type:'radio',name:'revision-mode-'+r.id,value});
+            input.checked=value==='proposer'; row.append(input,n('span',text));modes.append(row);choices.push({input,value});
+            input.addEventListener('change',()=>{if(input.checked){selectedMode=value;updateMode();}});
+          }
+          const updateMode=()=>{
+            const available=eligible();modes.hidden=!available;
+            if(!available)selectedMode='proposer';
+            for(const c of choices){c.input.checked=c.value===selectedMode;c.input.disabled=!available;}
+            submit.textContent=selectedMode==='rediscuss'?'質疑を開始して閉じる':'修正を依頼して閉じる';
+            effect.textContent=selectedMode==='rediscuss'
+              ? '修正内容を全員へ共有し、このトピックの参加者全員で新しい質疑を1本開始します。先手は提案者です。旧合意は履歴に残ります。'
+              : '参加者全員へ共有し、提案者へ修正を依頼します。新しい質疑は開始しません。';
+          };
+          for(const o of options)o.input.addEventListener('change',updateMode);
+          updateMode();fields.append(modes);
+        } else effect.textContent='参加者全員へ共有します。継続は依頼しません。';
+        fields.append(effect,submit);form.append(fields);
         form.addEventListener('submit',event=>{
           event.preventDefault();if(!this.can(e,action)) return;
           const targets=options.filter(x=>x.input.checked).map(x=>x.value),text=note.value.trim();
           if(!targets.length) {e.notice.textContent='対象項目を選択してください。';return;}
           if(targets.includes('other') && !text) {e.notice.textContent='その他の補足を入力してください。';return;}
           // §9.5 accepts note only. Preserve the user's target choices in that note.
-          const body=action==='revision' ? {targets,note:text} : {note:'対象：'+targets.map(t=>TARGETS[t]).join('・')+(text ? '\n'+text:'')};
+          const mode=eligible()?selectedMode:'proposer';
+          const body=action==='revision' ? {targets,note:text,mode} : {note:'対象：'+targets.map(t=>TARGETS[t]).join('・')+(text ? '\n'+text:'')};
           if(body.note.length>2000) {e.notice.textContent='対象項目を含めて2000文字以内にしてください。';return;}
-          this.perform(e,action,body);
+          this.perform(e,action,body,{closeOnSuccess:action==='revision'});
         });
         e.controls.push({element:fields,action});this.detail.append(form);
       }
@@ -342,7 +367,7 @@
       const e=this.current;if(!e) return;
       e.locked=true;e.notice.textContent=message;this.syncControls();
     }
-    async perform(e,action,body={}) {
+    async perform(e,action,body={},{closeOnSuccess=false}={}) {
       const permission=action==='plan/retry' ? 'retry' : action;
       if(!this.can(e,permission,body.taskKey)) return;
       const id=e.snapshot.id,hash=e.snapshot.proposalSha256;
@@ -351,6 +376,7 @@
         await request(this.fetcher,'/api/tray/'+encodeURIComponent(id)+'/'+action,{...body,proposalSha256:hash});
         if(this.current!==e) return;
         this.lock('受け付けました。最新の状態を読み込んでいます。');
+        if(closeOnSuccess) this.dialog.close();
         await this.refresh();
         // A fresh view is required before offering any further operation.
         if(this.current===e && this.connected) {

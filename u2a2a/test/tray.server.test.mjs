@@ -403,3 +403,65 @@ test("9. tray.jsonl が正本。再起動で復元し、継続予約は自動で
   const cont = (await getState()).topics.find((x) => x.id === topicId).trayContinuation;
   if (cont) assert.equal(cont.armed, false, "復元した予約は armed でない");
 });
+
+test("10. 修正依頼の mode: rediscuss は質疑を 1 本始める。proposer は従来どおり", async () => {
+  writeCtl({ claude: { text: block(QUESTION({ title: "再検討にまわす質問", issueId: "redis" })) } });
+  await drive("再検討用の質問");
+  const t = await getTray();
+  const id = t.topics[topicId].waiting[0];
+  const sha = t.requests[id].proposalSha256;
+  writeCtl({ claude: { text: "再検討します" }, codex: { text: "こちらも見ます" } });
+
+  const badMode = await api("POST", "/api/tray/" + id + "/revision", { proposalSha256: sha, targets: ["scope"], mode: "everyone" });
+  assert.equal(badMode.status, 400);
+  assert.equal(badMode.body.errors[0].code, "mode-invalid");
+  assert.equal((await getTray()).requests[id].status, "pending", "不正な mode では状態を変えない");
+
+  // 始められないときは押す前に断り、依頼は pending のまま残す（後から「やっぱり無理」にしない）
+  await api("PATCH", "/api/agents/codex", { auto: false });
+  const cant = await api("POST", "/api/tray/" + id + "/revision", { proposalSha256: sha, targets: ["scope"], mode: "rediscuss" });
+  assert.equal(cant.status, 409, JSON.stringify(cant.body));
+  assert.equal(cant.body.code, "rediscuss-unavailable");
+  assert.match(cant.body.error, /自動応答を ON/);
+  assert.equal((await getTray()).requests[id].status, "pending", "断ったときは状態を変えない");
+  await api("PATCH", "/api/agents/codex", { auto: true });
+
+  const relayBefore = (await getState()).topics.find((x) => x.id === topicId).relay;
+  assert.equal(relayBefore.active, false, "前提: 質疑は走っていない");
+  const r = await api("POST", "/api/tray/" + id + "/revision", { proposalSha256: sha, targets: ["scope", "approach"], note: "範囲が広すぎます", mode: "rediscuss" });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.mode, "rediscuss");
+  assert.equal(r.body.request.status, "revision-requested");
+  assert.equal(r.body.continuation, null, "質疑に手番があるので継続予約はしない");
+  assert.ok(r.body.relay && r.body.relay.active, "質疑が 1 本始まる");
+
+  const topic = (await getState()).topics.find((x) => x.id === topicId);
+  assert.deepEqual(r.body.relay.participants, topic.participants, "参加者は全員");
+  assert.equal(r.body.relay.participants[0], "claude", "先手は提案者");
+  assert.match(r.body.relay.agenda, /再検討にまわす質問 の再検討（範囲・進め方）/);
+
+  const start = (await getState()).messages.find((m) => m.id === r.body.relay.startMessageId);
+  assert.equal(start.thread, "claude");
+  assert.equal(start.author, "user");
+  assert.match(start.text, /直してほしいところ: 範囲 \/ 進め方/);
+  assert.match(start.text, /補足: 範囲が広すぎます/);
+  assert.ok(start.text.includes(id), "旧提案への参照が入る");
+  assert.match(start.text, /履歴に残してあります/);
+
+  const shared = (await getState()).messages.filter((m) => m.tray && m.tray.kind === "revision" && m.tray.requestId === id);
+  assert.equal(shared.length, topic.participants.length, "修正内容は全員へ共有する");
+  assert.equal(shared[0].tray.mode, "rediscuss");
+
+  // 旧依頼は履歴に残り、押せる状態には戻らない
+  const after = await getTray();
+  assert.ok(after.topics[topicId].later.includes(id));
+  assert.equal(after.requests[id].decision.mode, "rediscuss");
+
+  // 決着した依頼はもう一度決め直せない（再検討の二重開始もここで止まる）
+  const again = await api("POST", "/api/tray/" + id + "/revision", { proposalSha256: sha, targets: ["scope"], mode: "rediscuss" });
+  assert.equal(again.status, 409, JSON.stringify(again.body));
+  assert.equal(again.body.code, "invalid-transition");
+
+  await api("POST", "/api/qa/stop", { topicId });
+  assert.equal((await getState()).topics.find((x) => x.id === topicId).relay.active, false);
+});

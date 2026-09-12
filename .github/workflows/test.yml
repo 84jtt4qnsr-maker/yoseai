@@ -1,7 +1,14 @@
 name: test
 
 # クリーンチェックアウトで u2a2a のテストを通す。
-# 依存パッケージは無いので package-lock.json も無く、npm ci は使えない（npm install を使う）。
+#
+# 依存パッケージが 1 つも無いので、インストール段階は置いていない。
+#   - package-lock.json が無いので npm ci は使えない
+#   - npm install は依存ゼロでも registry へ出る可能性があり、落ちればテストに辿り着けない
+#   - package.json が壊れていれば npm test 自体が読めずに落ちるので、検査の役目は果たされる
+#
+# 注意: このワークフローが緑になるまで、テストスイート全体が CI で通った実績はない。
+# 赤になったら、まず u2a2a/test/ の該当スイートを疑うこと（ワークフローの設定より先に）。
 on:
   push:
     branches: [main]
@@ -21,11 +28,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22.x
-
-      # 依存は無いが、package.json が壊れていればここで落ちる
-      - name: Install
-        working-directory: u2a2a
-        run: npm install --no-audit --no-fund
 
       # サーバ統合テストが基点コミットの確認に git を使うので、コミットできる設定を入れておく
       - name: Configure git for tests

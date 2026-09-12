@@ -20,6 +20,8 @@ class Element {
  fire(k){return Promise.all((this.events[k]||[]).map(f=>f({target:this})));}
  focus(){this.doc.activeElement=this;}
  closest(selector){for(let n=this;n;n=n.parentElement)if(n.className?.split(' ').includes(selector.slice(1)))return n;return null;}
+ cloneNode(){const n=new Element(this.tagName,this.doc);n.src=this.src;n.alt=this.alt;return n;}
+ querySelector(tag){return this.querySelectorAll(tag)[0]||null;}
  querySelectorAll(tag){return this.children.flatMap(n=>[...(n.tagName===tag?[n]:[]),...n.querySelectorAll(tag)]);}
 }
 const fn=name=>html.match(new RegExp('(?:async )?function '+name+'\\([^]*?\\n}'))?.[0]||assert.fail(name);
@@ -64,7 +66,8 @@ test('untrusted display names remain text, no executable markup',()=>{
 });
 test('persistent header entry survives first message and notice describes auto control',async()=>{
  const {ctx,doc}=setup();doc.body.append(ctx.createThreadColumn('claude'));const b=doc.ids['manual-claude'];assert.ok(b);await b.fire('click');assert.equal(doc.activeElement,doc.ids['input-claude']);
- assert.equal(doc.ids['auto-claude'].getAttribute('aria-describedby'),'auto-notice-claude');assert.match(doc.ids['auto-notice-claude'].textContent,/外部サービス.*利用料金/);
+ assert.equal(doc.ids['auto-claude'].getAttribute('aria-describedby'),'auto-notice');assert.equal(doc.ids['auto-notice-claude'],undefined);
+ assert.equal((html.match(/id="auto-notice"/g)||[]).length,1);assert.match(html,/id="auto-notice"[^]*?外部送信[^]*?利用料金/);
 });
 test('unknown auth is neutral while auto ON/OFF renders independently',()=>{
  const {ctx,doc,state}=setup();doc.body.append(ctx.createThreadColumn('claude'));
@@ -91,10 +94,10 @@ test('failed enabling restores the prior switch and reports failure',async()=>{
  const {ctx,doc,state,notes}=setup();doc.body.append(ctx.createThreadColumn('codex'));const b=doc.ids['auto-codex'];b.checked=true;ctx.api=async()=>{throw Error('rejected');};await ctx.updateAuto('codex',b);assert.equal(b.checked,false);assert.equal(state.agents.codex.auto,false);assert.deepEqual(notes,['rejected']);
 });
 test('missing portraits for all agents retain letter and ring with no broken link',()=>{
- const {A,images}=setup();for(const[id,letter]of [['claude','C'],['codex','X'],['grok','G']]){const b=A.badge(id,true),img=images.at(-1);assert.equal(b.textContent,letter);assert.equal(b.href,undefined);assert.equal(img.hidden,true);img.onerror();assert.equal(b.querySelectorAll('img').length,0);assert.equal(b.textContent,letter);assert.equal(b.href,undefined);assert.match(b.getAttribute('aria-label'),/画像なし/);assert.match(b.className,/agent-avatar-face/);}
+ const {A,images}=setup();for(const[id,letter]of [['claude','C'],['codex','X'],['grok','G']]){const b=A.badge(id,true),img=images.at(-1);assert.equal(b.textContent,letter);assert.equal(b.href,undefined);assert.equal(b.querySelectorAll('img').length,0);img.onerror();assert.equal(b.querySelectorAll('img').length,0);assert.equal(b.textContent,letter);assert.equal(b.href,undefined);assert.match(b.getAttribute('aria-label'),/画像なし/);assert.match(b.className,/agent-avatar-face/);}
 });
 test('available portrait reveals image and enables existing full portrait link',()=>{
- const {A,images}=setup(),b=A.badge('grok',true),img=images.at(-1);assert.equal(img.src,'/api/pool/file/avatars/grok%2Fportrait.jpg');img.onload();assert.equal(img.hidden,false);assert.equal(b.href,img.src);assert.match(b.getAttribute('aria-label'),/自画像を見る/);
+ const {A,images}=setup(),b=A.badge('grok',true),img=images.at(-1);assert.equal(img.src,'/api/pool/file/avatars/grok%2Fportrait.jpg');img.onload();assert.equal(b.querySelectorAll('img').length,1);assert.equal(b.href,img.src);assert.match(b.getAttribute('aria-label'),/自画像を見る/);
 });
 test('small nodes are letters and do not request any image',()=>{const{A,images}=setup();for(const id of ['claude','codex','grok'])assert.equal(A.badge(id).querySelectorAll('img').length,0);assert.equal(images.length,0);});
 test('absent avatar manifest entry shows pet letter, clears stale still and loaded sprite',()=>{
@@ -104,4 +107,34 @@ test('production inline script parses and empty entry wiring differentiates filt
  for(const m of html.matchAll(/<script>([^]*?)<\/script>/g))if(m[1].trim())new vm.Script(m[1]);
  assert.match(html,/if \(!graph.nodes.length\) flowEmpty.append\(manualEmpty\(participantsOf\(\), true\)\)/);assert.match(html,/box.appendChild\(manualEmpty\(\[agent\]\)\)/);
  assert.match(html,/agent-avatar-face img\[hidden\]/);
+});
+
+test('pending and failed portrait probes are shared per agent across repeated badge renders',()=>{
+ const {A,images}=setup();const a=A.badge('codex',true),b=A.badge('codex',true);assert.equal(images.length,1);assert.equal(a.href,undefined);assert.equal(b.href,undefined);
+ images[0].onerror();for(let i=0;i<100;i++){const c=A.badge('codex',true);assert.equal(c.href,undefined);assert.equal(c.textContent,'X');}
+ assert.equal(images.length,1);assert.match(a.getAttribute('aria-label'),/画像なし/);assert.match(b.getAttribute('aria-label'),/画像なし/);
+ A.badge('grok',true);assert.equal(images.length,2,'other agent has an independent cache');
+});
+test('successful shared probe enables all badges and is cached for future badges',()=>{
+ const {A,images}=setup();const a=A.badge('claude',true),b=A.badge('claude',true);const probe=images[0];probe.onload();const c=A.badge('claude',true);
+ assert.equal(images.length,1);for(const n of [a,b,c]){assert.equal(n.href,probe.src);assert.equal(n.querySelectorAll('img').length,1);}
+ assert.notEqual(a.children[0],b.children[0],'each badge owns its own display image');
+});
+function petController(A){const c=Object.create(A.Controller.prototype);c.pets=new Map();c.assets={};c.io={observe(){}};return c;}
+test('pet link waits for the same portrait probe even when a still exists',()=>{
+ const {A,images}=setup(),c=petController(A);const b=A.badge('grok',true),probe=images[0],p=c.create('grok');
+ assert.equal(p.node.href,undefined);assert.doesNotMatch(p.node.title,/自画像を見る/);p.still.onload();assert.equal(p.node.href,undefined,'still success does not prove portrait availability');
+ probe.onload();assert.equal(b.href,probe.src);assert.equal(p.node.href,probe.src);assert.match(p.node.getAttribute('aria-label'),/自画像を見る/);
+ const p2=c.create('grok');assert.equal(p2.node.href,probe.src);assert.equal(images.length,3,'one portrait probe and two pet still images');
+});
+test('failed portrait leaves recreated pets without href or a misleading view label',()=>{
+ const {A,images}=setup(),c=petController(A);A.badge('claude',true);images[0].onerror();
+ for(let i=0;i<3;i++){const p=c.create('claude');assert.equal(p.node.href,undefined);assert.doesNotMatch(p.node.getAttribute('aria-label'),/自画像を見る/);}
+ assert.equal(images.length,4,'failed portrait must not create another Image; only three pet still nodes');
+});
+test('small empty buttons and shared guide avoid full per-column notice duplication',async()=>{
+ const {O,doc}=setup();const d=O.guide();doc.ids['cli-guide']=d;
+ const box=O.emptyState({agents:[{id:'claude',name:'Claude',ready:true}],onManual(){}});
+ assert.equal(box.querySelectorAll('button')[0].className,'small');assert.equal(box.querySelectorAll('details').length,0);
+ const link=box.querySelectorAll('a')[0];assert.equal(link.href,'#cli-guide');await link.fire('click');assert.equal(d.open,true);assert.equal(doc.activeElement,d.querySelector('summary'));
 });

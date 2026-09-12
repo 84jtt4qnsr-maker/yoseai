@@ -1032,7 +1032,7 @@
   .tray-downstream { font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
   .agent-avatar-face img[hidden] { display: none; }
   .auth-state { margin: 0 8px; color: var(--dim); font-size: 11px; }
-  .auto-notice { display: block; flex-basis: 100%; white-space: normal; font-weight: 400; letter-spacing: normal; color: var(--dim); font-size: 11px; line-height: 1.5; }
+  .auto-notice { display: block; margin: 0; padding: 4px 12px; white-space: nowrap; overflow-x: auto; color: var(--dim); font-size: 11px; line-height: 1.5; }
   .onboarding-empty { text-align: left; padding: 24px; max-width: 640px; margin: auto; }
   .onboarding-empty p { margin: 0 0 12px; line-height: 1.7; }
   .onboarding-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 16px 0; }
@@ -1054,6 +1054,7 @@
 </header>
 
 <div id="agent-access" aria-live="polite"></div>
+<p id="auto-notice" class="auto-notice">自動応答ON: 会話・参照内容を外部送信します。契約に応じた利用料金が発生します。 <a href="#cli-guide" id="cli-guide-link">CLIの案内</a></p>
 
 <!-- トピック（スレッド）タブ -->
 <div id="topic-bar"></div>
@@ -2234,10 +2235,9 @@ function createThreadColumn(agent) {
     el("span", { class: "auth-state", id: "auth-state-" + agent }),
     el("button", { type: "button", class: "small", id: "manual-" + agent, text: "手動入力", onclick: () => showAgentInput(agent) }),
     el("button", { class: "small", id: "reset-" + agent, text: "⟳", title: "CLIセッションをリセット" }),
-    el("label", { class: "auto-ctl" }, [el("input", { type: "checkbox", id: "auto-" + agent, "aria-describedby": "auto-notice-" + agent }), el("span", { id: "auto-label-" + agent, text: "自動応答 OFF" })]),
+    el("label", { class: "auto-ctl" }, [el("input", { type: "checkbox", id: "auto-" + agent, "aria-describedby": "auto-notice" }), el("span", { id: "auto-label-" + agent, text: "自動応答 OFF" })]),
     el("button", { type: "button", class: "small widen-column", text: "広げる", onclick: () => toggleWideColumn(agent) }),
     el("button", { class: "small fold-column", text: "折りたたむ", onclick: () => toggleColumn(agent) }),
-    el("small", { class: "auto-notice", id: "auto-notice-" + agent, text: U2AOnboarding.NOTICE }),
   ]);
   const rail = el("button", { class: "thread-rail", hidden: "", onclick: () => toggleColumn(agent) }, [
     AV.badge(agent), el("span", { class: "rail-name", text: NAMES[agent] }), el("span", { class: "rail-unread" }),
@@ -2425,9 +2425,9 @@ function renderAuthControls() {
   box.dataset.optionsKey = key;
   box.replaceChildren();
   // 参加列がない場合だけここにトグルを置き、列ヘッダとの重複を避ける。
-  box.append(U2AOnboarding.guide());
+  const guide=U2AOnboarding.guide(); guide.id="cli-guide"; box.append(guide);
   if (!hasGrok) return;
-  const auto = el("input", { type: "checkbox", "aria-label": NAMES.grok + " 自動応答", "aria-describedby": "auto-notice-grok-top" });
+  const auto = el("input", { type: "checkbox", "aria-label": NAMES.grok + " 自動応答", "aria-describedby": "auto-notice" });
   auto.checked = !!state.agents?.grok?.auto;
   auto.disabled = authAutoSaving;
   auto.addEventListener("change", async () => {
@@ -2444,7 +2444,7 @@ function renderAuthControls() {
   const check = el("button", { type: "button", class: "small", text: authChecking.size ? "確認中…" : "再確認", onclick: checkAgentAuth });
   check.disabled = authChecking.size > 0;
   box.append(el("span", { class: "auth-badge", text: NAMES.grok + ": " + authLabel("grok") }), check);
-  if (!inColumn) box.append(el("label", { class: "auto-ctl" }, [auto, document.createTextNode("自動応答 " + (auto.checked ? "ON" : "OFF"))]), el("small", { id: "auto-notice-grok-top", class: "auto-notice", text: U2AOnboarding.NOTICE }));
+  if (!inColumn) box.append(el("label", { class: "auto-ctl" }, [auto, document.createTextNode("自動応答 " + (auto.checked ? "ON" : "OFF"))]));
 }
 
 function chooseDestination(kind, fromAgent, m, event) {
@@ -5252,6 +5252,8 @@ async function updateAuto(agent, checkbox) {
     if ($("#status-" + agent)) renderAgentStatus(agent);
   }
 }
+
+$("#cli-guide-link").addEventListener("click", () => { const guide=$("#cli-guide"); if(guide){guide.open=true;guide.querySelector("summary")?.focus();} });
 
 function wireAgent(agent) {
   $("#auto-" + agent).addEventListener("change", (e) => updateAuto(agent, e.target));

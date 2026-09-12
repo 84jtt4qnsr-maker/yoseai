@@ -162,8 +162,8 @@ test('revision form targets + optional note, other requires note',async()=>{
  form.querySelectorAll('input')[3].checked=true;form.fire('submit');await tick();assert.equal(calls.length,0);
  form.querySelectorAll('input')[3].checked=false;form.querySelectorAll('input')[0].checked=true;
  form.fire('submit');await tick();
- assert.deepEqual(JSON.parse(calls[0].options.body),{targets:['scope'],note:'',proposalSha256:hash});
- assert.ok(calls[0].url.endsWith('/revision'));assert.ok(!c.detail.textContent.includes('3人で再検討を開始'));
+ assert.deepEqual(JSON.parse(calls[0].options.body),{targets:['scope'],note:'',mode:'proposer',proposalSha256:hash});
+ assert.ok(calls[0].url.endsWith('/revision'));assert.equal(c.dialog.open,false);
 });
 test('reject preserves target choice inside contract note, never posts targets',async()=>{
  const {c,calls}=setup();c.select(id);const form=c.detail.querySelectorAll('form')[1];
@@ -242,4 +242,60 @@ test('integration loads script, mounts launcher, syncs SSE and task-completion d
  assert.match(html,/trayUI.downstream\(t.id\)/);
  assert.match(html,/setViewMode\("columns"\)/);
  const inline=html.split('<script>')[1].split('</script>')[0];new vm.Script(inline);
+});
+
+const revisionForm=c=>c.detail.querySelectorAll('form')[0];
+const target=(form,value)=>form.querySelectorAll('input').find(x=>x.getAttribute('type')==='checkbox' && x.value===value);
+const modeInput=(form,value)=>form.querySelectorAll('input').find(x=>x.getAttribute('type')==='radio' && x.value===value);
+const change=(input,checked)=>{input.checked=checked;input.fire('change');};
+const modeGroup=form=>form.querySelectorAll('fieldset').find(x=>x.getAttribute('class')==='tray-revision-mode');
+test('revision scope/assignee reveals two choices, proposer default, selection alone never sends',async()=>{
+ const {c,calls}=setup();c.select(id);const form=revisionForm(c);assert.equal(modeGroup(form).hidden,true);
+ change(target(form,'scope'),true);assert.equal(modeGroup(form).hidden,false);assert.equal(modeInput(form,'proposer').checked,true);assert.equal(calls.length,0);
+ assert.ok(find(form,'button','修正を依頼して閉じる'));change(modeInput(form,'rediscuss'),true);
+ assert.ok(find(form,'button','質疑を開始して閉じる'));assert.match(form.textContent,/旧合意は履歴に残/);assert.equal(calls.length,0);
+});
+test('explicit relay confirm posts selected mode and frozen hash once; closes on success only',async()=>{
+ let finish;const {c,calls}=setup(view(proposal()),(url,opt)=>opt.method?new Promise(r=>finish=r):null);c.select(id);c.dialog.showModal();
+ const form=revisionForm(c);change(target(form,'assignee'),true);change(modeInput(form,'rediscuss'),true);form.fire('submit');form.fire('submit');
+ assert.equal(calls.length,1);assert.equal(c.dialog.open,true);assert.deepEqual(JSON.parse(calls[0].options.body),{targets:['assignee'],note:'',mode:'rediscuss',proposalSha256:hash});
+ finish(result(200,{request:proposal({status:'revision-requested'})}));await tick();assert.equal(c.dialog.open,false);
+});
+test('removing all eligible targets resets hidden mode to proposer before confirmation',async()=>{
+ const {c,calls}=setup();c.select(id);const form=revisionForm(c);change(target(form,'scope'),true);change(modeInput(form,'rediscuss'),true);change(target(form,'approach'),true);change(target(form,'scope'),false);
+ assert.equal(modeGroup(form).hidden,true);assert.equal(modeInput(form,'proposer').checked,true);assert.ok(find(form,'button','修正を依頼して閉じる'));
+ form.fire('submit');await tick();assert.equal(JSON.parse(calls[0].options.body).mode,'proposer');
+});
+test('same-version SSE preserves mode and targets; new version prevents sending',async()=>{
+ const {c,calls}=setup();c.select(id);const form=revisionForm(c);change(target(form,'scope'),true);change(modeInput(form,'rediscuss'),true);
+ c.update(view(proposal()));assert.equal(revisionForm(c),form);assert.equal(modeInput(form,'rediscuss').checked,true);
+ c.update(view(proposal({proposalSha256:'c'.repeat(64)})));form.fire('submit');await tick();assert.equal(calls.length,0);assert.equal(c.current.locked,true);
+});
+test('stale revision and failed revision keep the dialog visible; no implicit relay retry',async()=>{
+ for(const status of [409,400]){
+  const {c,calls}=setup(view(proposal()),(url,opt)=>opt.method?result(status,{code:status===409?'stale-proposal':'invalid-request',error:'rejected'}):null);c.select(id);c.dialog.showModal();
+  const form=revisionForm(c);change(target(form,'scope'),true);change(modeInput(form,'rediscuss'),true);form.fire('submit');await tick();
+  assert.equal(c.dialog.open,true);assert.equal(calls.length,1);assert.equal(c.current.locked,status===409);
+ }
+});
+test('other still requires note with relay mode, and reject never has mode choices',async()=>{
+ const {c,calls}=setup();c.select(id);const form=revisionForm(c);change(target(form,'scope'),true);change(target(form,'other'),true);change(modeInput(form,'rediscuss'),true);
+ form.fire('submit');await tick();assert.equal(calls.length,0);assert.match(c.detail.textContent,/その他の補足/);
+ const reject=c.detail.querySelectorAll('form')[1];assert.equal(reject.querySelectorAll('input').filter(x=>x.getAttribute('type')==='radio').length,0);
+});
+
+test('replacement proposal retains old-request navigation and field differences',()=>{
+ const old=proposal({id:'old',status:'revision-requested',actionable:{}}),next=proposal({replaces:'old'});next.block.scope=['修正した範囲'];
+ const {c,calls}=setup(view(old,next));c.select(id);assert.match(c.detail.textContent,/以前の依頼との項目差分/);assert.match(c.detail.textContent,/修正した範囲/);
+ click(c.detail,'以前の依頼を確認');assert.equal(c.current.snapshot.id,'old');assert.equal(calls.length,0);
+});
+
+test('rediscuss-unavailable keeps server reason visible, no fallback to proposer',async()=>{
+ const {c,calls}=setup(view(proposal()),(url,opt)=>opt.method?result(409,{code:'rediscuss-unavailable',error:'このトピックでは質疑が進行中です。'}):null);
+ c.select(id);c.dialog.showModal();const form=revisionForm(c);change(target(form,'scope'),true);change(modeInput(form,'rediscuss'),true);form.fire('submit');await tick();
+ assert.equal(c.dialog.open,true);assert.match(c.detail.textContent,/質疑が進行中/);assert.equal(c.current.locked,true);assert.equal(calls.length,1);
+});
+test('explicit proposer confirmation closes after acceptance and never posts a QA start',async()=>{
+ const {c,calls}=setup();c.select(id);c.dialog.showModal();const form=revisionForm(c);change(target(form,'approach'),true);form.fire('submit');await tick();
+ assert.equal(c.dialog.open,false);assert.equal(JSON.parse(calls[0].options.body).mode,'proposer');assert.ok(calls[0].url.endsWith('/revision'));assert.equal(calls.some(x=>x.url.includes('/qa/')),false);
 });
