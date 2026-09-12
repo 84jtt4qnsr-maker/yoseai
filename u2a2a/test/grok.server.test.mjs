@@ -182,7 +182,7 @@ before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u2a2a-grok-"));
   appDir = path.join(tmp, "u2a2a");
   fs.mkdirSync(path.join(appDir, "public"), { recursive: true });
-  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
+  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "tray.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
   fs.writeFileSync(path.join(appDir, "public", "index.html"), "<html></html>");
   poolDir = path.join(appDir, "pool");
   fs.mkdirSync(poolDir);
@@ -221,7 +221,7 @@ test("移行と起動: 旧トピックは 2 名、grok の定義と認証判定�
   assert.equal(s.agents.grok.authed, true);
   assert.deepEqual(Object.keys(s.agentDefs), ["claude", "codex", "grok"]);
   assert.equal(s.agentDefs.grok.name, "Grok");
-  assert.equal(s.schemaVersion, 10); // schemaVersion 10: agentOutcomes（仕様: SPEC-アバター状態.md） // schemaVersion 9: topic.relayHistory（仕様: SPEC-relayHistory.md） // schemaVersion 8: topic.summaryState（仕様: SPEC-要約鮮度.md）
+  assert.equal(s.schemaVersion, 11); // schemaVersion 10: agentOutcomes（仕様: SPEC-アバター状態.md） // schemaVersion 9: topic.relayHistory（仕様: SPEC-relayHistory.md） // schemaVersion 8: topic.summaryState（仕様: SPEC-要約鮮度.md）
   const models = (await api("GET", "/api/models")).body;
   assert.ok(models.grok.includes("grok-4.6-build"));
 });

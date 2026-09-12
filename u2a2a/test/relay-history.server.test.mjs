@@ -104,7 +104,7 @@ before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u2a2a-relayhist-"));
   appDir = path.join(tmp, "u2a2a");
   fs.mkdirSync(path.join(appDir, "public"), { recursive: true });
-  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
+  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "tray.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
   fs.writeFileSync(path.join(appDir, "public", "index.html"), "<html></html>");
   poolDir = path.join(appDir, "pool");
   fs.mkdirSync(poolDir);
@@ -259,8 +259,8 @@ test("6. 保存ファイルの schemaVersion が 10 になる（relayHistory は
   await api("POST", "/api/messages", { author: "user", thread: "claude", text: "保存を起こす", topicId });
   const saved = await waitFor(() => {
     const j = readSaved();
-    return j.schemaVersion === 10 ? j : null;
-  }, "schemaVersion 10");
+    return j.schemaVersion === 11 ? j : null;
+  }, "schemaVersion 11");
   const t = saved.topics.find((x) => x.id === topicId);
   assert.ok(Array.isArray(t.relayHistory));
   for (const rec of t.relayHistory) {

@@ -110,7 +110,7 @@ before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u2a2a-summary-"));
   appDir = path.join(tmp, "u2a2a");
   fs.mkdirSync(path.join(appDir, "public"), { recursive: true });
-  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
+  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "tray.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
   fs.writeFileSync(path.join(appDir, "public", "index.html"), "<html></html>");
   poolDir = path.join(appDir, "pool");
   fs.mkdirSync(poolDir);
@@ -313,8 +313,8 @@ test("12. schemaVersion 7 の state を読むと summaryState が補われ、run
   await api("POST", "/api/messages", { author: "user", thread: "claude", text: "移行後の発言", topicId });
   const saved = await waitFor(() => {
     const j = JSON.parse(fs.readFileSync(file, "utf8"));
-    return j.schemaVersion === 10 ? j : null;
-  }, "schemaVersion 10 が保存される");
+    return j.schemaVersion === 11 ? j : null;
+  }, "schemaVersion 11 が保存される");
   assert.ok(saved.topics.every((t) => t.summaryState && t.summaryState.phase !== "running"));
 });
 

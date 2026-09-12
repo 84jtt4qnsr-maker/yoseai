@@ -1007,6 +1007,29 @@
   .verification-panel fieldset:disabled { opacity: .65; }
   .verification-check { border-top: 1px solid var(--line); padding: 8px 0; }
   .verification-notice { color: var(--dim); }
+
+  .judgment-tray { width: min(900px, calc(100vw - 24px)); max-width: calc(100vw - 24px); max-height: calc(100dvh - 24px); box-sizing: border-box; overflow: auto; }
+  .judgment-tray h2 { font-size: 18px; margin: 0; flex: 1; }
+  .tray-top, .judgment-tray nav { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .judgment-tray nav button[aria-current="true"] { border-color: var(--codex); background: var(--panel); }
+  .tray-card, .tray-detail, .tray-plan-entry { border: 1px solid var(--line); border-radius: 8px; margin: 10px 0; padding: 12px; }
+  .tray-card h4, .tray-detail h4 { margin: 8px 0; }
+  .tray-detail p, .tray-detail li, .tray-card p { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .tray-blockers p { margin: 6px 0; padding: 6px 8px; border-left: 3px solid #d4a35b; background: #d4a35b12; }
+  .tray-version { font-size: 11px; color: var(--dim); overflow-wrap: anywhere; }
+  .judgment-tray fieldset { min-width: 0; margin: 12px 0; border: 1px solid var(--line); border-radius: 6px; padding: 12px; }
+  .judgment-tray fieldset:disabled { opacity: .6; }
+  .judgment-tray label { display: block; margin: 10px 0; }
+  .judgment-tray select, .judgment-tray textarea { display: block; width: 100%; max-width: 100%; box-sizing: border-box; margin-top: 6px; }
+  .judgment-tray input[type="checkbox"] { width: auto; margin-right: 8px; }
+  .judgment-tray button { margin: 4px; }
+  .judgment-tray button:disabled { opacity: .5; cursor: not-allowed; }
+  .judgment-tray pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+  .judgment-tray a { color: var(--codex); overflow-wrap: anywhere; }
+  .judgment-tray :focus-visible, .tray-notification :focus-visible { outline: 2px solid var(--codex); outline-offset: 2px; }
+  .tray-notification { position: fixed; bottom: 20px; right: 20px; z-index: 100; max-width: min(400px, calc(100vw - 40px)); padding: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 4px 20px #0005; }
+  .tray-notification button { margin: 6px 4px 0 0; }
+  .tray-downstream { font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -1293,10 +1316,29 @@
 
 <script src="/avatars.js"></script>
 <script src="/verification-ui.js"></script>
+<script src="/tray-ui.js"></script>
 <script>
 const NAMES = Object.assign(Object.create(null), { user: "ユーザー" });
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
 let state = { messages: [], tasks: [], pool: [], topics: [], projects: [], agents: {}, running: {}, reviewPending: {}, fixPending: {}, activity: {}, runs: [], events: [], storageMetrics: {} };
+
+// ---- 判断トレイ（契約版1の評価済み応答だけを表示）----
+const trayUI = new U2ATray.Controller({
+  topicName: id => state.topics.find(t => t.id === id)?.title || id,
+  agentName: id => NAMES[id] || id,
+  onTask: id => {
+    const task = state.tasks.find(t => t.id === id);
+    if (!task) { toast("タスクが見つかりません"); return; }
+    switchTopic(task.topicId);
+    if (requestedView() !== "columns") setViewMode("columns");
+    taskZoneOpen[task.agent] = true;
+    render();
+    const element = document.getElementById("tray-task-" + id);
+    element?.scrollIntoView({ block: "center" });
+    element?.focus();
+  },
+});
+document.querySelector("header").append(trayUI.launcher);
 
 // ---- トピック（スレッド）----
 let currentTopicId = localStorage.getItem("u2a2a-topic") || null;
@@ -4600,8 +4642,12 @@ function taskEl(t) {
   ];
   if (t.detail) kids.push(el("div", { class: "t-detail", text: t.detail }));
   if (t.result) kids.push(el("div", { class: "t-result", text: "結果: " + t.result }));
+  if (t.status === "returned") {
+    const next = trayUI.downstream(t.id);
+    if (next) kids.push(el("p", { class: "tray-downstream", text: next }));
+  }
   kids.push(actions);
-  return el("div", { class: "task" }, kids);
+  return el("div", { class: "task", id: "tray-task-" + t.id, tabindex: "-1" }, kids);
 }
 
 function renderTasks(agent) {
@@ -5190,8 +5236,11 @@ function wireAgent(agent) {
 }
 // ---- live sync ----
 const es = new EventSource("/api/events");
+es.onerror = () => trayUI.disconnect();
 es.onmessage = (e) => {
   state = JSON.parse(e.data);
+  if (state.tray) trayUI.update(state.tray);
+  else trayUI.disconnect("判断トレイAPIはまだ利用できません。");
   noteMessageSearchUpdate();
   render();
 };

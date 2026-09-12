@@ -59,11 +59,16 @@ import {
 } from "./lib.mjs";
 // 成果物の版と必須検証の共通モジュール（契約: 契約-成果物検証API.md）。名前の衝突を避けるため名前空間で読む
 import * as verif from "./verification.mjs";
+// 判断トレイの共通モジュール（契約: 契約-判断トレイAPI.md）。I/O を持たない純関数の集まり
+import * as tray from "./tray.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = path.join(__dirname, "data");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
+// 判断トレイの依頼ログ（契約 §12.1）。1 行 = その時点の依頼レコード全体。
+// 追記だけで、読み込み時は id ごとに最後の行を採る（依頼は状態が変わるので、checks.jsonl のような不変記録ではない）
+const TRAY_FILE = path.join(DATA_DIR, "tray.jsonl");
 const REPO_ROOT = path.resolve(__dirname, "..");
 // 共有タスクプールの実体はリポジトリ内のフォルダ（DAS）。
 // エージェント CLI（cwd=リポジトリ・読み取り可）からパスでそのまま読める。
@@ -171,6 +176,7 @@ function defaultTopic(title, participants = LEGACY_AGENTS) {
     summaryUsageLegacyUnknown: false,
     relayHistory: [], // 終わった質疑リレーの確定記録（仕様: SPEC-relayHistory.md）
     agentOutcomes: {}, // エージェント別の最新の終了状態（仕様: SPEC-アバター状態.md §4。分岐先には引き継がない）
+    trayContinuation: null, // 判断トレイの継続予約（契約-判断トレイAPI.md §10.3）。1 件だけ持つ
   };
 }
 
@@ -190,6 +196,7 @@ function emptyState() {
     usageDay: null,
     budgetHalt: null,
     unattributedOutcomes: {}, // トピックに帰属しない review / fix の終了状態（仕様: SPEC-アバター状態.md §4.3）
+    trayRequests: [], // 判断トレイの依頼（正本は data/tray.jsonl。state.json には保存しない）
   };
 }
 
@@ -304,6 +311,11 @@ function loadState() {
       // 過去の停止・失敗からは復元しない（解除の履歴が無く、解決済みの停止を蘇らせるため）
       parsed.unattributedOutcomes = sanitizeOutcomes(parsed.unattributedOutcomes, AGENTS);
       for (const t of parsed.topics) t.agentOutcomes = sanitizeOutcomes(t.agentOutcomes, AGENTS);
+      // schemaVersion 11: 判断トレイ（契約-判断トレイAPI.md §12.2）。
+      // 依頼そのものは data/tray.jsonl から読むのでここでは器だけ用意する。
+      // 過去の応答本文を遡って依頼を復元することはしない（受付は応答時の 1 回だけ）
+      parsed.trayRequests = [];
+      for (const t of parsed.topics) t.trayContinuation = sanitizeContinuation(t.trayContinuation);
       for (const m of parsed.messages) migrateMeta(m);
       // schemaVersion 5: 既存プールアイテムへ所属（topicId）と作者（origin）を補完する
       // （合意事項: 既存ファイルは動かさない。情報の補完のみ）
@@ -412,8 +424,10 @@ function persistState() {
   const t0 = Date.now();
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    state.schemaVersion = 10;
-    const jsonStr = JSON.stringify(state, null, 2);
+    state.schemaVersion = 11;
+    // trayRequests の正本は data/tray.jsonl。state.json に二重に持つと、どちらが正か分からなくなる
+    const { trayRequests, ...persisted } = state;
+    const jsonStr = JSON.stringify(persisted, null, 2);
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, jsonStr);
     fs.renameSync(tmp, STATE_FILE);
@@ -728,7 +742,7 @@ const REPO_ROOT_INFO = { name: path.basename(REPO_ROOT), path: REPO_ROOT };
 
 function publicState() {
   // running / reviewPending / fixPending は互換用の派生値。正は runs レジストリ
-  return { ...state, agentDefs: AGENT_DEFS, running, reviewPending, fixPending, activity, poolDirs, repoRoot: REPO_ROOT_INFO, runs: publicRuns(), agentState: agentStateNow(), events, storageMetrics };
+  return { ...state, agentDefs: AGENT_DEFS, running, reviewPending, fixPending, activity, poolDirs, repoRoot: REPO_ROOT_INFO, runs: publicRuns(), agentState: agentStateNow(), tray: trayViewNow(), events, storageMetrics };
 }
 
 function broadcast() {
@@ -981,11 +995,16 @@ async function projectContext(projectId) {
   return { project, probe, blockReason };
 }
 
-// Claude の起動引数（書き込みは pool のみ。Write(path) 規則はファイル権限に作用しないので Edit のみ。対象があれば --add-dir で読み取りを許可）
-// 相対規則は作業ディレクトリ基準で解決されるため、シェルで pool 深部へ cd した後の編集が拒否される
-// （実測: .work/impl-*/ 内で停止）。絶対パス規則を併記し、cd に依らず pool 配下への書き込みを許す
+// Claude の起動引数（書き込みは pool のみ。対象があれば --add-dir で読み取りを許可）
+// 相対規則は作業ディレクトリ基準で解決され、resume はシェルの cd 位置も引き継ぐため、
+// pool 深部で止まる事故が再発した（実測: .work/impl-*/ 内で停止）。絶対パス規則を併記する。
+// Write 規則は以前は不活性だったが、現行 CLI では新規ファイル作成が Edit 規則で許可されない
+// （実測: 既存ファイルの Edit は通り、同じフォルダへの Write が拒否される）ため、Write も両形式で渡す
 function claudeToolArgs(project) {
-  const args = ["--allowedTools", "Edit(u2a2a/pool/**)", `Edit(${POOL_DIR}/**)`, "Bash(python3:*)", "Bash(ffmpeg:*)"];
+  const args = ["--allowedTools",
+    "Edit(u2a2a/pool/**)", `Edit(${POOL_DIR}/**)`,
+    "Write(u2a2a/pool/**)", `Write(${POOL_DIR}/**)`,
+    "Bash(python3:*)", "Bash(ffmpeg:*)"];
   if (project) args.push("--add-dir", project.path);
   return args;
 }
@@ -2834,6 +2853,10 @@ async function agentLoop(topicId, agent) {
         } else if (relayLive) {
           qaHop(topic, agent, text, replyMsg.id);
         }
+        // 判断トレイの受付は qaHop の後（契約 §6.1）。ここまで来れば「終了宣言が受理されたか」が確定していて、
+        // 合意メモ §2 の「終了が不受理なら同じ応答の着手提案も捨てる」を判定できる。
+        // stale（古いリレー宛て）と stopped（権限要求・中断）は本文が途中で切れている可能性があるので受け付けない
+        if (!stale && !stopped) trayIntake(topic, agent, text, replyMsg.id);
       } catch (e) {
         // エラー/キャンセルで質疑が空回りしないよう停止（この実行の手番のリレーに限る。別リレーは触らない）
         if (sameRelay()) stopRelay(topic, e.cancelled ? "cancelled" : "error");
@@ -2873,6 +2896,9 @@ async function agentLoop(topicId, agent) {
     }
   } finally {
     running[key] = false;
+    // 実行中は見送っていた継続予約をここで拾う（§10.3。armed でない ＝ 再起動で復元した予約は動かない）
+    const t = findTopic(topicId);
+    if (t) trayFireContinuation(t);
     touch();
   }
 }
@@ -3027,6 +3053,26 @@ async function handleApi(req, res, url) {
     delete store[body.agent];
     if (cleared) touch();
     return json(res, 200, { ok: true, cleared });
+  }
+
+  // ---- 判断トレイ（契約: 契約-判断トレイAPI.md §9）----
+  if (parts[0] === "api" && parts[1] === "tray") {
+    if (req.method === "GET" && parts.length === 2) {
+      const tid = url.searchParams.get("topicId");
+      await trayRefreshAll(tid); // 取得時にも再評価する（§8）
+      const view = trayViewNow();
+      if (!tid) return json(res, 200, view);
+      const slot = view.topics[tid] || { waiting: [], later: [], history: [], pendingSlotTaken: false };
+      const ids = new Set([...slot.waiting, ...slot.later, ...slot.history]);
+      return json(res, 200, { ...view, topics: { [tid]: slot }, requests: Object.fromEntries(Object.entries(view.requests).filter(([k]) => ids.has(k))) });
+    }
+
+    if (req.method === "POST" && parts.length === 4 && ["answer", "approve", "revision", "reject", "park", "unpark"].includes(parts[3])) {
+      return trayAction(req, res, parts[2], parts[3]);
+    }
+    if (req.method === "POST" && parts.length === 5 && parts[3] === "plan" && parts[4] === "retry") {
+      return trayAction(req, res, parts[2], "retry");
+    }
   }
 
   // アバター配信（§7）: manifest は再検証、画像は内容ハッシュ付き URL で immutable
@@ -3770,6 +3816,8 @@ async function handleApi(req, res, url) {
     if (req.method === "PATCH" && parts.length === 3) {
       const body = await readBody(req);
       if (body.status && TASK_STATUSES.includes(body.status)) task.status = body.status;
+      // done になった前提タスクの後続を、承認済み計画から送る（追加承認は求めない・契約 §10.2）
+      trayAdvancePlans(task.topicId);
       touch();
       return json(res, 200, task);
     }
@@ -4285,6 +4333,594 @@ function serveStatic(res, url) {
     res.end(data);
   });
 }
+
+// ---- 判断トレイ（契約: 契約-判断トレイAPI.md）----
+// 依頼の解析・被覆・実行可否は tray.mjs（純関数）が持ち、ここは永続化と副作用だけを持つ。
+// 正本は data/tray.jsonl（1 行 = その時点の依頼レコード全体。同じ id は後の行が勝つ）
+
+const TRAY_LOG_VERSION = 1;
+const trayLog = { ok: true, lastSeq: 0, error: null, skipped: 0 };
+const trayBaseCache = new Set();
+
+// 継続予約の復元（§12.3）。armed は保存しない —— 再起動直後に勝手に CLI が動かないようにする
+function sanitizeContinuation(c) {
+  if (!c || typeof c !== "object" || !AGENTS.includes(c.agent) || typeof c.requestId !== "string") return null;
+  return { agent: c.agent, requestId: c.requestId, reason: c.reason === "revision" ? "revision" : "answer", ts: Number(c.ts) || Date.now(), armed: false };
+}
+
+function trayLoadLog() {
+  let text = "";
+  try {
+    text = fs.readFileSync(TRAY_FILE, "utf8");
+  } catch (e) {
+    if (e && e.code === "ENOENT") return; // 初回は空
+    trayLog.ok = false;
+    trayLog.error = String(e.message || e).slice(0, 200);
+    logEvent("tray", "tray.jsonl を読めません。トレイの受付を止めます: " + trayLog.error);
+    return;
+  }
+  const byId = new Map();
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const rec = JSON.parse(line);
+      if (!rec || rec.v !== TRAY_LOG_VERSION || !rec.request || typeof rec.request.id !== "string") throw new Error("形が不正");
+      trayLog.lastSeq = Math.max(trayLog.lastSeq, Number(rec.seq) || 0);
+      byId.set(rec.request.id, rec.request); // 同じ id は後の行が勝つ（状態遷移のたびに 1 行足す）
+    } catch {
+      trayLog.skipped++; // 壊れた 1 行で全部を失わない。件数は運用ログに出す
+    }
+  }
+  state.trayRequests = [...byId.values()].sort((a, b) => (a.ts || 0) - (b.ts || 0) || String(a.id).localeCompare(String(b.id)));
+  if (trayLog.skipped) logEvent("tray", `tray.jsonl に読めない行が ${trayLog.skipped} 件ありました（その依頼の最新状態を取り逃している可能性があります）`, "warn");
+}
+
+// 依頼 1 件を追記する。書けなければ false（呼び出し側が 500 を返し、メモリ上の状態も戻す）
+function trayWrite(request) {
+  if (!trayLog.ok) return false;
+  request.updatedTs = Date.now();
+  // checks（基点・メモの確認結果）は派生値なので残さない。再起動直後は「未確認」から始め、
+  // 取得時と承認直前の再評価で取り直す（§8）。古い "verified" を蘇らせない
+  const { checks, ...persisted } = request;
+  const line = JSON.stringify({ v: TRAY_LOG_VERSION, seq: trayLog.lastSeq + 1, ts: request.updatedTs, request: persisted }) + "\n";
+  let fd = null;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fd = fs.openSync(TRAY_FILE, "a");
+    const buf = Buffer.from(line, "utf8");
+    for (let off = 0; off < buf.length; ) off += fs.writeSync(fd, buf, off, buf.length - off);
+    fs.fsyncSync(fd);
+    trayLog.lastSeq++;
+    return true;
+  } catch (e) {
+    trayLog.ok = false;
+    trayLog.error = String(e.message || e).slice(0, 200);
+    logEvent("tray", "tray.jsonl への追記に失敗しました: " + trayLog.error);
+    return false;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // close の失敗は書込結果に影響しない
+      }
+    }
+  }
+}
+
+const trayFind = (id) => state.trayRequests.find((r) => r.id === id) || null;
+const trayOfTopic = (topicId) => state.trayRequests.filter((r) => r.topicId === topicId);
+const trayActivePending = (topicId) => trayOfTopic(topicId).find((r) => r.status === "pending") || null;
+
+function trayPoolSha(rel) {
+  const abs = poolFilePath(rel);
+  if (!abs) return null;
+  try {
+    return verif.sha256Hex(fs.readFileSync(abs));
+  } catch {
+    return null;
+  }
+}
+
+// §8 の再評価に要る「今のファイル・今の基点」を取り直す。SSE は同期で作るので、結果は依頼に持たせる
+async function trayRefresh(request) {
+  const block = request.block || {};
+  const checks = { basisStatus: "ok", detailsStatus: {}, baseCommitStatus: "verified", head: null, ts: Date.now() };
+  if (request.kind === "start-task") {
+    if (request.basisDigest && request.basisDigest.kind === "memo") {
+      const now = trayPoolSha(request.basisDigest.path);
+      checks.basisStatus = now === null ? "missing" : now === request.basisDigest.sha256 ? "ok" : "changed";
+    }
+    for (const [p, sha] of request.detailsDigests || []) {
+      const now = trayPoolSha(p);
+      checks.detailsStatus[p] = now === null ? "missing" : now === sha ? "ok" : "changed";
+    }
+    const repo = REPO_ROOT;
+    const key = repo + "\0" + block.baseCommit;
+    if (trayBaseCache.has(key)) checks.baseCommitStatus = "verified";
+    else {
+      const r = await gitExec(repo, ["cat-file", "-e", block.baseCommit + "^{commit}"]);
+      if (r.ok) {
+        trayBaseCache.add(key);
+        checks.baseCommitStatus = "verified";
+      } else {
+        const probe = await gitExec(repo, ["rev-parse", "--git-dir"]);
+        checks.baseCommitStatus = probe.ok ? "not-found" : "unverifiable";
+      }
+    }
+    const head = await gitExec(repo, ["rev-parse", "HEAD"]);
+    checks.head = head.ok ? String(head.out || "").trim() : null;
+  }
+  request.checks = checks;
+  return checks;
+}
+
+async function trayRefreshAll(topicId = null) {
+  for (const r of state.trayRequests) {
+    if (topicId && r.topicId !== topicId) continue;
+    if (!tray.ACTIVE_STATES.includes(r.status)) continue;
+    await trayRefresh(r);
+  }
+}
+
+// 1 件の評価（§8・§9.1）。checks がまだ無ければ基点・メモの理由は出さない
+// （承認・回答の直前は必ず trayRefresh してから呼ぶので、押す瞬間の判定は取りこぼさない）
+function trayEvaluateOne(request) {
+  const topic = findTopic(request.topicId);
+  const participants = topic ? topic.participants || LEGACY_AGENTS : [];
+  const c = request.checks;
+  const blockers = tray.evaluateBlockers({
+    request,
+    requests: state.trayRequests,
+    participants,
+    agents: state.agents,
+    budgetHalt: state.budgetHalt,
+    basisStatus: c ? c.basisStatus : "ok",
+    detailsStatus: c ? c.detailsStatus : {},
+    baseCommitStatus: c ? c.baseCommitStatus : "verified",
+    head: c ? c.head : null,
+  });
+  const titleOf = (id) => {
+    const r = trayFind(id);
+    return r ? (r.block || {}).title || "" : "（見つかりません）";
+  };
+  const statusOf = (id) => (trayFind(id) || {}).status || "missing";
+  return {
+    proposerName: NAMES[request.proposer] || request.proposer,
+    blockers,
+    basis: request.basisDigest ? { ...request.basisDigest, status: c ? c.basisStatus : "unchecked" } : null,
+    details: (request.detailsDigests || []).map(([p, sha]) => ({ path: p, sha256: sha, status: c ? c.detailsStatus[p] || "ok" : "unchecked" })),
+    baseCommit: (request.block || {}).baseCommit
+      ? { value: request.block.baseCommit, status: c ? c.baseCommitStatus : "unchecked", headMatches: c && c.head ? c.head === request.block.baseCommit : null }
+      : null,
+    dependencies: {
+      waiting: (request.acceptedDependsOn || []).map((id) => ({ id, title: titleOf(id), status: statusOf(id) })),
+      excluded: (request.acceptedExclude || []).map((e) => ({ id: e.id, title: titleOf(e.id), reason: e.reason, status: statusOf(e.id) })),
+      coverage: blockers.some((b) => b.code === "dependency-coverage-changed") ? "changed" : "ok",
+    },
+  };
+}
+
+function trayViewNow() {
+  const evaluations = {};
+  for (const r of state.trayRequests) evaluations[r.id] = trayEvaluateOne(r);
+  return { ...tray.buildTrayView({ requests: state.trayRequests, topics: state.topics.map((t) => t.id), now: Date.now(), evaluations }), log: { ok: trayLog.ok, error: trayLog.error, skipped: trayLog.skipped } };
+}
+
+// 受付の拒否は黙って捨てない（§6.3）。提案者の発言として印付きで 1 件残す
+function trayReject(topic, agent, codes, detail) {
+  state.messages.push({
+    id: id(),
+    topicId: topic.id,
+    thread: agent,
+    author: agent,
+    text: "⚠ 判断トレイの依頼を受け付けませんでした: " + String(detail || codes.join(" / ")).slice(0, 500),
+    tray: { kind: "rejected", codes, requestId: null },
+    provenance: { ingress: "agent-loop", delivery: "direct", trigger: "auto", source: null },
+    ts: Date.now(),
+  });
+  logEvent("tray", `${NAMES[agent]} の依頼を受け付けませんでした（${codes.join(" / ")}）`, "warn");
+  touch();
+  return null;
+}
+
+// 応答 1 件からの受付（§6.1。qaHop の後に呼ぶ ＝ 終了宣言が受理されたかを見てから判定する）
+function trayIntake(topic, agent, text, msgId) {
+  if (!trayLog.ok) return null;
+  const blocks = tray.extractRequestBlocks(text);
+  if (!blocks.length) return null;
+  if (blocks.length > 1) return trayReject(topic, agent, ["block-multiple"], tray.SHAPE_CODES["block-multiple"]);
+
+  const v = tray.validateRequestBlock(blocks[0].raw, { agents: AGENTS });
+  if (!v.ok) return trayReject(topic, agent, [...new Set(v.errors.map((e) => e.code))], v.errors.slice(0, 5).map((e) => `${e.path || "（全体）"}: ${e.message}`).join(" / "));
+  const block = v.block;
+  const parts = topic.participants || LEGACY_AGENTS;
+  const bad = (code, detail) => trayReject(topic, agent, [code], detail || tray.ACCEPT_CODES[code]);
+
+  if (!parts.includes(agent)) return bad("not-participant");
+  if (block.continueAgent && !parts.includes(block.continueAgent)) return bad("continue-agent-not-participant");
+
+  let basisDigest = null;
+  const detailsDigests = [];
+  if (v.kind === "start-task") {
+    if (topic.relay.active) return bad("start-task-during-relay");
+    for (const t of block.tasks) if (!parts.includes(t.agent)) return bad("task-agent-not-participant", `${NAMES[t.agent] || t.agent} はこのトピックの参加者ではありません`);
+    if (block.basis.relayId !== undefined) {
+      const rec = (topic.relayHistory || []).find((h) => h && h.id === block.basis.relayId);
+      if (!rec) return bad("basis-not-found");
+      // 合意で終わった質疑だけが着手の根拠になる（hops / error / cancelled では足りない）
+      if (rec.stopReason !== "agreed") return bad("basis-not-agreed", `この質疑は「${rec.stopReason || "不明"}」で終わっています`);
+      basisDigest = { kind: "relay", relayId: block.basis.relayId };
+    } else {
+      const sha = trayPoolSha(block.basis.memo);
+      if (sha === null) return bad("basis-not-found", `${block.basis.memo} を読めません`);
+      basisDigest = { kind: "memo", path: block.basis.memo, sha256: sha };
+    }
+    for (const p of block.details || []) {
+      const sha = trayPoolSha(p);
+      if (sha === null) return bad("details-not-found", `${p} を読めません`);
+      detailsDigests.push([p, sha]);
+    }
+  }
+
+  // 置換は明示したときだけ（§4.3）。issueId 一致も明示のうち
+  let replaced = null;
+  if (block.replaces) {
+    replaced = trayOfTopic(topic.id).find((r) => r.id === block.replaces && tray.ACTIVE_STATES.includes(r.status)) || null;
+    if (!replaced) return bad("replaces-not-found");
+  } else if (block.issueId) {
+    replaced = trayOfTopic(topic.id).find((r) => (r.block || {}).issueId === block.issueId && tray.ACTIVE_STATES.includes(r.status)) || null;
+  }
+  const pending = trayActivePending(topic.id);
+  if (pending && (!replaced || replaced.id !== pending.id)) return bad("pending-conflict", `「${(pending.block || {}).title || ""}」がまだ未回答です`);
+
+  // 依存の候補と被覆（§5）。質問の dependsOn は任意で被覆を求めないが、書かれていれば保持する
+  let accepted = { dependsOn: block.dependsOn || [], exclude: block.exclude || [] };
+  if (v.kind === "start-task") {
+    const others = state.trayRequests.filter((r) => !replaced || r.id !== replaced.id);
+    const candidates = tray.dependencyCandidates({ basis: block.basis, requests: others, topicId: topic.id, relayId: topic.relay.id || null });
+    const r = tray.resolveDependencies({ block, candidates, requests: others, topicId: topic.id });
+    if (!r.ok) return trayReject(topic, agent, [...new Set(r.errors.map((e) => e.code))], r.errors.slice(0, 5).map((e) => `${e.path}: ${e.message}`).join(" / "));
+    accepted = r;
+  }
+
+  // 展開した集合をブロックへ書き戻してから版を決める（§5.2。後から無言で依存先が変わらない）
+  const finalBlock = tray.normalizeRequestBlock({ ...block, dependsOn: accepted.dependsOn, exclude: accepted.exclude });
+  const request = {
+    id: "req_" + id(),
+    topicId: topic.id,
+    proposer: agent,
+    relayId: topic.relay.id || null,
+    fromMessageId: msgId || null,
+    kind: v.kind,
+    status: "pending",
+    block: finalBlock,
+    acceptedDependsOn: accepted.dependsOn,
+    acceptedExclude: accepted.exclude,
+    basisDigest,
+    detailsDigests,
+    proposalSha256: tray.computeProposalSha256({ topicId: topic.id, proposer: agent, block: finalBlock, basisDigest, detailsDigests }),
+    answer: null,
+    decision: null,
+    plan: null,
+    supersededBy: null,
+    ts: Date.now(),
+    updatedTs: Date.now(),
+    checks: null,
+  };
+  if (replaced) {
+    replaced.status = "superseded";
+    replaced.supersededBy = request.id;
+    if (!trayWrite(replaced)) return trayReject(topic, agent, ["log-write-failed"], "tray.jsonl へ書けませんでした");
+  }
+  if (!trayWrite(request)) return trayReject(topic, agent, ["log-write-failed"], "tray.jsonl へ書けませんでした");
+  state.trayRequests.push(request);
+  logEvent("tray", `${NAMES[agent]} の${v.kind === "question" ? "質問" : "着手提案"}を受け付けました: ${finalBlock.title}`, "info");
+  trayRefresh(request).then(touch, () => {});
+  touch();
+  return request;
+}
+
+// 回答・修正・見送りは参加者全員へ 1 件ずつ届ける。maybeTrigger は呼ばない（全員同時起動を避ける・§9.2）
+function trayShare(topic, text, meta) {
+  const created = (topic.participants || LEGACY_AGENTS).map((t) => ({
+    id: id(),
+    topicId: topic.id,
+    thread: t,
+    author: "user",
+    text,
+    tray: meta,
+    provenance: { ingress: "ui", delivery: "direct", trigger: "manual", source: null },
+    ts: Date.now(),
+  }));
+  state.messages.push(...created);
+  return created;
+}
+
+const trayThreadRunning = (topicId) => Object.values(runs).some((r) => r.kind === "thread" && r.topicId === topicId);
+
+// 継続予約（§10.3）。リレー進行中は次の手番に任せる。予約は 1 件だけで、新しい予約が古い予約を上書きする
+function trayReserveContinuation(topic, agent, requestId, reason) {
+  if (!agent || !(topic.participants || LEGACY_AGENTS).includes(agent)) return null;
+  if (topic.relay.active) return null;
+  const reservation = { agent, requestId, reason, ts: Date.now(), armed: true };
+  topic.trayContinuation = reservation;
+  // すぐ起動できる場合 trayFireContinuation が topic.trayContinuation を null にするので、
+  // 呼び出し側へは「何を予約したか」を返す（topic 側を読み直すと null になる）
+  trayFireContinuation(topic);
+  return { ...reservation, fired: topic.trayContinuation === null };
+}
+
+function trayFireContinuation(topic) {
+  const c = topic && topic.trayContinuation;
+  if (!c || !c.armed) return; // 再起動で復元した予約は armed でない ＝ 勝手には走らない（§12.3）
+  if (topic.relay.active || trayThreadRunning(topic.id)) return; // 実行中なら完了後に改めて
+  if (!agentAutoOn(c.agent)) return; // 自動応答 OFF・上限停止のときは予約を残して理由を見せる
+  if (c.agent === "grok" && state.agents.grok.authed !== true) return;
+  topic.trayContinuation = null;
+  agentLoop(topic.id, c.agent);
+}
+
+// ---- 承認計画の実行（§10）----
+
+function trayTaskFor(request, t) {
+  const b = request.block;
+  const detail = [
+    `目的: ${b.outcome}`,
+    `範囲: ${(t.scope || []).join(" / ")}`,
+    b.outOfScope && b.outOfScope.length ? `範囲外: ${b.outOfScope.join(" / ")}` : "",
+    `基点: ${b.baseCommit}`,
+    (b.details || []).length ? `参照: ${b.details.join(" / ")}` : "",
+    `判断トレイの承認: ${request.id}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const task = {
+    id: id(),
+    agent: t.agent,
+    topicId: request.topicId,
+    title: t.title,
+    detail,
+    status: "queued",
+    fromMessageId: request.fromMessageId || null,
+    result: "",
+    ts: Date.now(),
+  };
+  state.tasks.push(task);
+  return task;
+}
+
+function traySendEntry(request, entry) {
+  const topic = findTopic(request.topicId);
+  if (!topic) return;
+  const participants = topic.participants || LEGACY_AGENTS;
+  const blocked = tray.sendBlockers(entry.agent, { agents: state.agents, budgetHalt: state.budgetHalt, participants });
+  if (blocked.length) {
+    entry.send = blocked.some((b) => b.severity === "block") ? "blocked" : "ready";
+    entry.error = blocked.map((b) => b.message).join(" / ");
+    return;
+  }
+  const task = state.tasks.find((t) => t.id === entry.taskId);
+  const msg = {
+    id: id(),
+    topicId: topic.id,
+    thread: entry.agent,
+    author: "user",
+    text: `▶ 着手をお願いします（タスク: ${task ? task.title : entry.key}）\n${task ? task.detail : ""}`,
+    tray: { kind: "start", requestId: request.id, taskKey: entry.key, taskId: entry.taskId },
+    provenance: { ingress: "ui", delivery: "direct", trigger: "manual", source: null },
+    ts: Date.now(),
+  };
+  try {
+    state.messages.push(msg);
+    entry.send = "sent";
+    entry.messageId = msg.id;
+    entry.sentTs = msg.ts;
+    entry.error = null;
+    agentLoop(topic.id, entry.agent); // 担当 1 名だけを起こす
+  } catch (e) {
+    entry.send = "failed";
+    entry.error = String(e.message || e).slice(0, 200);
+  }
+}
+
+// 前提が done になった計画の後続を送る（追加承認は求めない・§10.2）
+function trayAdvancePlans(topicId = null) {
+  let changed = false;
+  for (const r of state.trayRequests) {
+    if (r.status !== "approved" || !r.plan) continue;
+    if (topicId && r.topicId !== topicId) continue;
+    const topic = findTopic(r.topicId);
+    if (!topic) continue;
+    const participants = topic.participants || LEGACY_AGENTS;
+    let touched = false;
+    for (const e of r.plan.entries) {
+      if (e.send === "sent") continue;
+      const next = tray.planSendState(e, { entries: r.plan.entries, tasks: state.tasks, participants });
+      if (next !== "ready") {
+        if (e.send !== next && e.send !== "failed") {
+          e.send = next;
+          touched = true;
+        }
+        continue;
+      }
+      if (!e.taskId) {
+        const spec = (r.block.tasks || []).find((t) => t.key === e.key);
+        if (spec) e.taskId = trayTaskFor(r, spec).id;
+        touched = true;
+      }
+      const before = e.send + "\0" + (e.error || "");
+      traySendEntry(r, e);
+      if (before !== e.send + "\0" + (e.error || "")) touched = true; // 変化が無ければログ行を増やさない
+    }
+    if (touched) {
+      trayWrite(r);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+// ---- トレイ API の本体（§9.2〜§9.7）----
+
+const ACTION_TRANSITION = { answer: "answer", approve: "approve", revision: "revision", reject: "reject", park: "park", unpark: "unpark" };
+
+async function trayAction(req, res, requestId, action) {
+  if (!trayLog.ok) return json(res, 503, { error: "tray.jsonl を読み書きできません", code: "log-unavailable", detail: trayLog.error });
+  const request = trayFind(requestId);
+  if (!request) return json(res, 404, { error: "依頼が見つかりません", code: "request-not-found" });
+  let body;
+  try {
+    body = await readBody(req);
+  } catch {
+    return json(res, 400, { error: "本文が JSON ではありません", code: "invalid-json" });
+  }
+  const topic = findTopic(request.topicId);
+  if (!topic) return json(res, 404, { error: "トピックが見つかりません", code: "topic-not-found" });
+
+  const view = () => trayViewNow().requests[request.id];
+  const stale = () => json(res, 409, { error: "提案の内容が変わっています。表示し直してください", code: "stale-proposal", current: view() });
+
+  // 再送は承認済みの計画に対する操作なので、版だけを見る（状態遷移はしない）
+  if (action === "retry") {
+    if (body.proposalSha256 !== request.proposalSha256) return stale();
+    if (request.status !== "approved" || !request.plan) return json(res, 409, { error: "承認済みの計画がありません", code: "no-plan" });
+    const keys = typeof body.taskKey === "string" ? [body.taskKey] : request.plan.entries.map((e) => e.key);
+    for (const e of request.plan.entries) {
+      if (!keys.includes(e.key) || e.send === "sent") continue;
+      if (e.send === "failed" || e.send === "ready" || e.send === "blocked") e.send = "ready";
+      e.error = null;
+    }
+    trayAdvancePlans(request.topicId);
+    trayWrite(request);
+    touch();
+    return json(res, 200, { request: view(), plan: request.plan });
+  }
+
+  if (typeof body.proposalSha256 !== "string") return json(res, 400, { error: "proposalSha256 は必須です", code: "invalid-request", errors: [{ code: "missing", path: "proposalSha256", message: "押した版を明示してください" }] });
+  // 承認の冪等（§9.3）: 同じ提案・同じ版の 2 回目は新規作成せず最初の結果を返す
+  if (action === "approve" && request.status === "approved" && request.plan && tray.idempotencyKey(request.id, body.proposalSha256) === tray.idempotencyKey(request.id, request.plan.proposalSha256)) {
+    return json(res, 200, { request: view(), plan: request.plan, idempotent: true });
+  }
+  if (body.proposalSha256 !== request.proposalSha256) return stale();
+  if (!tray.canTransition(request.status, ACTION_TRANSITION[action])) {
+    return json(res, 409, { error: `この依頼は「${request.status}」なのでこの操作はできません`, code: tray.TERMINAL_STATES.includes(request.status) ? "already-final" : "invalid-transition", status: request.status });
+  }
+
+  // 退避・復帰は評価を要しない（依存は解除されないが、押せない理由とは無関係）
+  if (action === "park" || action === "unpark") {
+    if (action === "unpark" && trayActivePending(topic.id)) return json(res, 409, { error: "このトピックには未回答の依頼がすでにあります", code: "pending-conflict" });
+    request.status = action === "park" ? "parked" : "pending";
+    if (!trayWrite(request)) return json(res, 500, { error: "tray.jsonl へ書けませんでした", code: "log-write-failed" });
+    touch();
+    return json(res, 200, { request: view() });
+  }
+
+  await trayRefresh(request); // 押す直前にもう一度調べる（§8）
+  const blockers = trayEvaluateOne(request).blockers;
+  const hard = blockers.filter((b) => b.severity === "block");
+  if (hard.length && (action === "answer" || action === "approve")) return json(res, 409, { error: hard[0].message, code: "not-actionable", blockers });
+
+  if (action === "answer") {
+    if (request.kind !== "question") return json(res, 400, { error: "これは質問ではありません", code: "not-a-question" });
+    const qs = request.block.questions || [];
+    const answers = Array.isArray(body.answers) ? body.answers : null;
+    const errors = [];
+    if (!answers || answers.length !== qs.length) errors.push({ code: "answers-incomplete", path: "answers", message: "全問に 1 件ずつ答えてください" });
+    else {
+      for (const q of qs) {
+        const hit = answers.filter((a) => a && a.questionId === q.id);
+        if (hit.length !== 1) {
+          errors.push({ code: "answers-incomplete", path: "answers", message: `「${q.text}」への回答が ${hit.length} 件です` });
+          continue;
+        }
+        const a = hit[0];
+        const known = [...q.options.map((o) => o.id), ...tray.SYSTEM_OPTIONS];
+        if (!known.includes(a.optionId)) errors.push({ code: "answers-unknown-option", path: "answers", message: `「${a.optionId}」はこの問の選択肢ではありません` });
+        if (a.optionId === "__other" && !(typeof a.text === "string" && a.text.trim() && Array.from(a.text.trim()).length <= tray.LIMITS.note)) {
+          errors.push({ code: "answers-text-required", path: "answers", message: "「その他」には内容を書いてください" });
+        }
+        if (a.optionId === "__defer" && a.text !== undefined) errors.push({ code: "answers-text-forbidden", path: "answers", message: "「あとで答える」に内容は付けられません" });
+      }
+      for (const a of answers) if (!qs.some((q) => q.id === (a || {}).questionId)) errors.push({ code: "answers-unknown-question", path: "answers", message: `${(a || {}).questionId} という問はありません` });
+    }
+    if (errors.length) return json(res, 400, { error: errors[0].message, code: "invalid-request", errors });
+
+    // 全問「あとで答える」は回答ではなく退避（§9.2。回答済みにすると依存する着手が押せてしまう）
+    if (answers.every((a) => a.optionId === "__defer")) {
+      request.status = "parked";
+      if (!trayWrite(request)) return json(res, 500, { error: "tray.jsonl へ書けませんでした", code: "log-write-failed" });
+      touch();
+      return json(res, 200, { request: view(), parked: true });
+    }
+    const answerId = id();
+    request.status = "answered";
+    request.answer = { answerId, answers, proposalSha256: request.proposalSha256, ts: Date.now() };
+    if (!trayWrite(request)) return json(res, 500, { error: "tray.jsonl へ書けませんでした", code: "log-write-failed" });
+    const messages = trayShare(topic, tray.answerSummaryText(request, answers), { kind: "answer", requestId: request.id, proposalSha256: request.proposalSha256, answerId });
+    const cont = trayReserveContinuation(topic, request.block.continueAgent || request.proposer, request.id, "answer");
+    trayAdvancePlans(topic.id); // 依存が解けた計画があれば進める
+    touch();
+    return json(res, 200, { request: view(), messages, continuation: cont });
+  }
+
+  if (action === "approve") {
+    if (request.kind !== "start-task") return json(res, 400, { error: "これは着手提案ではありません", code: "not-a-proposal" });
+    const prevStatus = request.status;
+    const created = request.block.tasks.map((t) => trayTaskFor(request, t));
+    const taskIds = Object.fromEntries(created.map((task, i) => [request.block.tasks[i].key, task.id]));
+    request.status = "approved";
+    request.plan = { approvedTs: Date.now(), proposalSha256: request.proposalSha256, entries: tray.planFromTasks({ tasks: request.block.tasks, taskIds }) };
+    if (!trayWrite(request)) {
+      // 記録できなければ承認は無かったことにする（タスクだけ残って「承認していないのに作業依頼が来る」を避ける）
+      for (const task of created) state.tasks.splice(state.tasks.indexOf(task), 1);
+      request.status = prevStatus;
+      request.plan = null;
+      return json(res, 500, { error: "tray.jsonl へ書けませんでした", code: "log-write-failed" });
+    }
+    const lines = request.plan.entries.map((e) => `・${NAMES[e.agent]}: ${(request.block.tasks.find((t) => t.key === e.key) || {}).title || e.key}` + (e.after.length ? `（${e.after.join(" / ")} の完了後に指示）` : "（承認後に指示）"));
+    const messages = trayShare(topic, `【判断トレイ】「${request.block.title}」を承認しました。${request.plan.entries.length} 件のタスクを登録します。\n${lines.join("\n")}`, {
+      kind: "approved",
+      requestId: request.id,
+      proposalSha256: request.proposalSha256,
+    });
+    trayAdvancePlans(topic.id); // after の無い要素をここで送る
+    touch();
+    return json(res, 200, { request: view(), plan: request.plan, messages });
+  }
+
+  if (action === "revision" || action === "reject") {
+    const note = typeof body.note === "string" ? body.note.trim() : "";
+    if (Array.from(note).length > tray.LIMITS.note) return json(res, 400, { error: "note が長すぎます", code: "invalid-request", errors: [{ code: "note-too-long", path: "note", message: "2000 文字までです" }] });
+    let targets = [];
+    if (action === "revision") {
+      targets = Array.isArray(body.targets) ? [...new Set(body.targets)] : [];
+      if (!targets.length || targets.some((t) => !tray.REVISION_TARGETS.includes(t))) {
+        return json(res, 400, { error: "どこを直してほしいかを 1 つ以上選んでください", code: "invalid-request", errors: [{ code: "targets-invalid", path: "targets", message: tray.REVISION_TARGETS.join(" / ") }] });
+      }
+      if (targets.includes("other") && !note) return json(res, 400, { error: "「その他」を選んだときは内容を書いてください", code: "invalid-request", errors: [{ code: "note-required", path: "note", message: "内容が要ります" }] });
+    }
+    request.status = action === "revision" ? "revision-requested" : "rejected";
+    request.decision = { kind: action, targets, note, ts: Date.now() };
+    if (!trayWrite(request)) return json(res, 500, { error: "tray.jsonl へ書けませんでした", code: "log-write-failed" });
+    const LABEL = { scope: "範囲", assignee: "担当", approach: "進め方", other: "その他" };
+    const text =
+      action === "revision"
+        ? `【判断トレイ】「${request.block.title}」に修正を依頼しました（${targets.map((t) => LABEL[t]).join(" / ")}）${note ? "\n" + note : ""}`
+        : `【判断トレイ】「${request.block.title}」は見送りにしました${note ? "\n" + note : ""}`;
+    const messages = trayShare(topic, text, { kind: action, requestId: request.id, proposalSha256: request.proposalSha256 });
+    // 修正は提案者へ 1 回だけ返す。見送りは続きを求めていないので予約しない（初版は 3 人での再検討を開始しない）
+    const cont = action === "revision" ? trayReserveContinuation(topic, request.proposer, request.id, "revision") : null;
+    touch();
+    return json(res, 200, { request: view(), messages, continuation: cont });
+  }
+  return json(res, 400, { error: "不明な操作です", code: "invalid-request", errors: [] });
+}
+
+// 判断トレイの依頼は data/tray.jsonl が正本（契約 §12.1）。
+// 読み込みは logEvent / events が初期化された後で行う。継続予約は復元するが armed でないので、
+// ここで CLI が動き出すことはない（§12.3）
+trayLoadLog();
 
 // ---- 出所の検査（ローカル専用アプリの最低限の防御）----
 // Host: DNS リバインディング対策。GET も含めて全要求で見る。

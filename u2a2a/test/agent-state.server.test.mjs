@@ -160,7 +160,7 @@ before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u2a2a-agentstate-"));
   appDir = path.join(tmp, "u2a2a");
   fs.mkdirSync(path.join(appDir, "public"), { recursive: true });
-  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
+  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "tray.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
   fs.writeFileSync(path.join(appDir, "public", "index.html"), "<html></html>");
   poolDir = path.join(appDir, "pool");
   fs.mkdirSync(poolDir);
@@ -307,11 +307,11 @@ test("8. 未認証は global waiting/unauthed で outcome を隠し、再認証�
   assert.equal(g.agents.grok.byTopic[T1].source, "outcome");
 });
 
-test("9. 終了状態は保存され再起動後も残る。schemaVersion 10。不正な保存値は捨て、過去データから復元しない", async () => {
+test("9. 終了状態は保存され再起動後も残る。schemaVersion 11。不正な保存値は捨て、過去データから復元しない", async () => {
   await waitFor(() => {
     const j = readSaved();
     const t = j && j.topics.find((x) => x.id === T1);
-    return j && j.schemaVersion === 10 && t && t.agentOutcomes && t.agentOutcomes.grok ? j : null;
+    return j && j.schemaVersion === 11 && t && t.agentOutcomes && t.agentOutcomes.grok ? j : null;
   }, "outcome が保存される");
   await stopServer();
   const saved = readSaved();

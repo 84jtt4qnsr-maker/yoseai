@@ -184,7 +184,7 @@ before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u2a2a-projects-"));
   appDir = path.join(tmp, "u2a2a");
   fs.mkdirSync(path.join(appDir, "public"), { recursive: true });
-  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
+  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "tray.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
   fs.writeFileSync(path.join(appDir, "public", "index.html"), "<html></html>");
   poolDir = path.join(appDir, "pool");
   fs.mkdirSync(poolDir);
@@ -323,7 +323,9 @@ test("4. プロンプト: 紐付けありの初回は対象・Git・概要が入
   const i = call.argv.indexOf("--add-dir");
   assert.ok(i >= 0 && call.argv[i + 1] === fs.realpathSync(projDir), "--add-dir <path>: " + JSON.stringify(call.argv));
   assert.ok(call.argv.includes("Edit(u2a2a/pool/**)"));
-  assert.ok(!call.argv.some((a) => a.startsWith("Write(")), "Write 規則は渡さない");
+  // 現行 CLI では新規ファイル作成に Write 規則が必要（Edit 規則では許可されない実測）。pool 限定で渡す
+  assert.ok(call.argv.includes("Write(u2a2a/pool/**)"));
+  assert.ok(call.argv.filter((a) => a.startsWith("Write(")).every((a) => a.includes("/pool/")), "Write 規則は pool 限定");
   assert.ok(!call.argv.includes("acceptEdits"));
   assert.equal((await getTopic(topicA)).projectLocked, true, "実行で固定される");
   assert.equal((await api("PATCH", "/api/topics/" + topicA, { projectId: plainPid })).status, 409);
