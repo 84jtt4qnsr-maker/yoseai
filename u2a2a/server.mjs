@@ -973,8 +973,10 @@ async function projectContext(projectId) {
 }
 
 // Claude の起動引数（書き込みは pool のみ。Write(path) 規則はファイル権限に作用しないので Edit のみ。対象があれば --add-dir で読み取りを許可）
+// 相対規則は作業ディレクトリ基準で解決されるため、シェルで pool 深部へ cd した後の編集が拒否される
+// （実測: .work/impl-*/ 内で停止）。絶対パス規則を併記し、cd に依らず pool 配下への書き込みを許す
 function claudeToolArgs(project) {
-  const args = ["--allowedTools", "Edit(u2a2a/pool/**)", "Bash(python3:*)", "Bash(ffmpeg:*)"];
+  const args = ["--allowedTools", "Edit(u2a2a/pool/**)", `Edit(${POOL_DIR}/**)`, "Bash(python3:*)", "Bash(ffmpeg:*)"];
   if (project) args.push("--add-dir", project.path);
   return args;
 }
@@ -1477,7 +1479,8 @@ async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
 // run_terminal_command ごと外せば read_file / list_dir / grep で探索して完走する。メディア生成は当面 claude/codex 担当）
 // 画像・動画は Grok 内蔵の生成スイートを許可（実測: 生成物は ~/.grok/sessions/ 配下に落ちる）。
 // シェルは python3 / ffmpeg の 1 行のみ（複数行・他コマンドは拒否 → プロンプト注意で誘導）。保存は python3 の 1 行コピーで pool へ
-const GROK_WRITE_ARGS = ["--allow", "Edit(u2a2a/pool/**)", "--allow", "Bash(python3:*)", "--allow", "Bash(ffmpeg:*)", "--allow", "image_gen", "--allow", "image_edit", "--allow", "image_to_video", "--allow", "reference_to_video", "--disallowed-tools", "spawn_subagent"];
+// Claude 同様、相対規則の cd 依存を避けるため絶対パス規則を併記する
+const GROK_WRITE_ARGS = ["--allow", "Edit(u2a2a/pool/**)", "--allow", `Edit(${POOL_DIR}/**)`, "--allow", "Bash(python3:*)", "--allow", "Bash(ffmpeg:*)", "--allow", "image_gen", "--allow", "image_edit", "--allow", "image_to_video", "--allow", "reference_to_video", "--disallowed-tools", "spawn_subagent"];
 // レビューは読み取りツールの正のホワイトリストで絞る。Grok は権限拒否で実行全体が停止するため、
 // read-only サンドボックス下で拒否され得る書き込み系ツール（search_replace 等）を持たせない
 // （web 検索 search_tool は --tools の対象外で残る。実測: whitelist 下でも呼べて完走する）
