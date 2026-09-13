@@ -4106,14 +4106,20 @@ async function handleApi(req, res, url) {
   // プールファイルの取得（プレビュー・ダウンロード用。サブフォルダのパスにも対応）
   if (req.method === "GET" && parts[0] === "api" && parts[1] === "pool" && parts[2] === "file" && parts[3]) {
     const file = poolFilePath(decodeURIComponent(parts.slice(3).join("/")));
-    if (!file || !fs.existsSync(file)) return json(res, 404, { error: "file not found" });
+    // ディレクトリを createReadStream すると EISDIR がストリームの 'error' で飛び、
+    // 未処理だとプロセスごと落ちる（2026-09-13 の実走で発生）。ファイル以外は 404
+    let st = null;
+    try { st = file ? fs.statSync(file) : null; } catch {}
+    if (!st || !st.isFile()) return json(res, 404, { error: "file not found" });
     const ext = path.extname(file).toLowerCase();
     const mime =
       ext === ".html" || ext === ".htm"
         ? "text/html; charset=utf-8" // HTML 成果物（ゲーム等）はそのまま実行できる形で配信
         : IMAGE_MIME[ext] || MEDIA_MIME[ext] || (isTextPoolFile(file) ? "text/plain; charset=utf-8" : "application/octet-stream");
     res.writeHead(200, { "Content-Type": mime, "Cache-Control": "no-store" });
-    fs.createReadStream(file).pipe(res);
+    const stream = fs.createReadStream(file);
+    stream.on("error", () => res.destroy()); // ヘッダ送信後はエラー応答を返せない。接続だけ切ってプロセスは守る
+    stream.pipe(res);
     return;
   }
 
@@ -4483,7 +4489,9 @@ function serveAvatarImage(req, res, pathname) {
     return;
   }
   res.writeHead(200, { ...headers, "Content-Type": "image/webp", "Content-Length": info.size });
-  fs.createReadStream(asset.abs).pipe(res);
+  const stream = fs.createReadStream(asset.abs);
+  stream.on("error", () => res.destroy()); // 読み中の消失等でプロセスを落とさない
+  stream.pipe(res);
 }
 
 // ---- 成果物の版と必須検証（仕様: SPEC-成果物検証.md／契約: 契約-成果物検証API.md 契約版 2）----

@@ -247,6 +247,17 @@ test("退避ファイルの最終回収に失敗した実行は成功になら�
   }
 });
 
+// ---- 回帰: ディレクトリへの /api/pool/file はプロセスを落とさず 404 ----
+// 2026-09-13 の実走で、ディレクトリの createReadStream が未処理 'error'（EISDIR）で
+// サーバごと落ちた。ファイル以外は 404、サーバは生き続けること
+
+test("GET /api/pool/file/<ディレクトリ> は 404 で、サーバは落ちない", async () => {
+  const dir = path.join(tmpA, "u2a2a", "pool", "probe-dir"); fs.mkdirSync(dir, { recursive: true });
+  const r = await apiA("GET", "/api/pool/file/probe-dir");
+  assert.equal(r.status, 404);
+  assert.equal((await apiA("GET", "/api/state")).status, 200, "サーバが生きている");
+});
+
 // ---- P2-②: revoke は切符も失効させる（資格が回るので最後に置く）----
 
 test("revoke 後は発行済みの SSE 切符が使えない", async () => {
