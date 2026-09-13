@@ -2,6 +2,9 @@
 (() => {
   'use strict';
   const HEX = /^[a-f0-9]{64}$/;
+  // サーバは Host として 127.0.0.1 / localhost / [::1] を同値に許可する（server.mjs の ALLOWED_HOSTS）。
+  // 資格の受理もそれに合わせる。これ以外のホストは従来どおり別サーバとして拒否する
+  const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
   const UNVERIFIED = {cliCredentials:'CLIの資格', cliSessionStore:'CLIの履歴保存', controlSocket:'制御ソケット', mcp:'MCP', execFiles:'実行ファイル'};
   const n = (tag, text, attrs = {}) => {
     const e = document.createElement(tag);
@@ -139,9 +142,17 @@
       const text=String(value || '').trim();
       if(HEX.test(text))return text;
       try{const url=new URL(text);const token=new URLSearchParams(url.hash.slice(1)).get('t');
-        if(url.origin===this.client.location.origin && HEX.test(token || ''))return token;
+        if(this.sameServer(url) && HEX.test(token || ''))return token;
       }catch{}
       return null;
+    }
+    // 画面を 127.0.0.1 で開いていても、端末が案内した localhost 表記の URL を貼れるようにする。
+    // 別ホスト・別ポート・別プロトコルは拒否（origin 完全一致だと同じサーバの別表記まで弾いていた）
+    sameServer(url) {
+      let here;
+      try{ here=new URL(this.client.location.href || this.client.location.origin); }catch{ return false; }
+      if(url.protocol!==here.protocol || url.port!==here.port) return false;
+      return url.hostname===here.hostname || (LOOPBACK.has(url.hostname) && LOOPBACK.has(here.hostname));
     }
     async accept() {
       if(this.busy)return;

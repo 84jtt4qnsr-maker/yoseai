@@ -1375,9 +1375,22 @@ function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = nul
     logEvent("isolation", `隔離を初期化できないため実行しませんでした: ${plan.reason}`, "error");
     return Promise.resolve({ code: null, out: "", err: "", isolationBlocked: true, isolationReason: plan.reason });
   }
+  // 隔離時は子の stdout / stderr を一時ファイルへ逃がす。grok は自分の stdout を
+  // 非ブロッキングにして EAGAIN でリトライしないため、srt が 1 段挟まってパイプ詰まりが
+  // 起きると "stdout write failed: os error 35" で落ちる（実測で再現）。通常ファイルは
+  // EAGAIN を返さないので確実に受け取れる。全プロファイルが <tmpDir> 書き込みを許可済み。
+  let redirect = null;
+  let runArgs = plan.args;
+  if (plan.mode === "enforced") {
+    const base = path.join(os.tmpdir(), "yoseai-run-" + crypto.randomBytes(8).toString("hex"));
+    redirect = { out: base + ".out", err: base + ".err" };
+    // plan.args の末尾は srt の -c に渡すシェル文字列。stdin は触らずリダイレクトだけ足す
+    runArgs = [...plan.args];
+    runArgs[runArgs.length - 1] += ` > ${sandbox.shellQuote(redirect.out)} 2> ${sandbox.shellQuote(redirect.err)}`;
+  }
   return new Promise((resolve) => {
     // 追加の環境変数はプロファイルの envAllow だけ（契約 §5）。既定は空
-    const child = spawn(plan.cmd, plan.args, { cwd, env: spawnEnv(plan.envAllow || []), stdio: ["pipe", "pipe", "pipe"], detached: true });
+    const child = spawn(plan.cmd, runArgs, { cwd, env: spawnEnv(plan.envAllow || []), stdio: ["pipe", "pipe", "pipe"], detached: true });
     let closed = false;
     if (ctl) {
       // キャンセル: SIGTERM → 3秒猶予 → SIGKILL 昇格
@@ -1393,21 +1406,58 @@ function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = nul
     child.stdin.on("error", () => {});
     child.stdin.end(stdinData);
     let out = "", err = "", lineBuf = "";
-    if (onLine) {
-      child.stdout.on("data", (d) => {
-        lineBuf += d;
-        let idx;
-        while ((idx = lineBuf.indexOf("\n")) >= 0) {
-          const line = lineBuf.slice(0, idx);
-          lineBuf = lineBuf.slice(idx + 1);
-          try {
-            onLine(line);
-          } catch {
-            // 実況の失敗で本処理を止めない
-          }
+    const feed = (chunk) => {
+      const s = chunk.toString();
+      out += s;
+      if (!onLine) return;
+      lineBuf += s;
+      let idx;
+      while ((idx = lineBuf.indexOf("\n")) >= 0) {
+        const line = lineBuf.slice(0, idx);
+        lineBuf = lineBuf.slice(idx + 1);
+        try {
+          onLine(line);
+        } catch {
+          // 実況の失敗で本処理を止めない
         }
-      });
+      }
+    };
+    let tailPos = 0, tailTimer = null;
+    const drainFile = () => {
+      if (!redirect) return;
+      try {
+        const st = fs.statSync(redirect.out);
+        if (st.size > tailPos) {
+          const fd = fs.openSync(redirect.out, "r");
+          const buf = Buffer.alloc(st.size - tailPos);
+          const n = fs.readSync(fd, buf, 0, buf.length, tailPos);
+          fs.closeSync(fd);
+          tailPos += n;
+          feed(buf.subarray(0, n));
+        }
+      } catch {
+        // まだ作られていない・読めない間は次のティックで拾う
+      }
+    };
+    if (redirect) {
+      // ファイル追尾で実況。srt 自身の出力（診断）はパイプ側で拾い err へ
+      tailTimer = setInterval(drainFile, 120);
+      child.stdout.on("data", (d) => (err += "[srt] " + d));
+      child.stderr.on("data", (d) => (err += d));
+    } else {
+      child.stdout.on("data", (d) => feed(d));
+      child.stderr.on("data", (d) => (err += d));
     }
+    const finish = (result) => {
+      if (tailTimer) clearInterval(tailTimer);
+      if (redirect) {
+        drainFile(); // 取りこぼしを最終回収
+        try { err += fs.readFileSync(redirect.err, "utf8"); } catch {}
+        try { fs.unlinkSync(redirect.out); } catch {}
+        try { fs.unlinkSync(redirect.err); } catch {}
+      }
+      resolve({ ...result, out, err });
+    };
     const timer = setTimeout(() => {
       err += `\n(タイムアウト: ${timeoutMs / 1000}秒)`;
       killTree(child, "SIGTERM"); // キャンセルと同じ作法で穏当に止め、3秒で昇格
@@ -1415,17 +1465,16 @@ function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = nul
         if (!closed) killTree(child, "SIGKILL");
       }, 3000);
     }, timeoutMs);
-    child.stdout.on("data", (d) => (out += d));
-    child.stderr.on("data", (d) => (err += d));
     child.on("error", (e) => {
       closed = true;
       clearTimeout(timer);
-      resolve({ code: -1, out, err: String(e.message || e), cancelled: !!(ctl && ctl.cancelled) });
+      err = String(e.message || e);
+      finish({ code: -1, cancelled: !!(ctl && ctl.cancelled) });
     });
     child.on("close", (code) => {
       closed = true;
       clearTimeout(timer);
-      resolve({ code, out, err, cancelled: !!(ctl && ctl.cancelled) });
+      finish({ code, cancelled: !!(ctl && ctl.cancelled) });
     });
   });
 }
@@ -4634,7 +4683,10 @@ const MIME = {
   ".png": "image/png",
 };
 
-function serveStatic(res, url) {
+// 画面のコードは「更新が必ず届く」ことを優先する。ヘッダを付けないとブラウザの
+// ヒューリスティックキャッシュで古い JS が残り、直したはずの挙動が反映されない（実測）。
+// no-cache は毎回再検証する指示で、内容が同じなら 304 で本体の転送は省ける
+function serveStatic(req, res, url) {
   let file = url.pathname === "/" ? "/index.html" : url.pathname;
   const resolved = path.join(PUBLIC_DIR, path.normalize(file));
   if (!resolved.startsWith(PUBLIC_DIR)) {
@@ -4647,7 +4699,13 @@ function serveStatic(res, url) {
       res.end("not found");
       return;
     }
-    res.writeHead(200, { "Content-Type": MIME[path.extname(resolved)] || "application/octet-stream" });
+    const headers = { "Cache-Control": "no-cache", ETag: '"' + crypto.createHash("sha256").update(data).digest("hex").slice(0, 32) + '"' };
+    if (etagMatches(req, headers.ETag)) {
+      res.writeHead(304, headers);
+      res.end();
+      return;
+    }
+    res.writeHead(200, { ...headers, "Content-Type": MIME[path.extname(resolved)] || "application/octet-stream" });
     res.end(data);
   });
 }
@@ -5326,7 +5384,7 @@ const server = http.createServer(async (req, res) => {
   }
   try {
     if (url.pathname.startsWith("/api/")) return await handleApi(req, res, url);
-    return serveStatic(res, url);
+    return serveStatic(req, res, url);
   } catch (e) {
     return json(res, 500, { error: String(e.message || e) });
   }

@@ -106,6 +106,17 @@ test('invalid input and foreign origin cannot reload or send requests',async()=>
   const s=setup();s.c.input.value=input;await s.c.accept();assert.equal(s.location.reloaded,undefined);assert.equal(s.calls.length,0);assert.equal(s.c.input.value,'');
  }
 });
+// 端末の案内 URL は localhost 表記のことがある。サーバは Host を 3 表記とも許可するので、資格の受理も揃える
+test('同じサーバのループバック別表記は受理し、別ホスト・別ポート・別プロトコルは拒否する',()=>{
+ const s=setup(); // 画面は http://127.0.0.1:4797
+ assert.equal(s.c.parseCredential('http://localhost:4797/#t='+token),token,'localhost 表記を受理');
+ assert.equal(s.c.parseCredential('http://[::1]:4797/#t='+token),token,'[::1] 表記を受理');
+ assert.equal(s.c.parseCredential('http://127.0.0.1:4797/#t='+token),token,'同一表記は従来どおり');
+ assert.equal(s.c.parseCredential(token),token,'64 桁だけでも従来どおり');
+ assert.equal(s.c.parseCredential('http://127.0.0.1:9999/#t='+token),null,'別ポートは拒否');
+ assert.equal(s.c.parseCredential('https://localhost:4797/#t='+token),null,'別プロトコルは拒否');
+ assert.equal(s.c.parseCredential('http://evil.test:4797/#t='+token),null,'外部ホストは拒否');
+});
 test('double submit creates only one handoff; closed dialog erases draft',async()=>{
  const s=setup();let navigations=0;s.c.navigate=()=>navigations++;s.c.input.value=token;await s.c.accept();await s.c.accept();assert.equal(navigations,1);
  s.c.input.value=next;s.c.dialog.close();assert.equal(s.c.input.value,'');

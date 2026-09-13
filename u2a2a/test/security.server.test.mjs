@@ -73,7 +73,7 @@ function raw(method, p, { headers = {}, body = null, hostHeader = null } = {}) {
           } catch {
             // 本文が JSON でないことも受け入れる（静的配信など）
           }
-          resolve({ status: res.statusCode, body: json, text });
+          resolve({ status: res.statusCode, body: json, text, headers: res.headers });
         });
       }
     );
@@ -218,6 +218,19 @@ test("4. 正規の Origin と、Origin 欠席（curl・テスト）は通る", a
   assert.equal(noOrigin.status, 201);
   const localhost = await raw("POST", "/api/messages", { headers: { origin: "http://localhost:" + port }, body: JSON.stringify({ author: "user", thread: "claude", text: "localhost から", topicId }) });
   assert.equal(localhost.status, 201, "localhost も許可（埋め込みペインが使う場合がある）");
+});
+
+// ヘッダ無しだとブラウザが勝手にキャッシュし、更新した画面コードが届かない（実測で古い JS が残った）
+test("4.5 静的配信は毎回再検証させ、同じ内容なら 304 を返す", async () => {
+  const first = await raw("GET", "/", {});
+  assert.equal(first.status, 200);
+  assert.equal(first.headers["cache-control"], "no-cache", "ヒューリスティックキャッシュに任せない");
+  const etag = first.headers.etag;
+  assert.match(etag || "", /^"[0-9a-f]{32}"$/, "内容から作った ETag: " + etag);
+  const again = await raw("GET", "/", { headers: { "if-none-match": etag } });
+  assert.equal(again.status, 304, "同じ内容なら本体を送らない");
+  const changed = await raw("GET", "/", { headers: { "if-none-match": '"' + "0".repeat(32) + '"' } });
+  assert.equal(changed.status, 200, "ETag が違えば本体を返す");
 });
 
 test("5. Host が違えば GET も静的配信も 403（DNS リバインディング対策）", async () => {
