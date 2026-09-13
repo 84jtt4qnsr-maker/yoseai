@@ -750,6 +750,35 @@ export function validateV2Format(fmt) {
   return null;
 }
 
+// ---- エージェント不在の分類（契約: 契約-不在可視化.md §1・契約版 1）----
+// 判定対象は throw された e.message の生文（grok 実測: 402 は streaming-json イベントではなく
+// `Internal error: {...}` の生文で届き、http_status は構造化されて取れない）。
+// 初版で unavailable に倒すのは grok の残高切れのみ。402 系キーワード単体では倒さず、
+// 必ず `usage balance exhausted` との併用を要件とする（フィクスチャ-grok402.md の負例 Gneg-1〜3）。
+// claude / codex の残高・レート制限の文面は未実測なので unknown。既存の認証切れ判定はここでは扱わない
+export function classifyBackendError(cli, error) {
+  const raw = String((error && error.message) || error || "");
+  // アプリ自身が生成した失敗（秘密を含まない自前の文言）は、その旨が分かる定型で返す。
+  // 「分類外」に丸めると P1-2（退避回収失敗）などの既知の失敗まで原因が読めなくなる
+  if (error && error.outputLost) {
+    return { availability: "unknown", detail: "CLI 出力の退避ファイルを回収できませんでした（出力が失われている可能性。詳細は起動端末のログに出力）" };
+  }
+  if (error && error.isolationBlocked) {
+    return { availability: "unknown", detail: "隔離を初期化できないため実行しませんでした（詳細は起動端末のログに出力）" };
+  }
+  if (
+    cli === "grok" &&
+    /usage balance exhausted/i.test(raw) &&
+    (/"http_status":\s*402/.test(raw) || /status 402/.test(raw) || /Payment Required/i.test(raw))
+  ) {
+    return { availability: "unavailable", detail: "Grok Build の利用残高が上限に達しています（402）。回復後にヘッダの「再確認」をどうぞ" };
+  }
+  // 契約 §2・codex 再レビュー2/3: 未分類の生文は、どんな伏せ字処理でも（access_token / Basic 認証など）
+  // 漏れの余地が残る。表示・⚠ 行・バッジ・イベント（SSE で配信される）へは**転記しない**で定型短文に固定し、
+  // 全文は呼び出し側が起動端末の stderr にだけ出す（資格の印字と同じ「端末にだけ」の規律）
+  return { availability: "unknown", detail: "実行に失敗しました（分類外のエラー。詳細は起動端末のログに出力）" };
+}
+
 // フロービューのグラフ導出（仕様: SPEC-フロービュー.md）。本体は public/flow-graph.js（ブラウザも同じファイルを読む）。ここはテスト用の再 export
 export * from "./public/flow-graph.js";
 

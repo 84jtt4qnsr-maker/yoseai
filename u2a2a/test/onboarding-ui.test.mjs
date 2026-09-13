@@ -30,11 +30,12 @@ function setup(){
  const doc={ids:{},activeElement:null,getElementById(id){return this.ids[id]||null;}};
  doc.createElement=tag=>new Element(tag,doc);doc.createTextNode=t=>{const n=doc.createElement('#text');n.textContent=t;return n;};doc.body=doc.createElement('body');
  const calls=[],notes=[],images=[],state={agents:{claude:{auto:false,authed:true},codex:{auto:false,authed:true},grok:{auto:false,authed:false}}};
- const ctx=vm.createContext({document:doc,URL,location:{href:'http://localhost/',origin:'http://localhost'},Image:class extends Element {constructor(){super('img',doc);images.push(this);}},requestAnimationFrame:()=>1,cancelAnimationFrame(){},state,NAMES:{claude:'Claude',codex:'Codex',grok:'Grok'},$:s=>s==='main'?doc.body:doc.ids[s.slice(1)],currentTopic:()=>({id:'t',agents:{}}),participantsOf:()=>['claude','codex'],autoSaving:new Set(),foldedColumns:new Map(),api:async(...args)=>{calls.push(plain(args));return {};},toast:s=>notes.push(s),isRunning:()=>false,applyThreadGlow(){},agentColor:()=>'',scheduleLinks(){},toggleWideColumn(){},toggleColumn(){},setViewMode:mode=>{calls.push(['view',mode]);doc.body.classList.remove('flow-view');},applyColumnLayout:()=>calls.push(['layout']),el:(tag,attrs={},children=[])=>{const n=doc.createElement(tag);for(const[k,v]of Object.entries(attrs)){if(k==='text')n.textContent=v;else if(k==='class')n.className=v;else if(k.startsWith('on'))n.addEventListener(k.slice(2),v);else n.setAttribute(k,v);}n.append(...children);return n;}});
+ const topic={id:'t',agents:{}}; // 契約-不在可視化 §3: スレッド列は topic 側 ta.lastError を読むため、可変の topic を共有する
+ const ctx=vm.createContext({document:doc,URL,location:{href:'http://localhost/',origin:'http://localhost'},Image:class extends Element {constructor(){super('img',doc);images.push(this);}},requestAnimationFrame:()=>1,cancelAnimationFrame(){},state,NAMES:{claude:'Claude',codex:'Codex',grok:'Grok'},$:s=>s==='main'?doc.body:doc.ids[s.slice(1)],currentTopic:()=>topic,participantsOf:()=>['claude','codex'],autoSaving:new Set(),foldedColumns:new Map(),api:async(...args)=>{calls.push(plain(args));return {};},toast:s=>notes.push(s),isRunning:()=>false,applyThreadGlow(){},agentColor:()=>'',scheduleLinks(){},toggleWideColumn(){},toggleColumn(){},setViewMode:mode=>{calls.push(['view',mode]);doc.body.classList.remove('flow-view');},applyColumnLayout:()=>calls.push(['layout']),el:(tag,attrs={},children=[])=>{const n=doc.createElement(tag);for(const[k,v]of Object.entries(attrs)){if(k==='text')n.textContent=v;else if(k==='class')n.className=v;else if(k.startsWith('on'))n.addEventListener(k.slice(2),v);else n.setAttribute(k,v);}n.append(...children);return n;}});
  vm.runInContext(onboarding,ctx);vm.runInContext(avatars,ctx);
  vm.runInContext("const AV=U2AAvatar; const agentDefs=()=>state.agents;"+html.match(/const agentReady =[^\n]+/)[0]+html.match(/const authLabel =[^\n]+/)[0],ctx);
  for(const n of ['createThreadColumn','manualEmpty','showAgentInput','hideAgentInput','sendAgent','renderAgentStatus','updateAuto'])vm.runInContext(fn(n),ctx);
- return {ctx,doc,calls,notes,images,state,O:ctx.U2AOnboarding,A:ctx.U2AAvatar};
+ return {ctx,doc,calls,notes,images,state,topic,O:ctx.U2AOnboarding,A:ctx.U2AAvatar};
 }
 test('unknown authentication is independent of auto and server auth flags',()=>{
  const {O,state}=setup(),before=plain(state);
@@ -74,8 +75,14 @@ test('unknown auth is neutral while auto ON/OFF renders independently',()=>{
  for(const auto of [false,true]){state.agents.claude.auto=auto;ctx.renderAgentStatus('claude');assert.equal(doc.ids['auth-state-claude'].textContent,'認証状態: 未確認');assert.equal(doc.ids['status-claude'].dataset.s,'');assert.equal(doc.ids['auto-label-claude'].textContent,'自動応答 '+(auto?'ON':'OFF'));}
 });
 test('real error and Grok failed auth retain error presentation',()=>{
- const {ctx,doc,state}=setup();doc.body.append(ctx.createThreadColumn('claude'),ctx.createThreadColumn('grok'));
- state.agents.claude.lastError='actual CLI failure';ctx.renderAgentStatus('claude');assert.equal(doc.ids['status-claude'].dataset.s,'error');
+ const {ctx,doc,state,topic}=setup();doc.body.append(ctx.createThreadColumn('claude'),ctx.createThreadColumn('grok'));
+ // 契約-不在可視化 §3（契約版1）: スレッド列のエラーはトピック側 ta.lastError のみ。グローバル a.lastError 単体では出さない
+ state.agents.claude.lastError='global only';ctx.renderAgentStatus('claude');assert.notEqual(doc.ids['status-claude'].dataset.s,'error');
+ topic.agents.claude={lastError:'actual CLI failure'};ctx.renderAgentStatus('claude');assert.equal(doc.ids['status-claude'].dataset.s,'error');
+ // §4: 席全体の可用性は ta が無くても出る。unavailable=error / unknown=wait
+ topic.agents.claude={};state.agents.claude.availability='unavailable';ctx.renderAgentStatus('claude');assert.equal(doc.ids['status-claude'].dataset.s,'error');
+ state.agents.claude.availability='unknown';ctx.renderAgentStatus('claude');assert.equal(doc.ids['status-claude'].dataset.s,'wait');
+ state.agents.claude.availability=null;ctx.renderAgentStatus('claude');assert.notEqual(doc.ids['status-claude'].dataset.s,'error');
  ctx.renderAgentStatus('grok');assert.equal(doc.ids['status-grok'].dataset.s,'error');assert.match(doc.ids['status-grok'].textContent,/未認証/);
 });
 test('manual paste posts own author with auto OFF; never enables auto or sends user request',async()=>{

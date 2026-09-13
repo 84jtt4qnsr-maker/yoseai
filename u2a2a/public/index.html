@@ -2480,7 +2480,8 @@ function renderAuthControls() {
   const hasGrok = agentIds().includes("grok");
   const inColumn = participantsOf().includes("grok");
   const key = JSON.stringify([hasGrok, inColumn, NAMES.grok, state.agents?.grok?.authed,
-    state.agents?.grok?.auto, authChecking.has("grok"), authAutoSaving]);
+    state.agents?.grok?.auto, authChecking.has("grok"), authAutoSaving,
+    state.agents?.grok?.availability, state.agents?.grok?.lastError]); // 可用性の変化で再描画（契約 §4・codex レビュー）
   if (box.dataset.optionsKey === key) return;
   box.dataset.optionsKey = key;
   box.replaceChildren();
@@ -2503,7 +2504,9 @@ function renderAuthControls() {
   });
   const check = el("button", { type: "button", class: "small", text: authChecking.size ? "確認中…" : "再確認", onclick: checkAgentAuth });
   check.disabled = authChecking.size > 0;
-  box.append(el("span", { class: "auth-badge", text: NAMES.grok + ": " + authLabel("grok") }), check);
+  const grokAvail = state.agents?.grok?.availability;
+  const availNote = grokAvail === "unavailable" ? "・応答不能（残高切れ等）" : grokAvail === "unknown" ? "・可用性不明" : "";
+  box.append(el("span", { class: "auth-badge", text: NAMES.grok + ": " + authLabel("grok") + availNote, ...(availNote ? { title: state.agents?.grok?.lastError || "" } : {}) }), check);
   if (!inColumn) box.append(el("label", { class: "auto-ctl" }, [auto, document.createTextNode("自動応答 " + (auto.checked ? "ON" : "OFF"))]));
 }
 
@@ -4485,7 +4488,8 @@ function renderAgentStatus(agent) {
   checkbox.checked = !!a.auto;
   checkbox.disabled = autoSaving.has(agent);
   $("#auto-label-" + agent).textContent = "自動応答 " + (a.auto ? "ON" : "OFF");
-  $("#auth-state-" + agent).textContent = authLabel(agent);
+  const availNote = a.availability === "unavailable" ? "・応答不能（残高切れ等）" : a.availability === "unknown" ? "・可用性不明" : "";
+  $("#auth-state-" + agent).textContent = authLabel(agent) + availNote; // 列の認証バッジにも可用性を併記（契約 §4・codex レビュー）
   $("#manual-" + agent).disabled = !agentReady(agent);
   $("#manual-" + agent).title = agentReady(agent) ? "CLIを起動せず発言を貼り付けます" : authLabel(agent);
   // キャンセルで中断したセッションがあれば再開ボタンを出す
@@ -4517,7 +4521,9 @@ function renderAgentStatus(agent) {
   if (a.model && ![...dl.options].some((o) => o.value === a.model)) {
     dl.appendChild(el("option", { value: a.model }));
   }
-  const error = ta.lastError || a.lastError;
+  // 契約-不在可視化 §3: スレッド列は ta.lastError のみ参照（a.lastError を混ぜると、成功で空へ戻した席に
+  // 別トピックのエラーが再表示される）。a.lastError は下の可用性バッジ専用
+  const error = ta.lastError;
   if (!agentReady(agent)) {
     status.dataset.s = a.authed === false ? "error" : "wait";
     status.textContent = authLabel(agent);
@@ -4534,6 +4540,11 @@ function renderAgentStatus(agent) {
     status.dataset.s = "error";
     status.textContent = error.includes("権限") || error.includes("中断") ? error : "エラー（ホバーで詳細）";
     status.title = error;
+  } else if (a.availability === "unavailable" || a.availability === "unknown") {
+    // 席全体の可用性（契約 §4）。null（未評価）は従来表示のまま
+    status.dataset.s = a.availability === "unavailable" ? "error" : "wait";
+    status.textContent = a.availability === "unavailable" ? "応答不能（残高切れ等・再確認を）" : "可用性: 不明（直近の失敗を判定できず）";
+    status.title = a.lastError || "";
   } else {
     status.dataset.s = "";
     status.textContent = a.auto ? "CLI 自動応答" : "手動（貼り付け）";
@@ -4555,7 +4566,8 @@ function applyThreadGlow(agent, a, ta) {
   if (isRunning(agent)) glow = "run";
   else if (topic.relay?.active && (topic.relay.participants || participantsOf(topic)).includes(agent)) glow = "relay"; // 質疑リレー中は流線と律動を揃えて明滅
   else if (!agentReady(agent)) glow = a.authed === false ? "err" : "wait";
-  else if (ta.lastError || a.lastError) glow = "err";
+  else if (ta.lastError) glow = "err"; // 契約 §3: トピック側のみ。席全体の可用性は次の行
+  else if (a.availability === "unavailable") glow = "err";
   else if ((state.budgetHalt && a.auto) || ta.interruptedSessionId || (last && last.cancelled)) glow = "wait";
   else if (unseen && !a.auto) glow = "wait";
   else if (last && last.author === agent && last.meta && last.meta.status === "completed") glow = "ok";
