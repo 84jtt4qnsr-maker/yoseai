@@ -4397,6 +4397,13 @@ async function handleApi(req, res, url) {
       a.modelOverride = body.model.trim();
       a.lastError = "";
     }
+    // 可用性の手動リセット（契約-不在可視化 §4 の後続・指摘#3）: unknown に落ちた席を「未評価」へ戻す。
+    // 復帰手段が「次の成功」しかないと、自動応答 OFF の席は不明表示を消せない。
+    // available へ直接は上げない（証拠なしに利用可能を示さない）——null は従来表示に戻るだけ。lastError は残す
+    if (body.resetAvailability === true) {
+      a.availability = null;
+      logEvent("cli", `${NAMES[parts[2]]} の可用性表示を手動で未評価に戻しました（次の実行または再確認で再評価）`, "info");
+    }
     touch();
     return json(res, 200, a);
   }

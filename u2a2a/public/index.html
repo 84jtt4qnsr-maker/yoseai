@@ -4512,6 +4512,24 @@ function renderAgentStatus(agent) {
   } else if (!ta.interruptedSessionId && resumeBtn) {
     resumeBtn.remove();
   }
+  // 可用性が「不明」に落ちた席の手動復帰（指摘#3）。available へは上げず「未評価」へ戻すだけ。
+  // unavailable（残高切れ等）は事実の表示なのでここでは消さない（grok はヘッダの再確認で更新できる）
+  let availBtn = document.getElementById("avail-reset-" + agent);
+  if (a.availability === "unknown" && !availBtn) {
+    availBtn = el("button", {
+      id: "avail-reset-" + agent,
+      class: "small",
+      text: "可用性を再評価に戻す",
+      title: "「不明」表示を消して未評価に戻します（次の実行または再確認で再評価。利用可能と断定はしません）",
+      onclick: () => {
+        api("/api/agents/" + agent, "PATCH", { resetAvailability: true })
+          .then(() => toast(NAMES[agent] + " の可用性表示を未評価に戻しました"));
+      },
+    });
+    resetBtn.after(availBtn);
+  } else if (a.availability !== "unknown" && availBtn) {
+    availBtn.remove();
+  }
   const modelInput = $("#model-" + agent);
   modelInput.placeholder = a.model || "model（既定）";
   // 入力中に SSE 更新で上書きしない

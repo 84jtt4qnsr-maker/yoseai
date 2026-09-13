@@ -16,6 +16,7 @@ class Element {
  appendChild(n){this.append(n);return n;}
  replaceChildren(...nodes){this.children=[];this._text='';this.append(...nodes);}
  remove(){if(this.parentElement)this.parentElement.children=this.parentElement.children.filter(n=>n!==this);}
+ after(n){if(!this.parentElement)return;const i=this.parentElement.children.indexOf(this);this.parentElement.children.splice(i+1,0,n);n.parentElement=this.parentElement;}
  addEventListener(k,f){(this.events[k]??=[]).push(f);}
  fire(k){return Promise.all((this.events[k]||[]).map(f=>f({target:this})));}
  focus(){this.doc.activeElement=this;}

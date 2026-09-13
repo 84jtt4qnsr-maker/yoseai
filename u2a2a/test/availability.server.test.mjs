@@ -266,6 +266,16 @@ test("キャンセルは対象外: ⏹ のみで ⚠ 無し・可用性不変（
   assert.equal(s.agents.grok.availability, "available", "キャンセルで可用性を動かさない");
 });
 
+test("手動リセット: unknown を未評価（null）へ戻せる。available へは上がらない（指摘#3）", async () => {
+  writeCtl({ claude: { fail: true } });
+  await api("POST", "/api/messages", { author: "user", thread: "claude", topicId: topic2, text: "unknown にする" });
+  await waitFor(async () => (await getState()).agents.claude.availability === "unknown", "claude unknown");
+  const r = await api("PATCH", "/api/agents/claude", { resetAvailability: true });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.availability, null, "未評価へ戻る（available と断定しない）");
+  writeCtl({});
+});
+
 test("再確認プローブにも分類が適用される: 402→unavailable／成功→available（受入⑨）", async () => {
   writeCtl({ grok: { fail402: true } });
   const r1 = await api("POST", "/api/agents/grok/check-auth");
