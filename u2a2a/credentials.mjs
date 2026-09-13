@@ -13,8 +13,10 @@ export const SCOPES = ["read", "write", "admin"];
 export const TICKET_TTL_MS = 10_000;
 export const ROUTE_CLASSES = ["public", "admin-read", "admin-write"];
 
-// 資格なしで通す経路。貼り付け先の画面を出せないと資格を渡せないので、静的資産だけ開ける
-const PUBLIC_EXACT = new Set(["/", "/index.html", "/favicon.ico"]);
+// 資格なしで通す経路。貼り付け先の画面を出せないと資格を渡せないので、静的資産だけ開ける。
+// /api/access は「資格検査が有効か」だけを返す唯一の public API（修正リスト-確定 P0-3）。
+// これが無いと U2A2A_CREDENTIALS=off の画面が state を取りに行けず空のままになる
+const PUBLIC_EXACT = new Set(["/", "/index.html", "/favicon.ico", "/api/access"]);
 const PUBLIC_PREFIX = ["/public/"];
 const PUBLIC_SUFFIX = [".js", ".css", ".map", ".png", ".svg", ".woff2"];
 
@@ -97,6 +99,10 @@ export function createTicketStore({ now = () => Date.now(), ttlMs = TICKET_TTL_M
     get size() {
       sweep();
       return tickets.size;
+    },
+    // 失効（/api/credentials/revoke）で呼ぶ。旧資格で取った切符を最大 TTL ぶん生かさない（P2-②）
+    clear() {
+      tickets.clear();
     },
   };
 }

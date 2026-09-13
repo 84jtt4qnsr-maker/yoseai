@@ -56,6 +56,8 @@ export function validateProfiles(raw) {
       }
     }
     if (p.unverified !== undefined && !strList(p.unverified)) err("profile-invalid", `${at}.unverified`, "文字列の配列です");
+    // 未知のキーは表示に落ちず「保護範囲を広く見せる」ので、綴りごと弾く（修正リスト-確定 P2-⑤）
+    if (strList(p.unverified)) for (const k of p.unverified) if (!UNVERIFIED_KEYS.includes(k)) err("profile-invalid", `${at}.unverified`, `未知のキー ${k}（使えるのは ${UNVERIFIED_KEYS.join(" / ")}）`);
     // §5: CLI ごとに要る環境変数はここで明示する。既定は空（spawnEnv の ENV_ALLOW だけ）
     if (p.envAllow !== undefined && !strList(p.envAllow)) err("profile-invalid", `${at}.envAllow`, "文字列の配列です");
     // 変数の綴り間違いを、展開時ではなくここで捕まえる
@@ -165,7 +167,10 @@ export function describeIsolation(state) {
   if (s.mode === "unprotected") return "未保護（OS の隔離なし）";
   if (s.mode === "enforced" && s.verified) {
     const when = s.verifiedAt ? String(s.verifiedAt).slice(0, 10) : "";
-    return `保護成立（検証済み${when ? " " + when : ""}）※ CLI 自身の資格は対象外`;
+    // 被覆を点灯と一緒に示す（P1-1）。「何が検証されたのか」を読める形で持ち歩く
+    const cov = s.coverage && Array.isArray(s.coverage.agents) && s.coverage.agents.length
+      ? `／被覆: ${s.coverage.agents.join("・")} 全${s.coverage.rows}行` : "";
+    return `保護成立（検証済み${when ? " " + when : ""}${cov}）※ CLI 自身の資格は対象外`;
   }
   if (s.mode === "enforced") return "隔離あり（未検証）";
   return "状態不明";

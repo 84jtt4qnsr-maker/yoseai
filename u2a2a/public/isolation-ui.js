@@ -5,6 +5,9 @@
   // サーバは Host として 127.0.0.1 / localhost / [::1] を同値に許可する（server.mjs の ALLOWED_HOSTS）。
   // 資格の受理もそれに合わせる。これ以外のホストは従来どおり別サーバとして拒否する
   const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+  // U2A2A_CREDENTIALS=off のサーバでは資格なしの fetch を許可する（修正リスト-確定 P0-3）。
+  // 判定の所有はブートストラップ（GET /api/access）。ここは渡された値に従うだけで、既定は「必要」
+  let credentialsRequired = true;
   const UNVERIFIED = {cliCredentials:'CLIの資格', cliSessionStore:'CLIの履歴保存', controlSocket:'制御ソケット', mcp:'MCP', execFiles:'実行ファイル'};
   const n = (tag, text, attrs = {}) => {
     const e = document.createElement(tag);
@@ -29,7 +32,7 @@
     }
     async asset(value) {
       if(!this.isApi(value))return value;
-      if(!this.credential()){this.onUnauthorized();throw new Error('資格が必要です。');}
+      if(credentialsRequired && !this.credential()){this.onUnauthorized();throw new Error('資格が必要です。');}
       const key=new URL(value,this.location.href).href;
       if(!this.assets.has(key)) {
         const epoch=this.epoch;
@@ -66,7 +69,7 @@
     stop(){this.generation++;this.cancel(this.timer);this.timer=null;this.source?.close();this.source=null;}
     async start(){
       this.stop();const generation=this.generation;
-      if(!this.credential()){this.onUnauthorized();return;}
+      if(credentialsRequired && !this.credential()){this.onUnauthorized();return;}
       try {
         const response=await this.fetcher('/api/state',{cache:'no-store'});
         if(generation!==this.generation)return;
@@ -87,7 +90,7 @@
     failed(generation){
       if(generation!==this.generation)return;
       this.stop();this.onDisconnect();
-      if(!this.credential()){this.onUnauthorized();return;}
+      if(credentialsRequired && !this.credential()){this.onUnauthorized();return;}
       this.timer=this.later(()=>this.start(),this.retry);this.retry=Math.min(this.retry*2,15000);
     }
   }
@@ -166,7 +169,17 @@
       // Fetch API file links as downloads, never navigate executable artifacts into the credential origin.
       doc.addEventListener('click',async e=>{
         const a=e.target.closest?.('a[href]');
-        if (!a || !this.client.isApi(a.href) || !new URL(a.href,this.client.location.href).pathname.startsWith('/api/pool/file/')) return;
+        if (!a) return;
+        // 差し替え済み（blob）のリンク: 左クリックはこれまでどおりダウンロード。中・右クリックは
+        // ここへ来ないので blob がそのまま新しいタブで開き「見る」が成立する（修正リスト-確定 P2-①）
+        if (a.dataset.yoseaiName && a.href.startsWith('blob:')) {
+          e.preventDefault();
+          const link=n('a');link.href=a.href;link.download=a.dataset.yoseaiName;
+          doc.body.append(link);link.click();link.remove();
+          return;
+        }
+        // 未差し替え（描画直後など）の API リンクは従来どおりクリック時に取得する
+        if (!this.client.isApi(a.href) || !new URL(a.href,this.client.location.href).pathname.startsWith('/api/pool/file/')) return;
         e.preventDefault();
         try {
           const url=await this.client.asset(a.href), link=n('a');
@@ -178,9 +191,21 @@
         for (const e of doc.querySelectorAll('[data-yoseai-src]')) {
           const src=e.getAttribute('data-yoseai-src');e.removeAttribute('data-yoseai-src');this.client.setSource(e,src);
         }
+        // プールファイルへのリンクはクリックを待たず認証済み blob に差し替える（P2-①）。
+        // 元のファイル名は dataset に残し、左クリックのダウンロード名に使う
+        for (const a of doc.querySelectorAll('a[href]')) {
+          if (a.dataset.yoseaiHydrated || !this.client.isApi(a.href)) continue;
+          const u=new URL(a.href,this.client.location.href);
+          if (!u.pathname.startsWith('/api/pool/file/')) continue;
+          a.dataset.yoseaiHydrated='1';
+          const name=decodeURIComponent(u.pathname.split('/api/pool/file/')[1]).split('/').pop() || 'artifact';
+          this.client.asset(a.href)
+            .then(url=>{a.dataset.yoseaiName=name;a.href=url;})
+            .catch(()=>{delete a.dataset.yoseaiHydrated;}); // 失敗はクリック時の従来経路に任せる
+        }
       };
       this.observer=new MutationObserver(hydrate);this.observer.observe(doc.body,{childList:true,subtree:true});hydrate();
     }
   }
-  globalThis.YoseaiIsolation={Media,LiveConnection,Controller};
+  globalThis.YoseaiIsolation={Media,LiveConnection,Controller,setCredentialsRequired:(v)=>{credentialsRequired=!!v;}};
 })();

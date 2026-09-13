@@ -2195,7 +2195,7 @@ const U2AOnboarding = globalThis.U2AOnboarding || {
   emptyState: () => document.createElement("div"),
   guide: () => document.createElement("span"),
 };
-const authLabel = (id) => U2AOnboarding.authLabel(id, state.agents?.[id]?.authed);
+const authLabel = (id) => U2AOnboarding.authLabel(id, state.agents?.[id]?.authed, state.isolation?.mode);
 const defaultParticipants = () => {
   const ready = agentIds().filter((id) => state.agents?.[id]?.auto && agentReady(id));
   return ready.length ? ready : ["claude", "codex"];
@@ -5370,10 +5370,18 @@ const live = new YoseaiIsolation.LiveConnection({
 });
 isolationUI.onLock = () => {live.stop();YoseaiAccess.clear();trayUI.disconnect("資格の確認が必要です。");};
 window.addEventListener('pagehide', () => live.stop());
-window.addEventListener('pageshow', e => {if(e.persisted && window.yoseaiCredential())live.start();});
+let accessOff = false; // GET /api/access で「資格の検査なし」を確認できたときだけ true
+window.addEventListener('pageshow', e => {if(e.persisted && (window.yoseaiCredential() || accessOff))live.start();});
 render(); // Show the normal shell and operating guidance even before credential entry.
 if(window.yoseaiCredential())live.start();
-else isolationUI.open();
+else {
+  // 資格が無いときは、資格検査が有効かだけを public API で確かめる（修正リスト-確定 P0-3）。
+  // 取得失敗・非200 を「検査なし」と解釈してはいけない——その場合は従来どおり資格の入力を求める
+  fetch('/api/access',{cache:'no-store'}).then(r=>r.ok?r.json():null).catch(()=>null).then(a=>{
+    if(a && a.credentials===false){accessOff=true;YoseaiIsolation.setCredentialsRequired(false);live.start();}
+    else isolationUI.open();
+  });
+}
 </script>
 <script type="module">
   try {

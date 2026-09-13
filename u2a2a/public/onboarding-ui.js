@@ -2,8 +2,11 @@
 (function (root) {
   'use strict';
   const NOTICE = '自動応答をONにすると、会話や参照内容がCLI経由で外部サービスへ送信され、契約に応じた利用料金が発生します。';
-  function authLabel(agent, authed) {
+  function authLabel(agent, authed, isolationMode) {
     if (agent !== 'grok') return '認証状態: 未確認';
+    // 隔離が blocked の間、認証プローブは起動されず前回値が残る（設計）。表示だけは
+    // 「認証済み」と断言せず、確認できない状態だと分かるようにする（修正リスト-確定 P2-⑥）
+    if (isolationMode === 'blocked') return (authed === true ? '認証済み' : authed === false ? '未認証' : '不明') + '・再確認不可（隔離停止中）';
     return authed === true ? '認証済み' : authed === false ? '未認証（grok login）' : '確認中';
   }
   function node(tag, text, className) {

@@ -771,6 +771,7 @@ function isolationView() {
     profilesSha256: isolation.profilesSha256,
     unverified: isolation.unverified,
     credentials: CREDENTIALS_ENABLED, // 資格の検査が生きているか（管理資格そのものは決して載せない）
+    coverage: isolation.coverage || null, // 検証済みのとき、その被覆（agents / 行数）
     label: sandbox.describeIsolation(isolation),
   };
 }
@@ -1123,11 +1124,20 @@ const QA_END_MARK = "【質疑終了】";
 const ENV_ALLOW = ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "TZ", "TERM", "SHELL", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"];
 const ENV_NEVER = /^(U2A2A_ADMIN_CREDENTIAL|.*(TOKEN|SECRET|PASSWORD|APIKEY|API_KEY))$/i;
 
+const envNeverWarned = new Set(); // 同じ名前を毎回書かない（起動ごとに 1 回）
 function spawnEnv(extraAllow = []) {
   const extra = [path.join(os.homedir(), ".homebrew/bin"), path.join(os.homedir(), ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin"];
   const env = { PATH: [process.env.PATH, ...extra].filter(Boolean).join(":") };
   for (const k of [...ENV_ALLOW, ...extraAllow]) {
-    if (ENV_NEVER.test(k)) continue; // 許可リストに書かれても秘密らしい名前は渡さない
+    if (ENV_NEVER.test(k)) {
+      // 許可リストに書かれても秘密らしい名前は渡さない。ただし黙って落とすと
+      // 「envAllow に書いたのに効かない」に見えるので、落とした事実は記録する（P2-④）
+      if (extraAllow.includes(k) && !envNeverWarned.has(k)) {
+        envNeverWarned.add(k);
+        logEvent("isolation", `envAllow の「${k}」は秘密らしい名前のため子プロセスへ渡しません（ENV_NEVER）`, "warn");
+      }
+      continue;
+    }
     if (process.env[k] !== undefined) env[k] = process.env[k];
   }
   return env;
@@ -1178,6 +1188,7 @@ const isolation = {
   reason: "not-initialized",
   verified: false,
   verifiedAt: null,
+  coverage: null, // 検証済みのとき、その被覆（P1-1）。verified と一緒にしか立たない
   profilesSha256: null,
   unverified: [],
   profiles: [],
@@ -1198,6 +1209,8 @@ function sandboxAvailability() {
 // 起動時に 1 回。プロファイルを読み、変数を展開した設定ファイルを data/sandbox/ へ書き出す。
 // 1 つでも展開に失敗したら mode は blocked（その状態で CLI を起こさない）
 function initIsolation() {
+  // 前回起動の設定ファイルの残骸を掃除する（P2-③）。実行のたびに書き直すので、持ち越す理由がない
+  try { fs.rmSync(SANDBOX_SETTINGS_DIR, { recursive: true, force: true }); } catch {}
   const avail = sandboxAvailability();
   let raw = null;
   try {
@@ -1231,20 +1244,26 @@ function initIsolation() {
   isolation.reason = "";
   // 前回の検証記録は、プロファイルが 1 バイトでも変わっていれば捨てる（§7.3）
   const prev = state.isolationVerification;
-  if (prev && prev.profilesSha256 === isolation.profilesSha256 && prev.runtime === isolation.runtime) {
+  // runtime は名前だけでなく**版**も一致が要る（P1-1）。プロファイルは 1 バイト、強制層は 1 版でも
+  // 変わっていれば前回の検証は無効。旧記録（version 未保存）も同じ扱いで捨てる
+  if (prev && prev.profilesSha256 === isolation.profilesSha256 && prev.runtime === isolation.runtime && prev.version && prev.version === isolation.version) {
     isolation.verified = true;
     isolation.verifiedAt = prev.verifiedAt || null;
+    isolation.coverage = prev.coverage || coverageSummary();
   } else if (prev) {
     state.isolationVerification = null;
-    logEvent("isolation", "プロファイルが変わったため、前回の検証記録を破棄しました。再測定が要ります", "warn");
+    logEvent("isolation", "プロファイルまたは強制層の版が変わったため、前回の検証記録を破棄しました。再測定が要ります", "warn");
   }
 }
 
-// (agent, phase) ごとの設定ファイル。トピックで変数が変わるので、実行のたびに書き出す
-function sandboxSettingsFor(profile, agent, phase, topicId) {
+// (agent, phase) ごとの設定ファイル。トピックや対象プロジェクトで変数が変わるので、実行のたびに書き出す。
+// 対象プロジェクトも名前に入れる——入れないと同じ (agent, phase, topic) の同時実行が別プロジェクトの
+// 設定を取り違えうる（修正リスト-確定 P2-③）。残骸は起動時の initIsolation が丸ごと掃除する
+function sandboxSettingsFor(profile, agent, phase, topicId, projectPath) {
   const t = sandbox.toRuntimeSettings(profile, isolation.runtime);
   if (!t.ok) return { ok: false, reason: "unsupported: " + t.unsupported.map((u) => u.key).join(" / ") };
-  const name = `${agent}-${phase}-${topicId || "none"}.json`.replace(/[^\w.-]/g, "_");
+  const proj = crypto.createHash("sha256").update(String(projectPath || "")).digest("hex").slice(0, 8);
+  const name = `${agent}-${phase}-${topicId || "none"}-${proj}.json`.replace(/[^\w.-]/g, "_");
   const file = path.join(SANDBOX_SETTINGS_DIR, name);
   try {
     fs.mkdirSync(SANDBOX_SETTINGS_DIR, { recursive: true, mode: 0o700 });
@@ -1258,7 +1277,10 @@ function sandboxSettingsFor(profile, agent, phase, topicId) {
 
 // runCli から呼ぶ。戻り値の mode で「包んだ」「そのまま」「起動しない」を決める
 function planRun({ agent, phase, topicId, projectPath }, cmd, args) {
-  if (!agent || !phase) return { mode: "unprotected", cmd, args, reason: "no-profile-requested" };
+  // 指定漏れは「未保護で走らせる」ではなく「起動しない」（fail-closed）。srt 不在の unprotected は
+  // 環境の事実だが、呼び出し忘れは実装の欠陥であり、黙って未保護実行に倒すと UI は enforced のまま
+  // 素通りが起きる（修正リスト-確定 P0-2。CLI 起動経路は現在4つで全て isolation を渡している）
+  if (!agent || !phase) return { mode: "blocked", cmd, args, reason: "no-profile-requested" };
   if (isolation.mode === "unprotected") return { mode: "unprotected", cmd, args, reason: isolation.reason };
   if (isolation.mode === "blocked") return { mode: "blocked", cmd, args, reason: isolation.reason };
   const vars = {
@@ -1278,7 +1300,7 @@ function planRun({ agent, phase, topicId, projectPath }, cmd, args) {
   };
   const r = sandbox.resolveProfile(isolation.profiles, { agent, phase, vars });
   if (!r.ok) return { mode: "blocked", cmd, args, reason: "profile: " + r.errors.map((e) => e.message).join(" / ") };
-  const s = sandboxSettingsFor(r.profile, agent, phase, topicId);
+  const s = sandboxSettingsFor(r.profile, agent, phase, topicId, vars.projectPath);
   if (!s.ok) return { mode: "blocked", cmd, args, reason: s.reason };
   return sandbox.planIsolation({
     availability: { available: true, version: isolation.version },
@@ -1312,6 +1334,30 @@ const REQUIRED_PROBES = {
   "-cred-file": "denied",
 };
 
+// 修正リスト-確定 P1-1: 必須 probe は §6 の汎用接尾辞に加えて、**実在するプロファイル行単位**で要る。
+// 行ごとに「書き込み境界」1 本（probe-isolation-boundary-<agent>-<phase>。phase "*" は "any"）、
+// エージェントごとに「本番経路（runCli）で包んでいること」1 本（probe-isolation-wrap-<agent>）。
+// これで「1 エージェント分の記録で全体の保護成立が点く」「プロファイルに行を足しても未測定のまま点く」
+// を機械的に防ぐ。旧スイートの取込は missing で弾かれ、点灯は新 probe が揃うまで自動的に待つ
+function requiredProbeSuffixes() {
+  const req = { ...REQUIRED_PROBES };
+  const agents = new Set();
+  for (const p of isolation.profiles || []) {
+    if (!p || !p.agent || p.agent === "*") continue; // 現物のプロファイルは全行 agent 指定
+    agents.add(p.agent);
+    req[`-boundary-${p.agent}-${p.phase === "*" ? "any" : p.phase}`] = "denied";
+  }
+  for (const a of agents) req[`-wrap-${a}`] = "denied";
+  return req;
+}
+
+// 取り込んだ記録から被覆の要約を作る（表示・保存用。判定は requiredProbeSuffixes が正）
+function coverageSummary() {
+  const agents = [...new Set((isolation.profiles || []).map((p) => p.agent).filter((a) => a && a !== "*"))].sort();
+  const rows = (isolation.profiles || []).filter((p) => p && p.agent && p.agent !== "*").length;
+  return { agents, rows };
+}
+
 // §7.3: サーバは自分で verified を立てない。再測定の記録を取り込んだときだけ立つ
 function applyIsolationVerification(body) {
   if (!body || typeof body !== "object") return { ok: false, code: "invalid-body", error: "本文が読めません" };
@@ -1324,10 +1370,14 @@ function applyIsolationVerification(body) {
   if (body.runtime && body.runtime !== isolation.runtime) {
     return { ok: false, code: "runtime-mismatch", error: `runtime が現行（${isolation.runtime}）と違います` };
   }
+  // 強制層の実装が入れ替わっても検証記録が生き残らないよう、名前だけでなく版も突き合わせる（P1-1）
+  if (body.version && isolation.version && body.version !== isolation.version) {
+    return { ok: false, code: "runtime-version-mismatch", error: `runtime の版が現行（${isolation.version}）と違います。強制層を入れ替えたら検証はやり直しです` };
+  }
   const probes = Array.isArray(body.probes) ? body.probes : [];
   const missing = [];
   const mismatched = [];
-  for (const [suffix, expected] of Object.entries(REQUIRED_PROBES)) {
+  for (const [suffix, expected] of Object.entries(requiredProbeSuffixes())) {
     const hits = probes.filter((p) => p && typeof p.probeId === "string" && p.probeId.endsWith(suffix));
     if (!hits.length) {
       missing.push(suffix);
@@ -1341,12 +1391,14 @@ function applyIsolationVerification(body) {
   }
   isolation.verified = true;
   isolation.verifiedAt = new Date().toISOString();
+  isolation.coverage = coverageSummary(); // 何が検証されたのかを点灯と一緒に持ち歩く（P1-1）
   // 保存するのは取り込んだ記録そのもの。次の起動では profilesSha256 が一致するときだけ復元する
   state.isolationVerification = {
     verifiedAt: isolation.verifiedAt,
     profilesSha256: isolation.profilesSha256,
     runtime: isolation.runtime,
     version: body.version || isolation.version || null,
+    coverage: isolation.coverage,
     probes: probes.map((p) => ({ probeId: String(p.probeId || ""), observation: String(p.observation || "not_run"), evidenceSha256: p.evidenceSha256 || null })),
   };
   logEvent("isolation", `再測定の記録を取り込みました（${probes.length} 件）。保護成立として表示します`, "info");
@@ -1359,12 +1411,49 @@ function isolationFor(agent, phase, topicId, project) {
   return { agent, phase, topicId: topicId || null, projectPath: (project && project.path) || null };
 }
 
+// P0-0（修正候補。受入は -codex-nested 測定の完了が必須・修正リスト-確定）:
+// macOS の Seatbelt は入れ子の sandbox_apply を拒否するため、srt の中で codex が自前の
+// OS サンドボックスを適用するとシェルツールが全滅する（実測: exit 71、pool 内の読取も不能）。
+// enforced のときだけ codex 自身の OS サンドボックスを外し、境界を srt に一本化する。
+// CLI の権限規則（--allowedTools / --allow / resumeWritable / writeDir）は維持——外すのは OS 層の
+// 入れ子だけ（合意メモ-隔離方式 §C の例外。契約補遺に明記）。
+// 判定は起動引数を組む直前に planRun と同じ入力で行い、runCli まで同期区間なので計画はずれない。
+// blocked なら runCli が起動を拒否する（fail-closed——素起動には決して落ちない）
+function isolationModeFor(iso) {
+  return planRun(iso || {}, "codex", []).mode;
+}
+
 // blocked は「起動していない」。呼び出し側の catch に合流させ、失敗として記録させる
 function isolationError(reason) {
   const e = new Error("隔離を初期化できないため実行しませんでした: " + (reason || "unknown"));
   e.isolationBlocked = true;
   e.reason = "isolation-init-failed";
   return e;
+}
+
+// 退避ファイルを最後まで回収できなかった実行は成功にしない（修正リスト-確定 P1-2）。
+// isolationBlocked と同じく throw で各 call* の失敗経路へ合流させる
+function outputLostError(err) {
+  const e = new Error("CLI 出力の退避ファイルを回収できませんでした。出力が失われている可能性があるため、この実行は失敗として扱います。" + String(err || "").slice(-300));
+  e.outputLost = true;
+  e.reason = "output-lost";
+  return e;
+}
+
+// 調査用に残した退避ファイルの削除期限（P1-2 の受入条件）。起動時に 24 時間を過ぎたものを掃除する
+function sweepRunRedirects(maxAgeMs = 24 * 3600_000) {
+  let removed = 0;
+  try {
+    const now = Date.now();
+    for (const name of fs.readdirSync(os.tmpdir())) {
+      if (!/^yoseai-run-[0-9a-f]{16}\.(out|err)$/.test(name)) continue;
+      const p = path.join(os.tmpdir(), name);
+      try {
+        if (now - fs.statSync(p).mtimeMs > maxAgeMs) { fs.unlinkSync(p); removed++; }
+      } catch {} // 消えていた・読めない残骸はスキップ
+    }
+  } catch {}
+  if (removed) logEvent("isolation", `期限切れの退避ファイルを ${removed} 件掃除しました`, "info");
 }
 
 // プロセスグループごとシグナル送信（ツール実行の子孫プロセスも道連れにする）
@@ -1397,6 +1486,8 @@ function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = nul
   if (plan.mode === "enforced") {
     const base = path.join(os.tmpdir(), "yoseai-run-" + crypto.randomBytes(8).toString("hex"));
     redirect = { out: base + ".out", err: base + ".err" };
+    // 先に 0600 で作っておく（シェルの > は truncate するだけ）。回収に失敗して残す場合の閲覧を自分に限る
+    try { fs.writeFileSync(redirect.out, "", { mode: 0o600 }); fs.writeFileSync(redirect.err, "", { mode: 0o600 }); } catch {}
     // plan.args の末尾は srt の -c に渡すシェル文字列。stdin は触らずリダイレクトだけ足す
     runArgs = [...plan.args];
     runArgs[runArgs.length - 1] += ` > ${sandbox.shellQuote(redirect.out)} 2> ${sandbox.shellQuote(redirect.err)}`;
@@ -1463,13 +1554,42 @@ function runCli(cmd, args, stdinData, timeoutMs = AGENT_TIMEOUT_MS, onLine = nul
     }
     const finish = (result) => {
       if (tailTimer) clearInterval(tailTimer);
+      let outputLost = false;
       if (redirect) {
-        drainFile(); // 取りこぼしを最終回収
-        try { err += fs.readFileSync(redirect.err, "utf8"); } catch {}
-        try { fs.unlinkSync(redirect.out); } catch {}
-        try { fs.unlinkSync(redirect.err); } catch {}
+        // 最終回収の成否は独立に記録する（修正リスト-確定 P1-2）。定期 tick の沈黙 catch は
+        // 「未作成の間は次で拾う」ための正当なものだが、close 後のここで拾えないのは事故:
+        //   missing    = ファイルが無い（リダイレクト自体が走っていない系統。> は空でも作る）
+        //   unreadable = 在るのに読めない（許可パスが死んだときの本命。EPERM 等）
+        // 空の出力は正常（CLI が何も書いていないだけ）なので ok。
+        const drainStatus = (file, read) => {
+          try { read(file); return "ok"; } catch (e) { return e && e.code === "ENOENT" ? "missing" : "unreadable"; }
+        };
+        const outStatus = drainStatus(redirect.out, () => {
+          const st = fs.statSync(redirect.out);
+          if (st.size > tailPos) {
+            const fd = fs.openSync(redirect.out, "r");
+            const buf = Buffer.alloc(st.size - tailPos);
+            const nRead = fs.readSync(fd, buf, 0, buf.length, tailPos);
+            fs.closeSync(fd);
+            tailPos += nRead;
+            feed(buf.subarray(0, nRead));
+          }
+        });
+        const errStatus = drainStatus(redirect.err, () => { err += fs.readFileSync(redirect.err, "utf8"); });
+        result.stdoutDrain = outStatus;
+        result.stderrDrain = errStatus;
+        // ok だったファイルだけ消す。回収できなかったファイルは原因調査のために残し（0600 で作成済み）、
+        // パスを err に書く。残骸は起動時の sweepRunRedirects が期限（24h）で掃除する
+        if (outStatus === "ok") { try { fs.unlinkSync(redirect.out); } catch {} }
+        if (errStatus === "ok") { try { fs.unlinkSync(redirect.err); } catch {} }
+        if (outStatus !== "ok" || errStatus !== "ok") {
+          outputLost = true;
+          const kept = [outStatus !== "ok" ? redirect.out : null, errStatus !== "ok" ? redirect.err : null].filter(Boolean);
+          err += `\n(退避ファイルの最終回収に失敗: stdout=${outStatus} / stderr=${errStatus}。調査用に残しました: ${kept.join(" ")})`;
+          logEvent("isolation", `CLI 出力の退避ファイルを回収できませんでした（stdout=${outStatus} / stderr=${errStatus}）。この実行は成功として扱いません`, "error");
+        }
       }
-      resolve({ ...result, out, err });
+      resolve({ ...result, out, err, outputLost });
     };
     const timer = setTimeout(() => {
       err += `\n(タイムアウト: ${timeoutMs / 1000}秒)`;
@@ -1739,8 +1859,9 @@ async function callClaude(prompt, sessionId, modelOverride, onStep, opts = {}) {
       if (s) onStep(s);
     }
   };
-  const { code, err, out, cancelled, isolationBlocked, isolationReason } = await runCli("claude", args, prompt, AGENT_TIMEOUT_MS, onLine, opts.cwd, opts.ctl, opts.isolation);
+  const { code, err, out, cancelled, isolationBlocked, isolationReason, outputLost } = await runCli("claude", args, prompt, AGENT_TIMEOUT_MS, onLine, opts.cwd, opts.ctl, opts.isolation);
   if (isolationBlocked) throw isolationError(isolationReason);
+  if (outputLost) throw outputLostError(err);
   if (cancelled)
     throw Object.assign(new Error("キャンセルされました"), {
       cancelled: true,
@@ -1813,11 +1934,16 @@ async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
   // resume は -s / -C を受け付けない（cwd は元セッションから継承）。sandbox は config 経由で明示する。
   // resumeWritable は「cwd=pool で作られたセッション」のみ true にすること（リポジトリ cwd の旧セッションを
   // workspace-write で再開するとリポジトリ全体が書き込み可能になってしまう）
+  // P0-0: enforced では codex の自前 OS サンドボックスを外して srt に一本化（isolationModeFor 参照）。
+  // unprotected / blocked では従来どおり自前サンドボックスを使う（blocked は runCli が起動を拒否）
+  const selfSandbox = isolationModeFor(opts.isolation) !== "enforced";
+  const resumeMode = selfSandbox ? (opts.resumeWritable ? "workspace-write" : "read-only") : "danger-full-access";
+  const newMode = selfSandbox ? (opts.writeDir ? "workspace-write" : "read-only") : "danger-full-access";
   const args = sessionId
-    ? ["exec", "resume", sessionId, "-", ...base, "-c", `sandbox_mode="${opts.resumeWritable ? "workspace-write" : "read-only"}"`]
+    ? ["exec", "resume", sessionId, "-", ...base, "-c", `sandbox_mode="${resumeMode}"`]
     : opts.writeDir
-      ? ["exec", "-", ...base, "-s", "workspace-write", "-C", opts.writeDir]
-      : ["exec", "-", ...base, "-s", "read-only", "-C", REPO_ROOT];
+      ? ["exec", "-", ...base, "-s", newMode, "-C", opts.writeDir]
+      : ["exec", "-", ...base, "-s", newMode, "-C", REPO_ROOT];
   if (modelOverride) args.push("-m", modelOverride);
   const onLine = (line) => {
     if (!line.trim()) return;
@@ -1842,8 +1968,9 @@ async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
       if (s) onStep(s);
     }
   };
-  const { code, out, err, cancelled, isolationBlocked, isolationReason } = await runCli("codex", args, prompt, AGENT_TIMEOUT_MS, onLine, REPO_ROOT, opts.ctl, opts.isolation);
+  const { code, out, err, cancelled, isolationBlocked, isolationReason, outputLost } = await runCli("codex", args, prompt, AGENT_TIMEOUT_MS, onLine, REPO_ROOT, opts.ctl, opts.isolation);
   if (isolationBlocked) throw isolationError(isolationReason);
+  if (outputLost) throw outputLostError(err);
   if (cancelled)
     throw Object.assign(new Error("キャンセルされました"), {
       cancelled: true,
@@ -1925,8 +2052,9 @@ async function callGrok(prompt, sessionId, modelOverride, onStep, opts = {}) {
       if (st) onStep(st);
     }
   };
-  const { code, out, err, cancelled, isolationBlocked, isolationReason } = await runCli("grok", args, "", AGENT_TIMEOUT_MS, onLine, opts.cwd, opts.ctl, opts.isolation);
+  const { code, out, err, cancelled, isolationBlocked, isolationReason, outputLost } = await runCli("grok", args, "", AGENT_TIMEOUT_MS, onLine, opts.cwd, opts.ctl, opts.isolation);
   if (isolationBlocked) throw isolationError(isolationReason);
+  if (outputLost) throw outputLostError(err);
   try {
     fs.unlinkSync(promptFile);
   } catch {
@@ -1966,6 +2094,7 @@ async function checkGrokAuth() {
     // 隔離が blocked のときは起動されないので、認証は「不明」ではなく未認証扱いにせず、そのまま前回値を残す
     const r = await runCli("grok", ["-p", "ping", "--output-format", "json", "--max-turns", "1"], "", 20_000, null, REPO_ROOT, null, isolationFor("grok", "review", null, null));
     if (r.isolationBlocked) return null;
+    if (r.outputLost) return null; // 出力が不完全で判定できない。blocked と同じく前回値を残す（authed を触らない）
     const parsed = parseGrokStream(r.out.split("\n"));
     ok = r.code === 0 && !parsed.error && !isGrokUnauthedError(r.out + r.err);
     message = ok ? "" : String(parsed.error || r.err || "プローブに失敗").slice(0, 200);
@@ -2886,7 +3015,7 @@ async function runSummary(topic, msgs, trigger) {
         : "") +
       `前置きなしで要約本文のみを出力。`;
     summaryAttempted = true;
-    const { text, meta } = await callClaude(prompt, null, "haiku", (s2) => actStep(actKey, s2), { ctl: run.ctl });
+    const { text, meta } = await callClaude(prompt, null, "haiku", (s2) => actStep(actKey, s2), { ctl: run.ctl, isolation: isolationFor("claude", "summary", topicId, null) });
     summaryMeta = meta || null;
     if (meta && meta.billing && meta.billing.mode === "metered") {
       topic.summaryCostUsd = (topic.summaryCostUsd || 0) + meta.billing.usd; // 計上漏れ防止
@@ -3376,6 +3505,13 @@ function validateParticipants(requested) {
 async function handleApi(req, res, url) {
   const parts = url.pathname.split("/").filter(Boolean); // ["api", ...]
 
+  // 資格検査が有効かどうかだけを返す唯一の public API（修正リスト-確定 P0-3）。
+  // 出所検査（403）は通った後。返すのは boolean 1 個だけ——public 面をこれ以上広げない。
+  // 取得に失敗した画面側は「off」と解釈してはいけない（起動エラーとして表示する）
+  if (req.method === "GET" && url.pathname === "/api/access") {
+    return json(res, 200, { credentials: CREDENTIALS_ENABLED });
+  }
+
   if (req.method === "GET" && url.pathname === "/api/state") {
     return json(res, 200, publicState());
   }
@@ -3400,6 +3536,10 @@ async function handleApi(req, res, url) {
   // 現行資格を捨てて作り直す（§4.4）。端末に新しい URL を出すので、開いている画面は貼り直しが要る
   if (req.method === "POST" && url.pathname === "/api/credentials/revoke") {
     adminCredential = cred.newAdminCredential();
+    // 失効は資格だけでなく、その資格で得たアクセスも切る（修正リスト-確定 P2-②）:
+    // 発行済みの SSE 切符（最大 10 秒有効）と、開いている SSE 接続を全部落とす
+    ticketStore.clear();
+    for (const c of [...sseClients]) { try { c.end(); } catch {} sseClients.delete(c); }
     logEvent("security", "管理資格を作り直しました。端末に出た新しい URL で開き直してください", "warn");
     printCredentialBanner();
     return json(res, 200, { ok: true, revokedAt: new Date().toISOString() });
@@ -5415,6 +5555,7 @@ try {
   // 起動時のミラー生成失敗は無視（次の保存時に再試行される）
 }
 initIsolation(); // state を読んだ後（前回の検証記録を見るため）、待ち受けを開く前
+sweepRunRedirects(); // 調査用に残した退避ファイルの期限掃除（P1-2）
 saveState();
 
 server.listen(PORT, "127.0.0.1", () => {
