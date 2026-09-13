@@ -2191,7 +2191,7 @@ function el(tag, attrs = {}, children = []) {
 
 // ---- 参加者・表示定義（サーバの agentDefs が正。旧 state は2名に限定）----
 const LEGACY_DEFS = { claude: { name: "Claude Code", cssVar: "--claude" }, codex: { name: "Codex", cssVar: "--codex" } };
-const STOP_LABELS = { agreed: "合意成立", hops: "中継回数の上限", budget: "予算上限", error: "実行エラー", cancelled: "実行を中断", "auto-off": "自動応答OFF", unauthed: "未認証", manual: "手動停止" };
+const STOP_LABELS = { agreed: "合意成立", hops: "中継回数の上限", budget: "予算上限", error: "実行エラー", cancelled: "実行を中断", "auto-off": "自動応答OFF", unauthed: "未認証", unavailable: "応答不能", manual: "手動停止" };
 const agentDefs = () => state.agentDefs || LEGACY_DEFS;
 const agentIds = () => Object.keys(agentDefs()).filter((id) => /^[a-z][a-z0-9_-]*$/.test(id));
 const participantsOf = (topic = currentTopic()) => topic?.participants || ["claude", "codex"];
@@ -2763,7 +2763,8 @@ function renderProjectUI() {
     if ($("#projects-dialog").open) renderProjectList();
   }
   const topic = currentTopic();
-  const errors = participantsOf(topic).map((agent) => topic?.agents?.[agent]?.lastError ?? state.agents?.[agent]?.lastError ?? "");
+  // 席全体のエラー（a.lastError）は混ぜない——短文が変わるたびプロジェクトの強制再プローブが走っていた（契約-停止ラッチ §6-6）
+  const errors = participantsOf(topic).map((agent) => topic?.agents?.[agent]?.lastError ?? "");
   const blockedMessage = (state.messages || []).findLast((m) => m.topicId === topic?.id && m.blocked);
   const errorKey = JSON.stringify([topic?.id, topic?.projectId, errors, blockedMessage?.id]);
   if (projectExecutionErrorKey !== errorKey) {
@@ -4515,7 +4516,7 @@ function renderAgentStatus(agent) {
   // 可用性が「不明」に落ちた席の手動復帰（指摘#3）。available へは上げず「未評価」へ戻すだけ。
   // unavailable（残高切れ等）は事実の表示なのでここでは消さない（grok はヘッダの再確認で更新できる）
   let availBtn = document.getElementById("avail-reset-" + agent);
-  if (a.availability === "unknown" && !availBtn) {
+  if ((a.availability === "unknown" || a.availability === "unavailable") && !availBtn) { // unavailable にも開く（契約-停止ラッチ §4）
     availBtn = el("button", {
       id: "avail-reset-" + agent,
       class: "small",
@@ -4527,7 +4528,7 @@ function renderAgentStatus(agent) {
       },
     });
     resetBtn.after(availBtn);
-  } else if (a.availability !== "unknown" && availBtn) {
+  } else if (a.availability !== "unknown" && a.availability !== "unavailable" && availBtn) {
     availBtn.remove();
   }
   const modelInput = $("#model-" + agent);
@@ -4586,6 +4587,7 @@ function applyThreadGlow(agent, a, ta) {
   else if (!agentReady(agent)) glow = a.authed === false ? "err" : "wait";
   else if (ta.lastError) glow = "err"; // 契約 §3: トピック側のみ。席全体の可用性は次の行
   else if (a.availability === "unavailable") glow = "err";
+  else if (a.availability === "unknown") glow = "wait"; // 不明は対応待ちの黄（契約-停止ラッチ §6-5）
   else if ((state.budgetHalt && a.auto) || ta.interruptedSessionId || (last && last.cancelled)) glow = "wait";
   else if (unseen && !a.auto) glow = "wait";
   else if (last && last.author === agent && last.meta && last.meta.status === "completed") glow = "ok";

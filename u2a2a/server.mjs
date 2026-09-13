@@ -57,6 +57,8 @@ import {
   validateV2Format,
   isSafeSpriteName,
   classifyBackendError,
+  availabilityDetail,
+  AVAILABILITY_DETAILS,
 } from "./lib.mjs";
 // 成果物の版と必須検証の共通モジュール（契約: 契約-成果物検証API.md）。名前の衝突を避けるため名前空間で読む
 import * as verif from "./verification.mjs";
@@ -117,7 +119,7 @@ function defaultAgent(agentId = "claude") {
   // auto: 新しい環境は OFF から始める（最初の発言で CLI が走って課金されないように。ON は画面から選ぶ）。
   //   既存の state.json は loadState の移行で保存値を維持する（ここの既定値は新規作成時だけ効く）
   // authed: grok のみ判定する（null = 確認中）。claude / codex は従来どおり true 扱い
-  return { auto: false, lastError: "", model: "", modelOverride: "", authed: agentId === "grok" ? null : true, authCheckedTs: 0, availability: null };
+  return { auto: false, lastError: "", model: "", modelOverride: "", authed: agentId === "grok" ? null : true, authCheckedTs: 0, availability: null, availabilityReason: null, availabilitySince: 0 };
 }
 
 // 参加・宛先として選べるか（自動応答 ON かつ認証済み）
@@ -287,7 +289,11 @@ function loadState() {
           // schemaVersion 7: grok の認証状態は起動時に再判定する（保存値は「確認中」に戻す）
           authed: a === "grok" ? null : true,
           authCheckedTs: 0,
-          availability: null, // 再起動で再評価（未評価へ戻す。キーは常に存在させ /api/state の形を安定させる——指摘#8）
+          // 契約-停止ラッチ §3: unavailable は理由コード＋観測時刻で復元し、表示は定型から再生成する
+          //（「確認または明示解除まで自動起動を再開しない」が永続化の意味）。unknown は未評価（null）へ戻す
+          ...(old.availability === "unavailable" && old.availabilityReason
+            ? { availability: "unavailable", availabilityReason: old.availabilityReason, availabilitySince: old.availabilitySince || Date.now(), lastError: availabilityDetail(old.availabilityReason) }
+            : { availability: null, availabilityReason: null, availabilitySince: 0 }),
         };
       }
       for (const t of parsed.topics) {
@@ -1438,13 +1444,11 @@ function isolationError(reason) {
 // 可用性（unavailable / unknown）とバッジ用の a.lastError を1か所で更新する。
 // thread / review / fix の3経路の catch から共通で呼ぶ（分類関数を経路ごとに散らすと漏れる——契約 §1）
 // cli は実行バックエンドの CLI（第1段は席＝CLI。第2段で resolveBackend() が入っても差分がここで済むよう分離——指摘#5）
-function noteRunFailure(topicId, agent, e, kind, cli = agent) {
+// startedAt はこの失敗を出した実行の開始時刻。ラッチ中（unavailable）は、停止観測より前に開始した実行から
+// 可用性を変えない——stale の一般エラーが unknown 上書きで成功ガードを迂回する穴（契約-停止ラッチ §2）
+function noteRunFailure(topicId, agent, e, kind, cli = agent, startedAt = null) {
   const cls = classifyBackendError(cli, e);
-  const a = state.agents[agent];
-  if (a) {
-    a.availability = cls.availability; // unknown も上書きする（unavailable が残り続けない——契約 §4）
-    a.lastError = cls.detail;
-  }
+  markAvailability(agent, cls.availability, cls.reason, cls.detail, startedAt); // unknown も上書き（契約 §4）。stale は不変（§2）
   const topic = findTopic(topicId);
   if (topic) {
     const ta = topic.agents && topic.agents[agent];
@@ -1468,27 +1472,73 @@ function noteRunFailure(topicId, agent, e, kind, cli = agent) {
   return cls;
 }
 
-// 実行成功（stopped / cancelled を除く）で可用性とトピック側エラーを戻す（契約 §3・§4）
-function noteRunSuccess(topicId, agent) {
+// 可用性の更新は必ずここを通す（契約-停止ラッチ §2 の一元化・codex レビュー2/4）。
+// startedAt がラッチの観測時刻より前＝stale な評価は、成功でも失敗でも状態を変えない
+function markAvailability(agent, availability, reason, detail, startedAt = null) {
   const a = state.agents[agent];
-  const wasUnavailable = !!(a && a.availability === "unavailable");
-  const seatError = a ? a.lastError : "";
-  if (a) {
-    a.availability = "available";
-    a.lastError = ""; // available と旧エラーを併存させない（契約 §4・codex レビュー）
+  if (!a) return false;
+  if (a.availability === "unavailable" && startedAt && a.availabilitySince && startedAt < a.availabilitySince) return false;
+  a.availability = availability;
+  a.availabilityReason = reason || null;
+  a.availabilitySince = Date.now();
+  a.lastError = detail || "";
+  return true;
+}
+
+// available への遷移（成功・再確認成功の共用）。席全体の複製の一括クリアまで含む
+function markAvailable(agent, startedAt = null) {
+  const a = state.agents[agent];
+  if (!a) return false;
+  const wasUnavailable = a.availability === "unavailable";
+  const seatError = a.lastError;
+  // 手動解除（unavailable → null）を経てから成功した場合、wasUnavailable では捕まらないが複製は残る。
+  // 席全体の事情の定型文言（AVAILABILITY_DETAILS）に一致する場合に限り一括クリアの対象にする
+  const seatWide = !!seatError && Object.values(AVAILABILITY_DETAILS).includes(seatError);
+  if (!markAvailability(agent, "available", null, "", startedAt)) return false;
+  if (wasUnavailable || seatWide) clearSeatErrorCopies(agent, seatError);
+  return true;
+}
+
+// 残高切れ等の「席全体の事情」は各トピックに同じ短文で複製される。席が復帰したら全トピック分を消す
+// （残すと、復帰後も別トピックの列で古い残高エラーが availability より先に表示され続ける——第1段 指摘#4）。
+// 複製かどうかは文言の厳密一致で判定できる（unavailable の detail は定型）。checkGrokAuth の成功側からも呼ぶ（契約-停止ラッチ §6-1）
+function clearSeatErrorCopies(agent, seatError) {
+  if (!seatError) return;
+  for (const t of state.topics) {
+    const tta = t.agents && t.agents[agent];
+    if (tta && tta.lastError === seatError) tta.lastError = "";
   }
+}
+
+// 実行成功（stopped / cancelled を除く）で可用性とトピック側エラーを戻す（契約 §3・§4）。
+// ラッチ中は、停止観測より前に開始した実行の成功では何も変えない（契約-停止ラッチ §2）
+function noteRunSuccess(topicId, agent, startedAt = null) {
+  if (!markAvailable(agent, startedAt)) return; // stale は何も変えない（§2）
   const topic = findTopic(topicId);
   const ta = topic && topic.agents && topic.agents[agent];
   if (ta) ta.lastError = "";
-  // 残高切れ等の「席全体の事情」は各トピックに同じ短文で複製される。席が復帰したら全トピック分を消す
-  // （残すと、復帰後も別トピックの列で古い残高エラーが availability より先に表示され続ける——指摘#4）。
-  // 複製かどうかは文言の厳密一致で判定できる（unavailable の detail は定型）
-  if (wasUnavailable && seatError) {
-    for (const t of state.topics) {
-      const tta = t.agents && t.agents[agent];
-      if (tta && tta.lastError === seatError) tta.lastError = "";
-    }
+}
+
+// 非正常完了（meta.status === "error"）の分類結果を可用性へ届ける（codex 再レビュー2巡目）。
+// startedAt 付きで共用更新を通すので、stale 実行からは状態が変わらない（§2）
+function noteResultFailure(topicId, agent, meta, startedAt = null) {
+  const cls = meta && meta.classified;
+  if (!cls) return;
+  if (markAvailability(agent, cls.availability, cls.reason, cls.detail, startedAt)) {
+    const topic = findTopic(topicId);
+    const ta = topic && topic.agents && topic.agents[agent];
+    if (ta) ta.lastError = cls.detail;
   }
+}
+
+// ラッチによる見送りは、同じ停止期間につき最初の1回だけイベントに残す（毎メッセージで連打しない——契約-停止ラッチ §1）
+const latchLogged = new Set();
+function latchSkip(agent, what) {
+  const a = state.agents[agent];
+  const key = agent + ":" + (a && a.availabilitySince) + ":" + what;
+  if (latchLogged.has(key)) return;
+  latchLogged.add(key);
+  logEvent("cli", `${NAMES[agent]} は応答不能（${(a && a.lastError) || "停止中"}）のため${what}を起動しません。解除は列の「可用性を再評価に戻す」か、復旧後の再確認で`, "warn");
 }
 
 // 退避ファイルを最後まで回収できなかった実行は成功にしない（修正リスト-確定 P1-2）。
@@ -1791,6 +1841,11 @@ function openRelay(topic, { first, order, hops = 6, agenda = "", text = "", chec
   if (ordered.includes("grok") && state.agents.grok.authed !== true) {
     return { error: "Grok が未認証（または確認中）のため質疑を開始できません", reason: "unauthed", agent: "grok" };
   }
+  const down = ordered.find((x) => state.agents[x] && state.agents[x].availability === "unavailable");
+  if (down) {
+    // 契約-停止ラッチ §1: 停止席がいる質疑は開始しない（理由付き拒否）
+    return { error: `${NAMES[down]} は応答不能（残高切れ等）のため質疑を開始できません`, reason: "unavailable", agent: down };
+  }
   if (check) return { ok: true, participants: ordered };
   topic.relay = {
     ...defaultRelay(),
@@ -1867,6 +1922,12 @@ function qaHop(topic, agent, replyText, sourceMsgId) {
     stopRelay(topic, "auto-off");
     return;
   }
+  // 停止ラッチを未認証より先に見る（402 は authed=false も立てるため、理由が「未認証」に化けていた——契約-停止ラッチ §1）
+  if (state.agents[next] && state.agents[next].availability === "unavailable") {
+    latchSkip(next, "質疑の手番");
+    stopRelay(topic, "unavailable");
+    return;
+  }
   if (next === "grok" && state.agents.grok.authed !== true) {
     stopRelay(topic, "unauthed");
     return;
@@ -1935,7 +1996,6 @@ async function callClaude(prompt, sessionId, modelOverride, onStep, opts = {}) {
     });
   if (!result && code !== 0) throw new Error((err || out || "claude CLI エラー").trim().slice(0, 500));
   if (!result) throw new Error("claude: 結果イベントを受信できませんでした");
-  if (result.is_error) throw new Error(String(result.result || "claude エラー").slice(0, 500));
   // modelUsage のキーがモデルID（"claude-opus-5[1m]" の [1m] はfastモード印なので除く）
   const model = Object.keys(result.modelUsage || {})[0]?.replace(/\[.*\]$/, "") || "";
   const u = result.usage || {};
@@ -1947,6 +2007,29 @@ async function callClaude(prompt, sessionId, modelOverride, onStep, opts = {}) {
     billing:
       typeof result.total_cost_usd === "number" ? { mode: "metered", usd: result.total_cost_usd } : { mode: "unknown" },
   };
+  // 診断文の材料は result.result に加えて result.errors も見る（そちらにだけ 401 等が入る形がある——codex レビュー3）
+  const diagText = [result.result, ...(Array.isArray(result.errors) ? result.errors.map((x) => (typeof x === "string" ? x : JSON.stringify(x))) : [])]
+    .filter(Boolean).join(" ");
+  if (result.is_error) {
+    // 契約-停止ラッチ §5: is_error の診断文は本文として保存・中継しない（catch 側が分類済み定型で ⚠ を積む）。
+    // usage・費用は e.meta で保持する——既存 throw への単純合流で費用を失わない（codex 指摘）
+    const err = new Error(String(diagText || "claude エラー").slice(0, 500));
+    err.meta = { ...meta, status: "error" };
+    throw err;
+  }
+  // §5: 既知の error_* subtype は usage・費用を保持した非正常完了として返す
+  //（成功としてリレー中継・トレイ受付・判定抽出・自動再レビュー・要約更新へ進めない）。
+  // 本文（result.result）は診断文であり得るため保存・中継せず、表示は定型に固定する（codex レビュー3。
+  // 生文は起動端末の stderr にだけ）。subtype の欠落・未知値は触らない（実イベントの実測待ち）
+  if (typeof result.subtype === "string" && ["error_max_turns", "error_during_execution"].includes(result.subtype)) {
+    meta.status = "error";
+    meta.resultSubtype = result.subtype;
+    // 診断文も分類して可用性へ届ける（errors にだけ OAuth 期限切れが入る形でもラッチが立つ——codex 再レビュー2巡目）。
+    // meta に載るのは分類済みの定型のみ。生文は stderr にだけ
+    meta.classified = classifyBackendError("claude", diagText || result.subtype);
+    console.error("[yoseai] Claude Code の非正常完了（生文・端末のみ・" + result.subtype + "）: " + String(diagText || "").slice(0, 500));
+    return { text: "（CLI が非正常完了を返しました: " + result.subtype + "。本文は保存されません）", sessionId: result.session_id || sessionId, model, meta };
+  }
   return { text: result.result || "(空の応答)", sessionId: result.session_id || sessionId, model, meta };
 }
 
@@ -2153,12 +2236,12 @@ async function checkGrokAuth() {
   } else {
     // プローブは ping を返すだけで何も書かないので、読み取りのみのプロファイル（grok/review）で起こす。
     // 隔離が blocked のときは起動されないので、認証は「不明」ではなく未認証扱いにせず、そのまま前回値を残す
+    const probeStartedAt = Date.now(); // §2: 走行中に別の観測でラッチが立ったら、このプローブの結果では状態を変えない（codex レビュー2）
     const r = await runCli("grok", ["-p", "ping", "--output-format", "json", "--max-turns", "1"], "", 20_000, null, REPO_ROOT, null, isolationFor("grok", "review", null, null));
     if (r.isolationBlocked || r.outputLost) {
       // 再確認を実行できなかった: 認証は前回値のまま（設計）だが、可用性は「不明」へ落として画面に出す
       //（available のまま残すと「再確認不能なのに利用可能」になる——契約 §4・codex レビュー）
-      g.availability = "unknown";
-      g.lastError = "再確認を実行できませんでした（" + (r.isolationBlocked ? "隔離を初期化できない" : "退避出力を回収できない") + "）";
+      markAvailability("grok", "unknown", null, "再確認を実行できませんでした（" + (r.isolationBlocked ? "隔離を初期化できない" : "退避出力を回収できない") + "）", probeStartedAt);
       touch();
       return null;
     }
@@ -2167,10 +2250,11 @@ async function checkGrokAuth() {
     message = ok ? "" : String(parsed.error || r.err || "プローブに失敗").slice(0, 200);
     // 手動「再確認」にも同じ分類を適用する（契約-不在可視化 §4）: 402 → unavailable、判定不能 → unknown、成功 → available。
     // 認証（authed）の判定はこれまでどおり——認証済みであることと応答可能であることは別軸
-    if (ok) g.availability = "available";
-    else {
+    if (ok) {
+      markAvailable("grok", probeStartedAt); // 複製の一括クリア（seatWide 含む）と §2 ガードを成功処理と共用（codex レビュー4）
+    } else {
       const cls = classifyBackendError("grok", parsed.error || r.err || r.out || message);
-      g.availability = cls.availability;
+      markAvailability("grok", cls.availability, cls.reason, cls.detail, probeStartedAt);
       // unknown でも生文を残さない（codex 再レビュー2）。events も SSE・画面に流れるので定型のみ（再レビュー3）。
       // 生文は起動端末の stderr にだけ
       console.error("[yoseai] Grok 再確認プローブ失敗（生文・端末のみ）: " + String(parsed.error || r.err || "").slice(0, 500));
@@ -2180,7 +2264,9 @@ async function checkGrokAuth() {
   }
   g.authed = ok;
   g.authCheckedTs = Date.now();
-  g.lastError = ok ? "" : message; // available へ戻すときは旧エラーを残さない（契約 §4・codex レビュー）
+  // lastError は markAvailability / markAvailable が管理する（stale ガードで保護した値をここで潰さない）。
+  // auth.json 不在の分岐だけはプローブが走っていないので、未認証の説明を直接書く
+  if (!fs.existsSync(GROK_AUTH_FILE)) g.lastError = message;
   touch();
   return ok;
 }
@@ -2769,6 +2855,13 @@ async function runReview(itemId, reviewer, ropts = {}) {
     touch();
     return;
   }
+  if (state.agents[reviewer].availability === "unavailable") {
+    // 契約-停止ラッチ §1: 停止中の席で CLI を起こさない（自動再レビュー経路もここを通る）
+    item.reviews.push({ id: id(), reviewer, text: "（未実施: 応答不能（残高切れ等）のためスキップ）", verdict: "", skipped: true, reason: "応答不能", ts: Date.now() });
+    latchSkip(reviewer, "レビュー");
+    touch();
+    return;
+  }
   if (ropts.auto && !state.agents[reviewer].auto) {
     item.reviews.push({ id: id(), reviewer, text: "（未実施: 自動応答 OFF のためスキップ）", verdict: "", skipped: true, reason: "自動応答OFF", ts: Date.now() });
     touch();
@@ -2838,27 +2931,42 @@ async function runReview(itemId, reviewer, ropts = {}) {
     return;
   }
   try {
+    // 対象確認・版保存の await の間に席が停止し得る。CLI 起動直前に再検査（契約-停止ラッチ §1・codex レビュー1）
+    if (state.agents[reviewer].availability === "unavailable" || (reviewer === "grok" && state.agents.grok.authed !== true)) {
+      item.reviews.push({ id: id(), reviewer, text: "（未実施: 応答不能（残高切れ等）のためスキップ）", verdict: "", skipped: true, reason: "応答不能", ts: Date.now(), ...reviewVersionFields(item, history) });
+      latchSkip(reviewer, "レビュー");
+      finish();
+      return;
+    }
     const runner = RUNNERS[reviewer];
     // 読み取りのみのオプション（claude: --add-dir、codex: read-only、grok: --sandbox read-only）。offline は検索を使わない指示
     const callOpts = { ...runner.reviewOpts(pc.project, itemOutcomeTopic(item)), offline: !!ropts.offline };
     const { text, meta } = await runner.call(buildReviewPrompt(item, reviewer, history, pc, !!ropts.offline), null, state.agents[reviewer].modelOverride, (s) => actStep(actKey, s), callOpts);
-    // 権限要求・中断で止まった応答（meta.status === "stopped"）は本文・費用を残すが、判定は抽出しない（途中の文言を判定として扱わない）
+    // 権限要求・中断で止まった応答（meta.status === "stopped"）は本文・費用を残すが、判定は抽出しない（途中の文言を判定として扱わない）。
+    // 非正常完了（meta.status === "error"、§5 の既知 error_*）も同様に判定へ進めない
     const stopped = !!(meta && meta.status === "stopped");
-    item.reviews.push({ id: id(), reviewer, text, verdict: stopped ? "" : verdictFrom(text), meta, ts: Date.now(), ...(stopped ? { stopped: true } : {}), ...reviewVersionFields(item, history) });
-    noteOutcome(itemOutcomeTopic(item), reviewer, stopped ? { type: "stopped", kind: "review", runId: run.runId, itemId } : { type: "completed", kind: "review" });
-    if (!stopped) noteRunSuccess(itemOutcomeTopic(item), reviewer);
+    const errored = !!(meta && meta.status === "error");
+    item.reviews.push({ id: id(), reviewer, text, verdict: stopped || errored ? "" : verdictFrom(text), meta, ts: Date.now(), ...(stopped ? { stopped: true } : {}), ...(errored ? { error: true } : {}), ...reviewVersionFields(item, history) });
+    noteOutcome(itemOutcomeTopic(item), reviewer, stopped
+      ? { type: "stopped", kind: "review", runId: run.runId, itemId }
+      : errored
+        ? { type: "failed", kind: "review", reason: "result", runId: run.runId, itemId, detail: "CLI が非正常完了を返しました（" + (meta.resultSubtype || "result") + "）" }
+        : { type: "completed", kind: "review" });
+    if (errored) noteResultFailure(itemOutcomeTopic(item), reviewer, meta, run.startedAt);
+    if (!stopped && !errored) noteRunSuccess(itemOutcomeTopic(item), reviewer, run.startedAt);
   } catch (e) {
     item.reviews.push({
       id: id(),
       reviewer,
-      text: "（レビュー失敗: " + String(e.message || e).slice(0, 300) + "）",
+      // 生文を残さない（契約-停止ラッチ §6-2。キャンセルの e.message はアプリ自前の安全な文言）
+      text: "（レビュー失敗: " + (e.cancelled ? String(e.message || e).slice(0, 100) : classifyBackendError(reviewer, e).detail) + "）",
       verdict: "",
       error: true,
       meta: e.meta || null,
       ts: Date.now(),
       ...reviewVersionFields(item, history),
     });
-    const cls = e.cancelled ? null : noteRunFailure(itemOutcomeTopic(item), reviewer, e, "レビュー"); // キャンセルは対象外（契約 §2）
+    const cls = e.cancelled ? null : noteRunFailure(itemOutcomeTopic(item), reviewer, e, "レビュー", reviewer, run.startedAt); // キャンセルは対象外（契約 §2）
     noteOutcome(
       itemOutcomeTopic(item),
       reviewer,
@@ -2901,6 +3009,10 @@ function buildFixPrompt(item, agent, pc = null, offline = false) {
 }
 
 async function runFix(itemId, agent, fopts = {}) {
+  if (state.agents[agent] && state.agents[agent].availability === "unavailable") {
+    latchSkip(agent, "修正"); // 契約-停止ラッチ §1（API は 400 済み。ここは二重防御）
+    return;
+  }
   const item = state.pool.find((p) => p.id === itemId);
   if (!item || !item.file || fixPending[itemId] || reviewPending[itemId]) return; // レビュー中の修正は API が 409。ここは二重防御
   const overBudget = budgetStatus(null);
@@ -2960,6 +3072,12 @@ async function runFix(itemId, agent, fopts = {}) {
   }
   let cliOk = false;
   try {
+    // 対象確認・版保存の await の間に席が停止し得る。CLI 起動直前に再検査（契約-停止ラッチ §1・codex レビュー1）
+    if (state.agents[agent].availability === "unavailable" || (agent === "grok" && state.agents.grok.authed !== true)) {
+      latchSkip(agent, "修正");
+      Object.assign(fix, { text: "（未実施: 応答不能（残高切れ等）のためスキップ）", error: true });
+      throw Object.assign(new Error("latch"), { latchSkipped: true });
+    }
     const prompt = buildFixPrompt(item, agent, pc, !!fopts.offline);
     const onStep = (s) => actStep(actKey, s);
     const override = state.agents[agent].modelOverride;
@@ -2968,21 +3086,27 @@ async function runFix(itemId, agent, fopts = {}) {
     const runner = RUNNERS[agent];
     const { text, meta } = await runner.call(prompt, null, override, onStep, { ...runner.fixOpts(pc.project, itemOutcomeTopic(item)), offline: !!fopts.offline });
     const stopped = !!(meta && meta.status === "stopped");
-    Object.assign(fix, { text, meta }, stopped ? { stopped: true } : {});
+    const errored = !!(meta && meta.status === "error"); // §5: 部分成果・費用は保持、正常完了扱いにしない
+    Object.assign(fix, { text, meta }, stopped ? { stopped: true } : errored ? { error: true } : {});
     const st = statPoolFile(item.file); // 中断でもファイルは途中まで書かれ得るので stat は更新する
     if (st) Object.assign(item, st);
-    if (stopped) {
-      // 権限要求・中断で止まった修正は正常完了として扱わない: 本文・費用は残し、修正後の版は partial で保存し、
+    if (stopped || errored) {
+      // 権限要求・中断・非正常完了の修正は正常完了として扱わない: 本文・費用は残し、修正後の版は partial で保存し、
       // 状態は動かさず自動再レビューも起動しない（ユーザーが内容を確認して再修正・手動レビューを選ぶ）
-      logEvent("cli", `${NAMES[agent]} の修正が途中で停止しました（${item.file}）: ` + GROK_STOP_NOTE, "warn");
+      logEvent("cli", `${NAMES[agent]} の修正が途中で${stopped ? "停止" : "非正常完了"}しました（${item.file}）`, "warn");
+      if (errored) noteResultFailure(itemOutcomeTopic(item), agent, meta, run.startedAt);
     } else {
       cliOk = true;
       item.status = "submitted";
-      noteRunSuccess(itemOutcomeTopic(item), agent);
+      noteRunSuccess(itemOutcomeTopic(item), agent, run.startedAt);
     }
   } catch (e) {
-    Object.assign(fix, { text: "（修正失敗: " + String(e.message || e).slice(0, 300) + "）", error: true, cancelled: !!e.cancelled, meta: fix.meta || e.meta || null });
-    if (!e.cancelled) fix.publicDetail = noteRunFailure(itemOutcomeTopic(item), agent, e, "修正").detail; // キャンセルは対象外（契約 §2）
+    if (!e.latchSkipped) {
+      const cls = e.cancelled ? null : noteRunFailure(itemOutcomeTopic(item), agent, e, "修正", agent, run.startedAt); // キャンセルは対象外（契約 §2）
+      // 生文を残さない（契約-停止ラッチ §6-3）
+      Object.assign(fix, { text: "（修正失敗: " + (cls ? cls.detail : String(e.message || e).slice(0, 100)) + "）", error: true, cancelled: !!e.cancelled, meta: fix.meta || e.meta || null });
+      if (cls) fix.publicDetail = cls.detail;
+    }
   }
   // 修正後の版を成否問わず保存（失敗・中断時は partial）→ ロック解除 → 正常完了かつ履歴保存に成功したときだけ自動再レビュー
   let historyOk = true;
@@ -3039,6 +3163,11 @@ function summarizeTopic(topicId, trigger = "auto") {
   if (summaryPending.has(topicId)) {
     const cur = topic.summaryState || defaultSummaryState();
     return { started: false, state: { ...cur, phase: "skipped", reason: "already-running", detail: "", trigger, ts: Date.now() } };
+  }
+  // 契約-停止ラッチ §1: 要約担当（claude 固定）が応答不能なら起動しない。見送り理由は残す（無言のスキップを作らない）
+  if (state.agents.claude && state.agents.claude.availability === "unavailable") {
+    setSummaryState(topic, { phase: "skipped", reason: "unavailable", detail: state.agents.claude.lastError || "", trigger });
+    return { started: false, state: topic.summaryState };
   }
   // 予算管理下に置く（合意事項B）: 停止中・上限超過なら halt は起こさず見送る（理由は残す）
   if (state.budgetHalt) {
@@ -3103,6 +3232,12 @@ async function runSummary(topic, msgs, trigger) {
     if (meta && meta.billing && meta.billing.mode === "metered") {
       topic.summaryCostUsd = (topic.summaryCostUsd || 0) + meta.billing.usd; // 計上漏れ防止
     }
+    if (meta && meta.status === "error") {
+      // §5: 非正常完了の本文で要約を更新しない（費用は上で計上済み）。分類結果は可用性へ（codex 再レビュー2巡目）
+      noteResultFailure(topicId, "claude", meta, run.startedAt);
+      setSummaryState(topic, { phase: "failed", reason: "result", detail: "CLI が非正常完了を返しました（" + (meta.resultSubtype || "result") + "）", trigger });
+      return;
+    }
     // 旧対象の要約を引き継いで更新した場合は、モデルの出力に依らず引き継ぎの注記を先頭に固定で残す
     topic.summaryText = (carried ? `（この要約は対象「${prevLabel}」の時点の内容を引き継ぎ、対象「${nowLabel}」で更新したものです）\n` : "") + text.trim();
     topic.summaryProjectId = originProjectId; // 要約の出所（開始時点の対象。分岐で要約と一緒に引き継ぐ）
@@ -3117,9 +3252,18 @@ async function runSummary(topic, msgs, trigger) {
       // 明示的な中断は失敗ではない（見送り扱い）
       setSummaryState(topic, { phase: "skipped", reason: "cancelled", detail: "", trigger });
     } else {
-      setSummaryState(topic, { phase: "failed", reason: "error", detail: classifyBackendError("claude", e).detail, trigger }); // summaryState も publicState で配信される。生文を載せない（#1 と同型）
+      const cls = classifyBackendError("claude", e);
+      setSummaryState(topic, { phase: "failed", reason: "error", detail: cls.detail, trigger }); // summaryState も publicState で配信される。生文を載せない
       console.error("[yoseai] 要約の失敗（生文・端末のみ）: " + String((e && e.message) || e || "").slice(0, 500));
-      logEvent("summary", `スレッド要約の生成に失敗（${topic.title}）: ` + (e.message || e), "warn");
+      // 要約の失敗も可用性に反映する（契約-停止ラッチ §1。⚠ 行は積まない——要約はスレッドの発言ではない）
+      const ag = state.agents.claude;
+      if (ag && !(ag.availability === "unavailable" && run.startedAt && ag.availabilitySince && run.startedAt < ag.availabilitySince)) {
+        ag.availability = cls.availability;
+        ag.availabilityReason = cls.reason || null;
+        ag.availabilitySince = Date.now();
+        ag.lastError = cls.detail;
+      }
+      logEvent("summary", `スレッド要約の生成に失敗（${topic.title}）: ` + cls.detail, "warn"); // events は SSE 配信。生文は stderr のみ（契約-停止ラッチ §6-4）
     }
   } finally {
     if (summaryAttempted) {
@@ -3340,6 +3484,18 @@ async function agentLoop(topicId, agent) {
       if (!(topic.participants || LEGACY_AGENTS).includes(agent)) break; // 参加者でないエージェントは動かない（セッション状態もない）
       const a = state.agents[agent];
       const ta = topic.agents[agent];
+      // 契約-停止ラッチ §1: unavailable の席は CLI を起こさない（起動直前の検査）。
+      // 進行中の質疑は次の CLI 起動前に停止する（席は飛ばさない・自動再開しない）
+      if (a.availability === "unavailable") {
+        latchSkip(agent, "自動応答");
+        if (topic.relay.active && (topic.relay.participants || LEGACY_AGENTS)[topic.relay.turn] === agent) {
+          stopRelay(topic, "unavailable");
+          touch();
+        }
+        break;
+      }
+      // grok の認証検査も実行前に明示的に行う（agentAutoOn に認証条件は無い——契約-停止ラッチ §1）
+      if (agent === "grok" && a.authed !== true) break;
       try {
         if (syncExternal(topic, agent)) touch(); // 外部での続きを取り込んでから応答する
       } catch {
@@ -3360,6 +3516,16 @@ async function agentLoop(topicId, agent) {
       const pc = await projectContext(topic.projectId);
       // 確認待ちの間に自動応答 OFF・上限停止・トピック削除が起きていれば起動しない
       if (!agentAutoOn(agent) || findTopic(topicId) !== topic) break;
+      // 確認待ち（await）の間に席が停止した場合も起動しない——CLI 起動直前の再検査（契約-停止ラッチ §1・codex レビュー1）
+      if (a.availability === "unavailable") {
+        latchSkip(agent, "自動応答");
+        if (sameRelay()) {
+          stopRelay(topic, "unavailable");
+          touch();
+        }
+        break;
+      }
+      if (agent === "grok" && a.authed !== true) break;
       // リレー起動は、確認待ちの間にリレーが終了・別リレーになっていたら中止する（通常応答として扱い直さない）。
       // ただし待機中に新しい起動要求（停止→同じ先手で新規開始など）が needsRun に入っていれば、旧起動を捨てた上で
       // 先頭から再評価する（break で終えると新リレーが active のまま誰も走らない）
@@ -3421,14 +3587,15 @@ async function agentLoop(topicId, agent) {
         if (model) a.model = model;
         ta.lastSeenTs = msgs[msgs.length - 1].ts;
         const stopped = !!(meta && meta.status === "stopped");
+        const errored = !!(meta && meta.status === "error"); // 既知の error_* subtype（§5）。部分成果は残すが成功扱いにしない
         // 権限要求または中断で停止した応答は赤字で示す（UI は ta を読む——契約 §3）。
         // 成功時の a.lastError クリアは noteRunSuccess に一元化する: 先にここで消すと、
         // 「席全体の複製を一括クリアする」判定材料（旧 a.lastError）が失われる（指摘#4 の回帰で発覚）
         if (stopped) {
           a.lastError = GROK_STOP_NOTE;
           ta.lastError = GROK_STOP_NOTE;
-        } else {
-          noteRunSuccess(topicId, agent); // 成功系のみ可用性を戻す（stopped は戻さない——契約 §4）
+        } else if (!errored) {
+          noteRunSuccess(topicId, agent, run.startedAt); // 成功系のみ可用性を戻す（stopped / errored は戻さない——契約 §4・§5）
         }
         // 応答待ちの間にリレーが停止・別リレーになっていたら、この応答は旧リレーの発言。記録はするが中継・議題採用はしない
         const relayLive = sameRelay();
@@ -3442,13 +3609,18 @@ async function agentLoop(topicId, agent) {
           provenance: { ingress: "agent-loop", delivery: "direct", trigger: "auto", source: null },
           meta,
           ...(stopped ? { stopped: true } : {}),
+          ...(errored ? { failed: true } : {}),
           ...(stale ? { staleRelayId: relayIdAtStart } : {}),
           ts: Date.now(),
         };
         state.messages.push(replyMsg);
-        noteOutcome(topicId, agent, stopped ? { type: "stopped", kind: "thread", runId: run.runId, messageId: replyMsg.id } : { type: "completed", kind: "thread" });
+        noteOutcome(topicId, agent, stopped
+          ? { type: "stopped", kind: "thread", runId: run.runId, messageId: replyMsg.id }
+          : errored
+            ? { type: "failed", kind: "thread", reason: "result", runId: run.runId, messageId: replyMsg.id, detail: "CLI が非正常完了を返しました（" + (meta.resultSubtype || "result") + "）" }
+            : { type: "completed", kind: "thread" });
         // 質疑の論点が未定なら、先手の応答冒頭の起案を採用（ユーザーは qa バーで修正可能）。同じリレーの手番の応答に限る
-        if (relayLive && !stopped && !topic.relay.agenda) {
+        if (relayLive && !stopped && !errored && !topic.relay.agenda) {
           // 「今回決めること: 〜」形式にも「## 今回決めること」見出し＋次行にも対応
           const am = text.match(/今回決めること[:：]?[ \t]*\n*[-*\s]*([^\n]+)/);
           if (am) {
@@ -3465,13 +3637,17 @@ async function agentLoop(topicId, agent) {
           // 中断した応答は正常完了ではない: 相手へ中継せず、自分の手番のリレーなら止める（次の手番を空回りさせない）。
           // 停止理由は lib の RELAY_STOP_REASONS / UI の表示名にある "cancelled"（実行を中断）を共用する（独自の理由は増やさない）
           if (relayLive) stopRelay(topic, "cancelled");
+        } else if (errored) {
+          // 非正常完了（§5）も中継しない。手番のリレーは error で止める。分類結果は可用性へ（codex 再レビュー2巡目）
+          noteResultFailure(topicId, agent, meta, run.startedAt);
+          if (relayLive) stopRelay(topic, "error");
         } else if (relayLive) {
           qaHop(topic, agent, text, replyMsg.id);
         }
         // 判断トレイの受付は qaHop の後（契約 §6.1）。ここまで来れば「終了宣言が受理されたか」が確定していて、
         // 合意メモ §2 の「終了が不受理なら同じ応答の着手提案も捨てる」を判定できる。
         // stale（古いリレー宛て）と stopped（権限要求・中断）は本文が途中で切れている可能性があるので受け付けない
-        if (!stale && !stopped) trayIntake(topic, agent, text, replyMsg.id);
+        if (!stale && !stopped && !errored) trayIntake(topic, agent, text, replyMsg.id);
       } catch (e) {
         // エラー/キャンセルで質疑が空回りしないよう停止（この実行の手番のリレーに限る。別リレーは触らない）
         if (sameRelay()) stopRelay(topic, e.cancelled ? "cancelled" : "error");
@@ -3499,7 +3675,7 @@ async function agentLoop(topicId, agent) {
             ts: Date.now(),
           });
         } else {
-          const cls = noteRunFailure(topicId, agent, e, "応答"); // ⚠ 行・ta.lastError・可用性・a.lastError を一括（契約 §1〜§4）
+          const cls = noteRunFailure(topicId, agent, e, "応答", agent, run.startedAt); // ⚠ 行・ta.lastError・可用性・a.lastError を一括（契約 §1〜§4）
           // outcome の detail も定型短文（生文は agentOutcomes → state.json / API へ永続配信されてしまう——指摘#1）
           noteOutcome(topicId, agent, { type: "failed", kind: "thread", reason: "error", runId: run.runId, detail: cls.detail });
         }
@@ -4305,6 +4481,7 @@ async function handleApi(req, res, url) {
       if (!reviewer) return json(res, 400, { error: "reviewer は " + AGENTS.join(" / ") });
       if (!participantsOfTopic(item.topicId).includes(reviewer)) return json(res, 400, { error: `${NAMES[reviewer]} はこの成果物のトピックの参加者ではありません` });
       if (reviewer === "grok" && state.agents.grok.authed !== true) return json(res, 400, { error: "Grok が未認証（または確認中）です", reason: "unauthed", agent: "grok" });
+      if (state.agents[reviewer].availability === "unavailable") return json(res, 400, { error: `${NAMES[reviewer]} は応答不能（残高切れ等）です。復旧後に再確認または「可用性を再評価に戻す」を`, reason: "unavailable", agent: reviewer });
       if (fixPending[item.id]) return json(res, 409, { error: "このアイテムは修正実行中です（完了後にレビューしてください）" });
       runReview(item.id, reviewer, { offline: body.offline === true });
       return json(res, 202, { ok: true });
@@ -4317,6 +4494,7 @@ async function handleApi(req, res, url) {
       if (!agent) return json(res, 400, { error: "agent は " + AGENTS.join(" / ") });
       if (!participantsOfTopic(item.topicId).includes(agent)) return json(res, 400, { error: `${NAMES[agent]} はこの成果物のトピックの参加者ではありません` });
       if (agent === "grok" && state.agents.grok.authed !== true) return json(res, 400, { error: "Grok が未認証（または確認中）です", reason: "unauthed", agent: "grok" });
+      if (state.agents[agent].availability === "unavailable") return json(res, 400, { error: `${NAMES[agent]} は応答不能（残高切れ等）です。復旧後に再確認または「可用性を再評価に戻す」を`, reason: "unavailable", agent });
       if (!item.file) return json(res, 400, { error: "ファイル実体のない旧形式アイテムは修正できません" });
       if (fixPending[item.id]) return json(res, 409, { error: "このアイテムは修正実行中です" });
       if (reviewPending[item.id]) return json(res, 409, { error: "このアイテムはレビュー実行中です（完了後に修正してください）" });
@@ -4391,17 +4569,18 @@ async function handleApi(req, res, url) {
       a.auto = body.auto;
       // ON にした時点から先の新着のみ拾う。参加しているトピックだけ（旧トピックには grok のセッション状態がない）
       if (body.auto) for (const t of state.topics) if (t.agents[parts[2]]) t.agents[parts[2]].lastSeenTs = Date.now();
-      a.lastError = "";
+      // lastError はここでは消さない（可用性の証拠にならない操作。消すのは resetAvailability——契約-停止ラッチ §6-7）
     }
     if (typeof body.model === "string") {
       a.modelOverride = body.model.trim();
-      a.lastError = "";
     }
     // 可用性の手動リセット（契約-不在可視化 §4 の後続・指摘#3）: unknown に落ちた席を「未評価」へ戻す。
     // 復帰手段が「次の成功」しかないと、自動応答 OFF の席は不明表示を消せない。
     // available へ直接は上げない（証拠なしに利用可能を示さない）——null は従来表示に戻るだけ。lastError は残す
     if (body.resetAvailability === true) {
-      a.availability = null;
+      a.availability = null; // 停止ラッチを外す（unavailable にも開く——契約-停止ラッチ §4）。available へは上げない
+      a.availabilityReason = null;
+      a.availabilitySince = 0;
       logEvent("cli", `${NAMES[parts[2]]} の可用性表示を手動で未評価に戻しました（次の実行または再確認で再評価）`, "info");
     }
     touch();
@@ -5671,5 +5850,6 @@ server.listen(PORT, "127.0.0.1", () => {
   printCredentialBanner(); // 資格は端末にだけ出す。ファイルにもログにも残さない（§4.1）
   logEvent("system", "サーバー起動（schemaVersion 10）", "info");
   logEvent("isolation", sandbox.describeIsolation(isolation), isolation.mode === "enforced" ? "info" : "warn");
-  if (state.agents.grok) checkGrokAuth().catch((e) => logEvent("cli", "Grok の認証確認に失敗: " + (e.message || e), "warn"));
+  // unavailable（残高切れ等）を復元した席では起動時プローブを飛ばさない——再起動のたびの課金 402 を止める（契約-停止ラッチ §3）
+  if (state.agents.grok && state.agents.grok.availability !== "unavailable") checkGrokAuth().catch((e) => logEvent("cli", "Grok の認証確認に失敗: " + (e.message || e), "warn"));
 });

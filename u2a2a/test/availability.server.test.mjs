@@ -109,8 +109,11 @@ const c = ctl.claude || {};
 let p = ""; process.stdin.setEncoding("utf8");
 process.stdin.on("data", d => p += d);
 process.stdin.on("end", () => {
-  if (c.fail) { process.stderr.write("boom: unexpected crash\\n", () => process.exit(1)); return; }
-  process.stdout.write(JSON.stringify({ type: "result", result: "done", session_id: "fake", usage: { input_tokens: 1, output_tokens: 1 } }) + "\\n", () => process.exit(0));
+  if (c.fail) { process.stderr.write((c.failText || "boom: unexpected crash") + "\\n", () => process.exit(1)); return; }
+  const res = { type: "result", result: c.resultText ?? "done", session_id: "fake", usage: { input_tokens: 1, output_tokens: 1 } };
+  if (c.resultSubtype) res.subtype = c.resultSubtype;
+  if (c.errors) res.errors = c.errors;
+  process.stdout.write(JSON.stringify(res) + "\\n", () => process.exit(0));
 });
 `;
 
@@ -181,20 +184,43 @@ test("grok 402: ⚠ 行・ta.lastError・availability=unavailable、別トピッ
   assert.equal(s.agents.grok.availability, "unavailable");
   assert.ok(s.agents.grok.lastError.includes("残高"), "バッジ用 a.lastError: " + s.agents.grok.lastError);
   assert.ok(!topicOf(s, topic2).agents.grok.lastError, "別トピックへ漏れない");
-  // 席全体の事情は topic2 にも複製される（次のテストで復帰時の一括クリアを見る）
-  assert.equal((await api("POST", "/api/messages", { author: "user", thread: "grok", topicId: topic2, text: "残高切れ試験2" })).status, 201);
-  await waitFor(async () => {
-    const st = await getState();
-    return topicOf(st, topic2).agents.grok.lastError ? st : null;
-  }, "⚠ in topic2 too");
+  // 契約-停止ラッチ §1: unavailable の席は次の依頼で CLI を起こさない（受入 a）
+  assert.equal((await api("POST", "/api/messages", { author: "user", thread: "grok", topicId: topic2, text: "ラッチ試験" })).status, 201);
+  await sleep(2500);
+  const s2 = await getState();
+  assert.ok(!s2.messages.some((m) => m.topicId === topic2 && m.author === "grok"), "grok は起動しない（応答も ⚠ も無い）");
+  assert.ok(!(s2.runs || []).some((r) => r.agent === "grok"), "run が立たない");
+});
+
+test("ラッチ中: レビュー依頼と質疑開始は理由付き 400、自動要約は見送り（受入 b/c/e）", async () => {
+  const nf = await api("POST", "/api/pool/newfile", { name: "latch-review.md", dir: "topics/" + topic1 });
+  const rv = await api("POST", "/api/pool/" + nf.body.id + "/review", { reviewer: "grok" });
+  assert.equal(rv.status, 400);
+  assert.equal(rv.body.reason, "unavailable");
+  const q = await api("POST", "/api/qa/start", { first: "claude", topicId: topic1, text: "t", participants: ["claude", "grok"] });
+  assert.equal(q.status, 400);
+  assert.equal(q.body.reason, "unavailable");
+  // 要約担当（claude）を unavailable にして要約が見送られること（受入 b）。OAuth 実文面で claude を落とす
+  writeCtl({ claude: { fail: true, failText: "Failed to authenticate. API Error: 401 OAuth access token has expired. Re-authenticate to continue." } });
+  assert.equal((await api("POST", "/api/messages", { author: "user", thread: "claude", topicId: topic1, text: "claude を落とす" })).status, 201);
+  await waitFor(async () => (await getState()).agents.claude.availability === "unavailable", "claude unavailable via OAuth 401");
+  const sm = await api("POST", "/api/topics/" + topic1 + "/summarize");
+  assert.equal(sm.status, 202);
+  assert.equal(sm.body.state.reason, "unavailable", JSON.stringify(sm.body));
+  // claude を解除して以後のテストへ（成功で戻す）
+  assert.equal((await api("PATCH", "/api/agents/claude", { resetAvailability: true })).status, 200);
+  writeCtl({});
+  assert.equal((await api("POST", "/api/messages", { author: "user", thread: "claude", topicId: topic1, text: "回復" })).status, 201);
+  await waitFor(async () => (await getState()).agents.claude.availability === "available", "claude available again");
 });
 
 test("claude の一般失敗: availability=unknown に更新される（受入⑧、unavailable が残らない）", async () => {
   writeCtl({ claude: { fail: true } });
+  const t0 = Date.now();
   assert.equal((await api("POST", "/api/messages", { author: "user", thread: "claude", topicId: topic1, text: "一般失敗試験" })).status, 201);
   const s = await waitFor(async () => {
     const st = await getState();
-    return st.messages.some((m) => m.topicId === topic1 && m.thread === "claude" && m.failed) ? st : null;
+    return st.messages.some((m) => m.topicId === topic1 && m.thread === "claude" && m.failed && m.ts >= t0) ? st : null; // 直前のテストの ⚠ を拾わない
   }, "⚠ line for claude");
   assert.equal(s.agents.claude.availability, "unknown");
   assert.ok(topicOf(s, topic1).agents.claude.lastError);
@@ -202,16 +228,23 @@ test("claude の一般失敗: availability=unknown に更新される（受入�
   assert.ok(!JSON.stringify(s.agentState || {}).includes("boom"), "agentState に生文が出ない");
 });
 
-test("成功で availability=available・ta.lastError が空へ戻る。席全体の複製は全トピック消える（受入④・指摘#4）", async () => {
+test("解除→別トピックの成功で available。席全体の複製は解除経由でも消える（受入④・#4・§4）", async () => {
+  // ラッチを外す（availability は null。a.lastError と topic1 の複製は残る——「回復確認済み」とは言わない）
+  const rr = await api("PATCH", "/api/agents/grok", { resetAvailability: true });
+  assert.equal(rr.status, 200);
+  assert.equal(rr.body.availability, null);
+  assert.ok(rr.body.lastError, "解除は lastError を消さない");
   writeCtl({});
-  assert.equal((await api("POST", "/api/messages", { author: "user", thread: "grok", topicId: topic1, text: "回復試験" })).status, 201);
+  // 別トピック（topic2）の成功が、topic1 に残った席全体の複製も消す（unavailable→null→available の経路）
+  assert.equal((await api("POST", "/api/messages", { author: "user", thread: "grok", topicId: topic2, text: "回復試験" })).status, 201);
   const s = await waitFor(async () => {
     const st = await getState();
-    return st.messages.some((m) => m.topicId === topic1 && m.author === "grok" && m.text === "了解（Grok）") ? st : null;
+    return st.messages.some((m) => m.topicId === topic2 && m.author === "grok" && m.text === "了解（Grok）") ? st : null;
   }, "grok recovery reply");
   assert.equal(s.agents.grok.availability, "available");
-  assert.equal(topicOf(s, topic1).agents.grok.lastError, "");
-  assert.equal(topicOf(s, topic2).agents.grok.lastError, "", "残高切れ由来の複製は実行していないトピックからも消える（指摘#4）");
+  assert.equal(s.agents.grok.lastError, "");
+  assert.equal(topicOf(s, topic2).agents.grok.lastError, "");
+  assert.equal(topicOf(s, topic1).agents.grok.lastError, "", "解除→成功の経路でも席全体の複製が消える");
 });
 
 test("review 失敗も同じ可視化（3経路の網羅・codex レビュー）", async () => {
@@ -245,7 +278,9 @@ test("fix 失敗も同じ可視化（3経路の網羅・codex レビュー）", 
 });
 
 test("stopped は成功でも失敗でもない: ⚠ 無し・available 維持・停止理由は ta に残る（受入⑦）", async () => {
-  writeCtl({}); // まず成功で状態を戻す
+  // 直前のレビュー失敗テストでラッチが掛かっているので、解除→成功で戻してから測る
+  await api("PATCH", "/api/agents/grok", { resetAvailability: true });
+  writeCtl({});
   await api("POST", "/api/messages", { author: "user", thread: "grok", topicId: topic2, text: "回復" });
   await waitFor(async () => (await getState()).agents.grok.availability === "available", "grok available again");
   const failedBefore = (await getState()).messages.filter((m) => m.failed).length;
@@ -274,6 +309,26 @@ test("キャンセルは対象外: ⏹ のみで ⚠ 無し・可用性不変（
   assert.equal(s.agents.grok.availability, "available", "キャンセルで可用性を動かさない");
 });
 
+test("errors にだけ OAuth 期限切れが入る error_* 結果でもラッチが立ち、要約が止まる（codex 再レビュー2巡目）", async () => {
+  writeCtl({ claude: { resultSubtype: "error_during_execution", resultText: "diag with Authorization: Bearer FAKE_DIAG_TOKEN", errors: ["Failed to authenticate. API Error: 401 OAuth access token has expired."] } });
+  const t0 = Date.now();
+  assert.equal((await api("POST", "/api/messages", { author: "user", thread: "claude", topicId: topic1, text: "errors 分類試験" })).status, 201);
+  const s = await waitFor(async () => {
+    const st = await getState();
+    return st.messages.some((m) => m.topicId === topic1 && m.author === "claude" && m.failed && m.ts >= t0) ? st : null;
+  }, "errored reply");
+  const reply = s.messages.filter((m) => m.topicId === topic1 && m.author === "claude" && m.ts >= t0).pop();
+  assert.ok(reply.text.includes("非正常完了") && !reply.text.includes("FAKE_DIAG_TOKEN"), "本文は定型・診断文は載らない: " + reply.text);
+  assert.equal(s.agents.claude.availability, "unavailable", "errors の OAuth 診断が分類されてラッチが立つ");
+  const sm = await api("POST", "/api/topics/" + topic1 + "/summarize");
+  assert.equal(sm.body.state.reason, "unavailable", "次の自動要約は起動しない");
+  // 後始末: 解除 → 成功で戻す
+  await api("PATCH", "/api/agents/claude", { resetAvailability: true });
+  writeCtl({});
+  await api("POST", "/api/messages", { author: "user", thread: "claude", topicId: topic1, text: "回復" });
+  await waitFor(async () => (await getState()).agents.claude.availability === "available", "claude restored");
+});
+
 test("手動リセット: unknown を未評価（null）へ戻せる。available へは上がらない（指摘#3）", async () => {
   writeCtl({ claude: { fail: true } });
   await api("POST", "/api/messages", { author: "user", thread: "claude", topicId: topic2, text: "unknown にする" });
@@ -282,6 +337,32 @@ test("手動リセット: unknown を未評価（null）へ戻せる。available
   assert.equal(r.status, 200);
   assert.equal(r.body.availability, null, "未評価へ戻る（available と断定しない）");
   writeCtl({});
+});
+
+test("停止観測前に開始した実行の成功ではラッチが外れない（契約-停止ラッチ §2）", async () => {
+  writeCtl({ grok: { delayMs: 6000 } });
+  assert.equal((await api("POST", "/api/messages", { author: "user", thread: "grok", topicId: topic1, text: "遅い成功" })).status, 201);
+  await waitFor(async () => ((await getState()).runs || []).some((r) => r.agent === "grok" && r.kind === "thread"), "slow run started");
+  await sleep(2000); // run 登録から CLI の spawn まで少し間があり、先に ctl を切り替えると遅い実行自体が 402 で死ぬ
+  // 走行中に再確認を 402 で失敗させ、席を unavailable にする（観測時刻 = 今 > 遅い実行の開始時刻）
+  writeCtl({ grok: { fail402: true, delayMs: 6000 } });
+  assert.equal((await api("POST", "/api/agents/grok/check-auth")).status, 200);
+  assert.equal((await getState()).agents.grok.availability, "unavailable");
+  // 遅い実行が成功で戻ってきてもラッチは外れない
+  const s = await waitFor(async () => {
+    const st = await getState();
+    return st.messages.some((m) => m.topicId === topic1 && m.author === "grok" && m.text === "了解（Grok）" && m.ts > Date.now() - 60000) ? st : null;
+  }, "slow success reply");
+  assert.equal(s.agents.grok.availability, "unavailable", "stale 成功で解除されない");
+  // 後始末: 402 で authed=false になっているので、解除だけでは自動応答は始まらない（契約 §4 の grok 導線そのもの）。
+  // 再確認（ping 成功）で authed と available を戻す
+  await api("PATCH", "/api/agents/grok", { resetAvailability: true });
+  writeCtl({});
+  await api("POST", "/api/agents/grok/check-auth");
+  await waitFor(async () => {
+    const g = (await getState()).agents.grok;
+    return g.availability === "available" && g.authed === true;
+  }, "restored");
 });
 
 test("再確認プローブにも分類が適用される: 402→unavailable／成功→available（受入⑨）", async () => {

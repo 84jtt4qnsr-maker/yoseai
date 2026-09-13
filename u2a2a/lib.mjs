@@ -350,7 +350,7 @@ export const AGENT_DEFS = {
 };
 export const LEGACY_AGENTS = ["claude", "codex"]; // 旧トピックの参加者・thread:"both" の意味
 // null は「理由が記録されていない」= 不明。移行で復元した過去リレーは基本これになる（偽の確実さを作らない）
-export const RELAY_STOP_REASONS = ["agreed", "hops", "budget", "error", "cancelled", "auto-off", "unauthed", "manual", "restart"];
+export const RELAY_STOP_REASONS = ["agreed", "hops", "budget", "error", "cancelled", "auto-off", "unauthed", "unavailable", "manual", "restart"];
 
 // ---- 質疑リレーの履歴（仕様: SPEC-relayHistory.md）----
 // 確定記録 1 件の形。不明な項目は null のままにする（"" や既定値で埋めない）
@@ -756,32 +756,42 @@ export function validateV2Format(fmt) {
 // 初版で unavailable に倒すのは grok の残高切れのみ。402 系キーワード単体では倒さず、
 // 必ず `usage balance exhausted` との併用を要件とする（フィクスチャ-grok402.md の負例 Gneg-1〜3）。
 // claude / codex の残高・レート制限の文面は未実測なので unknown。既存の認証切れ判定はここでは扱わない
+// 可用性の理由コード → 表示の定型短文。unavailable は理由コード＋観測時刻で永続化し、
+// 表示文は復元時にここから再生成する（保存文字列を表示に使わない——契約-停止ラッチ §3）
+export const AVAILABILITY_DETAILS = {
+  "grok-402": "Grok Build の利用残高が上限に達しています（402）。回復後にヘッダの「再確認」をどうぞ",
+  "claude-oauth-expired": "Claude CLI の認証トークンが期限切れです（隔離外で claude を1回実行するか、claude login で再認証）",
+};
+export function availabilityDetail(reason) {
+  return AVAILABILITY_DETAILS[reason] || "応答できない状態です（詳細は起動端末のログに出力）";
+}
+
 export function classifyBackendError(cli, error) {
   const raw = String((error && error.message) || error || "");
   // アプリ自身が生成した失敗（秘密を含まない自前の文言）は、その旨が分かる定型で返す。
   // 「分類外」に丸めると P1-2（退避回収失敗）などの既知の失敗まで原因が読めなくなる
   if (error && error.outputLost) {
-    return { availability: "unknown", detail: "CLI 出力の退避ファイルを回収できませんでした（出力が失われている可能性。詳細は起動端末のログに出力）" };
+    return { availability: "unknown", reason: null, detail: "CLI 出力の退避ファイルを回収できませんでした（出力が失われている可能性。詳細は起動端末のログに出力）" };
   }
   if (error && error.isolationBlocked) {
-    return { availability: "unknown", detail: "隔離を初期化できないため実行しませんでした（詳細は起動端末のログに出力）" };
+    return { availability: "unknown", reason: null, detail: "隔離を初期化できないため実行しませんでした（詳細は起動端末のログに出力）" };
   }
   if (
     cli === "grok" &&
     /usage balance exhausted/i.test(raw) &&
     (/"http_status":\s*402/.test(raw) || /status 402/.test(raw) || /Payment Required/i.test(raw))
   ) {
-    return { availability: "unavailable", detail: "Grok Build の利用残高が上限に達しています（402）。回復後にヘッダの「再確認」をどうぞ" };
+    return { availability: "unavailable", reason: "grok-402", detail: availabilityDetail("grok-402") };
   }
   // 2026-09-13 実測（本番の 401 連発）: 隔離下の claude は期限切れ OAuth トークンを更新できない
   //（隔離外で 1 回実行すると更新され、次の期限まで隔離内も動く）。判定表の更新は契約改版不要（§1）
   if (cli === "claude" && /OAuth access token has expired/i.test(raw)) {
-    return { availability: "unavailable", detail: "Claude CLI の認証トークンが期限切れです（隔離外で claude を1回実行するか、claude login で再認証）" };
+    return { availability: "unavailable", reason: "claude-oauth-expired", detail: availabilityDetail("claude-oauth-expired") };
   }
   // 契約 §2・codex 再レビュー2/3: 未分類の生文は、どんな伏せ字処理でも（access_token / Basic 認証など）
   // 漏れの余地が残る。表示・⚠ 行・バッジ・イベント（SSE で配信される）へは**転記しない**で定型短文に固定し、
   // 全文は呼び出し側が起動端末の stderr にだけ出す（資格の印字と同じ「端末にだけ」の規律）
-  return { availability: "unknown", detail: "実行に失敗しました（分類外のエラー。詳細は起動端末のログに出力）" };
+  return { availability: "unknown", reason: null, detail: "実行に失敗しました（分類外のエラー。詳細は起動端末のログに出力）" };
 }
 
 // フロービューのグラフ導出（仕様: SPEC-フロービュー.md）。本体は public/flow-graph.js（ブラウザも同じファイルを読む）。ここはテスト用の再 export
