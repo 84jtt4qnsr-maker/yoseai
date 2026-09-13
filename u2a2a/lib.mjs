@@ -773,6 +773,11 @@ export function classifyBackendError(cli, error) {
   ) {
     return { availability: "unavailable", detail: "Grok Build の利用残高が上限に達しています（402）。回復後にヘッダの「再確認」をどうぞ" };
   }
+  // 2026-09-13 実測（本番の 401 連発）: 隔離下の claude は期限切れ OAuth トークンを更新できない
+  //（隔離外で 1 回実行すると更新され、次の期限まで隔離内も動く）。判定表の更新は契約改版不要（§1）
+  if (cli === "claude" && /OAuth access token has expired/i.test(raw)) {
+    return { availability: "unavailable", detail: "Claude CLI の認証トークンが期限切れです（隔離外で claude を1回実行するか、claude login で再認証）" };
+  }
   // 契約 §2・codex 再レビュー2/3: 未分類の生文は、どんな伏せ字処理でも（access_token / Basic 認証など）
   // 漏れの余地が残る。表示・⚠ 行・バッジ・イベント（SSE で配信される）へは**転記しない**で定型短文に固定し、
   // 全文は呼び出し側が起動端末の stderr にだけ出す（資格の印字と同じ「端末にだけ」の規律）

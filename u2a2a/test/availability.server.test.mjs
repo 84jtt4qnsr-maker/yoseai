@@ -38,6 +38,14 @@ test("classifyBackendError: 併用条件を欠く 402 系・残高文言単体�
   }
 });
 
+test("classifyBackendError: claude の OAuth 期限切れ（2026-09-13 実測）は unavailable、他 CLI は対象外", () => {
+  const msg = "Failed to authenticate. API Error: 401 OAuth access token has expired. Re-authenticate to continue.";
+  const r = classifyBackendError("claude", new Error(msg));
+  assert.equal(r.availability, "unavailable");
+  assert.ok(r.detail.includes("再認証"));
+  assert.equal(classifyBackendError("codex", new Error(msg)).availability, "unknown");
+});
+
 test("classifyBackendError: grok 以外の CLI は 402 実文面でも unknown（初版の判定範囲）", () => {
   assert.equal(classifyBackendError("claude", new Error(G402_MAIN)).availability, "unknown");
   assert.equal(classifyBackendError("codex", new Error(G402_MAIN)).availability, "unknown");
