@@ -2030,13 +2030,23 @@ function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// 同じパスへ描き直された成果物が古いまま出ないよう、pool 登録済みのファイルは mtime を版として URL に付ける。
+// Media の blob キャッシュは URL がキーなので、版が変われば新しいキーになり再取得される（修正リスト-確定 P2-① の残り）。
+// pool に見つからない・mtime が無いものは従来どおり素の URL（挙動を変えない）
+function poolFileVersion(rel) {
+  let decoded = rel;
+  try { decoded = decodeURIComponent(rel); } catch {}
+  const item = (state.pool || []).find((p) => p.file === rel || p.file === decoded);
+  return item && item.mtime ? "?v=" + item.mtime : "";
+}
+
 function inlineMd(raw) {
   let s = escapeHtml(raw);
   // 画像: ![alt](http(s)://… | u2a2a/pool/… | /api/pool/file/…)
   s = s.replace(
     /!\[([^\]]*)\]\((?:(https?:[^)\s]+)|(?:\/api\/pool\/file\/|u2a2a\/pool\/)([^)\s]+))\)/g,
     (_, alt, abs, rel) => {
-      const src = abs || "/api/pool/file/" + rel;
+      const src = abs || "/api/pool/file/" + rel + poolFileVersion(rel);
       return '<img ' + (YoseaiAccess.isApi(src) ? 'data-yoseai-src' : 'src') + '="' + src + '" alt="' + alt + '" loading="lazy">';
     }
   );
@@ -4641,7 +4651,7 @@ function messageEl(m, { onChange, onOpenColumn }) {
       const rel = full.slice("u2a2a/pool/".length);
       // Markdown 記法で既に本文中に埋め込まれているものは重複させない
       if (new RegExp("\\]\\([^)]*" + rel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\)").test(m.text)) continue;
-      const url = "/api/pool/file/" + encodeURI(rel);
+      const url = "/api/pool/file/" + encodeURI(rel) + poolFileVersion(rel);
       if (mediaFailed.has(rel)) {
         mediaKids.push(el("span", { class: "pf-size", text: "⚠ ファイルが見つかりません: " + full }));
       } else if (isImageExt(rel)) {
