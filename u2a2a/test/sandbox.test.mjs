@@ -25,6 +25,7 @@ const VARS = {
   dataDir: "/repo/u2a2a/data",
   home: "/home/u",
   tmpDir: "/tmp",
+  systemTmp: "/private/tmp", // symlink 解決後の共有 tmp（os.tmpdir() とは別物）
   profilesPath: "/repo/u2a2a/sandbox-profiles.json",
   projectPath: "/proj",
 };
@@ -82,6 +83,26 @@ test("具体度: agent+phase > agent+* > *+phase。review は phase:* より優�
   assert.ok(th.fs.write.includes(VARS.poolTopicDir));
   // codex/fix は pool 全体（修正は成果物をまたぐ）
   assert.ok(pick("codex", "fix").fs.write.includes(VARS.poolDir));
+});
+
+// Claude Code は TMPDIR を渡しても無視して共有 tmp 直下に作業ファイルを作る。
+// ここを許可し損ねると Bash が丸ごと EPERM で落ちるので、os.tmpdir() とは別枠で持つ
+test("claude は共有 tmp も書ける（<tmpDir> とは別物）", () => {
+  for (const phase of ["thread", "review"]) {
+    const r = resolveProfile(PROFILES.profiles, { agent: "claude", phase, vars: VARS });
+    assert.equal(r.ok, true, phase);
+    assert.ok(r.profile.fs.write.includes(VARS.systemTmp), `${phase}: 共有 tmp`);
+    assert.ok(r.profile.fs.write.includes(VARS.tmpDir), `${phase}: os.tmpdir() も従来どおり`);
+  }
+  // 共有 tmp を開けても、リポジトリや pool 外への書き込み許可は増えない
+  const claude = resolveProfile(PROFILES.profiles, { agent: "claude", phase: "thread", vars: VARS }).profile;
+  assert.ok(!claude.fs.write.includes(VARS.repoRoot), "リポジトリ直下は書けないまま");
+  assert.ok(claude.fs.denyRead.includes(VARS.dataDir), "資格を含む data は読めないまま");
+  // 値が無ければ空文字に化けさせず、プロファイルごと不成立にする
+  const { systemTmp, ...missing } = VARS;
+  const ng = resolveProfile(PROFILES.profiles, { agent: "claude", phase: "thread", vars: missing });
+  assert.equal(ng.ok, false);
+  assert.ok(ng.errors.some((e) => e.code === "var-unset"));
 });
 
 test("変数は展開され、値が無ければ失敗する（空文字にしない）", () => {

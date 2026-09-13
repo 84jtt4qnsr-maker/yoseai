@@ -7,7 +7,7 @@
       "agent": "claude",
       "phase": "*",
       "fs": {
-        "write": ["<poolTopicDir>", "<home>/.claude", "<home>/.claude.json", "<home>/.claude.json.backup", "<home>/Library/Caches/claude-cli-nodejs", "<tmpDir>"],
+        "write": ["<poolTopicDir>", "<home>/.claude", "<home>/.claude.json", "<home>/.claude.json.backup", "<home>/Library/Caches/claude-cli-nodejs", "<tmpDir>", "<systemTmp>"],
         "denyRead": ["<dataDir>", "<profilesPath>", "<home>/.codex", "<home>/.grok"],
         "denyWrite": []
       },
@@ -18,7 +18,7 @@
       "agent": "claude",
       "phase": "review",
       "fs": {
-        "write": ["<home>/.claude", "<home>/.claude.json", "<home>/.claude.json.backup", "<home>/Library/Caches/claude-cli-nodejs", "<tmpDir>"],
+        "write": ["<home>/.claude", "<home>/.claude.json", "<home>/.claude.json.backup", "<home>/Library/Caches/claude-cli-nodejs", "<tmpDir>", "<systemTmp>"],
         "denyRead": ["<dataDir>", "<profilesPath>", "<home>/.codex", "<home>/.grok"],
         "denyWrite": ["<poolDir>", "<repoRoot>"]
       },

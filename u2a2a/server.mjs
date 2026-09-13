@@ -75,6 +75,14 @@ const TRAY_FILE = path.join(DATA_DIR, "tray.jsonl");
 // 強制層（契約-資格隔離API.md §3）。プロファイルはエージェントの書き込み領域の外に置き、denyRead にも入れる
 const SANDBOX_PROFILES_FILE = path.join(__dirname, "sandbox-profiles.json");
 const SANDBOX_RUNTIME_CMD = process.env.U2A2A_SANDBOX_CMD || "srt";
+// 隔離規則は symlink 解決後の実パスで判定される（/tmp 表記では効かない・実測）
+const SYSTEM_TMP = (() => {
+  try {
+    return fs.realpathSync("/tmp");
+  } catch {
+    return "/tmp";
+  }
+})();
 // 設定ファイルは起動ごとに書き出す（プロファイルの変数を展開した実体）。エージェントからは読めない場所へ
 const SANDBOX_SETTINGS_DIR = path.join(DATA_DIR, "sandbox");
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -1260,6 +1268,11 @@ function planRun({ agent, phase, topicId, projectPath }, cmd, args) {
     dataDir: DATA_DIR,
     home: os.homedir(),
     tmpDir: os.tmpdir(),
+    // Claude Code は TMPDIR を渡しても無視して、ここへコマンド出力の受け皿
+    // （claude-<uid>/ と毎回名前の変わる claude-<hex>-cwd）を作る。許可しないと Bash が
+    // 丸ごと EPERM で落ちる。srt は glob も単体指定も受けないので範囲を絞れない（実測）。
+    // ここを開けてもリポジトリ・pool 外・資格ファイルの保護は変わらないことを確認済み
+    systemTmp: SYSTEM_TMP,
     profilesPath: SANDBOX_PROFILES_FILE,
     projectPath: projectPath || REPO_ROOT,
   };

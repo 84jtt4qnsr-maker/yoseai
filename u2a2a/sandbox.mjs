@@ -13,7 +13,11 @@ export const ISOLATION_MODES = ["enforced", "unprotected", "blocked"];
 export const PHASES = ["thread", "review", "fix", "summary"];
 export const UNVERIFIED_KEYS = ["cliCredentials", "cliSessionStore", "controlSocket", "mcp", "execFiles"];
 // プロファイルで使える変数。未知の変数は「空文字に展開」ではなく不正として扱う（§8-8）
-export const PROFILE_VARS = ["<repoRoot>", "<poolDir>", "<poolTopicDir>", "<dataDir>", "<home>", "<projectPath>", "<tmpDir>", "<profilesPath>"];
+// <systemTmp> は symlink を解決したシステム共有の一時領域（macOS では /private/tmp）。
+// <tmpDir>（os.tmpdir()）とは別物で、Claude Code は TMPDIR を渡しても無視してこちらへ
+// 作業ファイルを作る（uid 付き claude-<uid> と、毎回名前が変わる claude-<hex>-cwd の両方）。
+// srt は実パスで判定し glob もファイル単体指定も受け付けないため、ここは丸ごと許可するしかない（実測）
+export const PROFILE_VARS = ["<repoRoot>", "<poolDir>", "<poolTopicDir>", "<dataDir>", "<home>", "<projectPath>", "<tmpDir>", "<systemTmp>", "<profilesPath>"];
 export const DEFAULT_RUNTIME = "sandbox-runtime";
 
 const VAR_RE = /<[a-zA-Z]+>/g;
