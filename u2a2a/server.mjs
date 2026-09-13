@@ -1419,16 +1419,20 @@ function isolationFor(agent, phase, topicId, project) {
   return { agent, phase, topicId: topicId || null, projectPath: (project && project.path) || null };
 }
 
-// P0-0（修正候補。受入は -codex-nested 測定の完了が必須・修正リスト-確定）:
-// macOS の Seatbelt は入れ子の sandbox_apply を拒否するため、srt の中で codex が自前の
-// OS サンドボックスを適用するとシェルツールが全滅する（実測: exit 71、pool 内の読取も不能）。
-// enforced のときだけ codex 自身の OS サンドボックスを外し、境界を srt に一本化する。
-// CLI の権限規則（--allowedTools / --allow / resumeWritable / writeDir）は維持——外すのは OS 層の
-// 入れ子だけ（合意メモ-隔離方式 §C の例外。契約補遺に明記）。
+// 合意メモ-隔離方式 §C（CLI 規則と OS 層の二重掛け）の例外は現在 **2件**:
+//   例外1（P0-0・-codex-nested 測定済み）: macOS の Seatbelt は入れ子の sandbox_apply を拒否するため、
+//     enforced のときだけ codex 自身の OS サンドボックスを外し、境界を srt に一本化する
+//     （実測: 入れ子だと exit 71 でシェルツール全滅）。CLI の権限規則は維持。
+//   例外2（契約-grok許可拡張 版1・改版1b）: grok は拒否を非致命にできず1回の拒否でラン全体が停止するため、
+//     enforced の thread / fix に限り --always-approve ＋ --tools の正ホワイトリストで起動する
+//     （Bash(*) 等の規則構文は実測で無効。--disallowed-tools も always-approve 併用時は spawn_subagent を
+//     除外できない実測。review は読み取りホワイトリストのまま。spawn_subagent / web_fetch はリスト外＝不提供）。
+//     境界の維持は受入実測で確認する（保護成立の点灯維持を根拠にしない）。
 // 判定は起動引数を組む直前に planRun と同じ入力で行い、runCli まで同期区間なので計画はずれない。
-// blocked なら runCli が起動を拒否する（fail-closed——素起動には決して落ちない）
-function isolationModeFor(iso) {
-  return planRun(iso || {}, "codex", []).mode;
+// blocked なら runCli が起動を拒否する（fail-closed——素起動には決して落ちない）。
+// cmd はそのエージェント自身の起動計画に合わせて渡す（codex 固定を流用しない——契約-grok許可拡張 §1）
+function isolationModeFor(iso, cmd = "codex") {
+  return planRun(iso || {}, cmd, []).mode;
 }
 
 // blocked は「起動していない」。呼び出し側の catch に合流させ、失敗として記録させる
@@ -1816,10 +1820,16 @@ function buildPrompt(topic, agent, msgs, isFirst, changesNote = "", projectInfo 
         : "";
   // 紐付けありの初回のみ、対象プロジェクトの概要（README 冒頭＋直下エントリ名、4,000 文字まで）
   const digestNote = isFirst && project && projectInfo.digest ? `\n\n--- 対象プロジェクトの概要（初回のみ） ---\n${projectInfo.digest}\n` : "";
-  // Grok は権限拒否で応答全体が停止するため、拒否されるシェルを最初から使わないよう明示する（工程0の実測: 複合シェル偵察で停止）
+  // Grok は権限拒否で応答全体が停止するため、注意書きはモードで切り替える（契約-grok許可拡張 版1）。
+  // enforced では Bash(*) を許可済み——実境界は srt で、拒否は継続可能なエラーとして返る想定を明示する。
+  // pool パスの誤例と profiles 拒否の文面（§3）は両モード共通
+  const grokPathNote = `pool の相対パスは u2a2a/pool/ が正です（/Users/sver/u2a2a/pool/… は誤り。絶対なら ${POOL_DIR}）。sandbox-profiles.json など保護対象の読み取り拒否は想定内です——その対象は除外し、許可された範囲を調べてください。`;
+  const grokEnforced = agent === "grok" && isolationModeFor(isolationFor("grok", "thread", topic.id, project), "grok") === "enforced";
   const grokShellNote =
     agent === "grok"
-      ? `\n\n（Grok への注意: シェルで許可されているのは python3 / ffmpeg だけで、しかも必ず 1 行で書いてください（複数行コマンドや mkdir・sips 等は権限拒否となり、応答全体がその場で停止します）。確認は read_file / list_dir / grep ツールで。画像・動画は image_gen / image_edit / image_to_video が使えます — 生成物は python3 の 1 行（例: from PIL import Image; …）で保存先へコピー・変換してください）`
+      ? grokEnforced
+        ? `\n\n（Grok への注意: シェル（run_terminal_command）は複数行・複合コマンドも使えます。実際の境界は OS 層が強制します——書き込みは作業中トピックのフォルダ内のみ・通信は x.ai 系のみで、外れた操作は Operation not permitted になりますが、そのエラーを受けて応答を続けてください。${grokPathNote}画像・動画は image_gen / image_edit / image_to_video が使えます）`
+        : `\n\n（Grok への注意: シェルで許可されているのは python3 / ffmpeg だけで、しかも必ず 1 行で書いてください（複数行コマンドや mkdir・sips 等は権限拒否となり、応答全体がその場で停止します）。確認は read_file / list_dir / grep ツールで。${grokPathNote}画像・動画は image_gen / image_edit / image_to_video が使えます — 生成物は python3 の 1 行（例: from PIL import Image; …）で保存先へコピー・変換してください）`
       : "";
   return preamble + contextNote + digestNote + qaJoinNote + backlogNote + lines + qaNote + changesNote + artifactNote + grokShellNote + commonRulesBlock("通常応答");
 }
@@ -2166,6 +2176,23 @@ async function callCodex(prompt, sessionId, modelOverride, onStep, opts = {}) {
 // シェルは python3 / ffmpeg の 1 行のみ（複数行・他コマンドは拒否 → プロンプト注意で誘導）。保存は python3 の 1 行コピーで pool へ
 // Claude 同様、相対規則の cd 依存を避けるため絶対パス規則を併記する
 const GROK_WRITE_ARGS = ["--allow", "Edit(u2a2a/pool/**)", "--allow", `Edit(${POOL_DIR}/**)`, "--allow", "Bash(python3:*)", "--allow", "Bash(ffmpeg:*)", "--allow", "image_gen", "--allow", "image_edit", "--allow", "image_to_video", "--allow", "reference_to_video", "--disallowed-tools", "spawn_subagent"];
+// 契約-grok許可拡張 版1→改版1a（§C 例外2）: enforced では実境界が srt なので、CLI 層の致命拒否を
+// なくして「拒否＝ラン全体停止」を避ける。当初機構の Bash(*) は**実測で無効**（app 1ラン＋統合者
+// プローブ2ラン: Bash(*) / Bash / run_terminal_command すべて改行入り python3 を拒否）。
+// 唯一動いたのは --always-approve（プローブで複数行 python3 -c と mkdir && ls の成功を実測）。
+// web_fetch は許可でなく**提供から外す**（--disallowed-tools）——未決のままだが、呼ばれない＝致命拒否も
+// 起きない。spawn_subagent の disallow 継続・review は GROK_READ_ARGS のまま・unprotected では従来規則。
+// Edit 規則は always-approve 下で意味を失うため、pool 外書き込みの担保は srt（受入測定2で確認）
+// 改版1b（実測）: --disallowed-tools は --always-approve 併用時に spawn_subagent を除外できない
+//（プローブ実測: 単一リスト・順序入替・--deny すべてで spawn 起動。同フラグの複数指定は CLI エラー）。
+// 確実に効いたのは --tools の**正のホワイトリスト**（spawn_subagent 不在を実測、複数行 python3 も成功）。
+// クライアント側 web_fetch はこの一覧に無く呼べない。backend 実行の web_search / open_page 系は
+// --tools の対象外で残る（GROK_READ_ARGS の search_tool と同じ既知の挙動。ローカル通信は srt が遮断）
+const GROK_WRITE_ARGS_ENFORCED = ["--always-approve", "--tools", "run_terminal_command,read_file,search_replace,write,list_dir,grep,todo_write,image_gen,image_edit,image_to_video,reference_to_video"];
+// enforced かどうかを grok 自身の起動計画と同じ入力で判定して引数を選ぶ
+function grokWriteArgs(iso) {
+  return isolationModeFor(iso, "grok") === "enforced" ? GROK_WRITE_ARGS_ENFORCED : GROK_WRITE_ARGS;
+}
 // レビューは読み取りツールの正のホワイトリストで絞る。Grok は権限拒否で実行全体が停止するため、
 // read-only サンドボックス下で拒否され得る書き込み系ツール（search_replace 等）を持たせない
 // （web 検索 search_tool は --tools の対象外で残る。実測: whitelist 下でも呼べて完走する）
@@ -2289,9 +2316,18 @@ const RUNNERS = {
   },
   grok: {
     call: callGrok,
-    threadOpts: (topic, ta, project) => ({ extraArgs: GROK_WRITE_ARGS, isolation: isolationFor("grok", "thread", topic.id, project) }),
+    threadOpts: (topic, ta, project) => {
+      const isolation = isolationFor("grok", "thread", topic.id, project);
+      const extraArgs = grokWriteArgs(isolation); // enforced なら --always-approve ＋ --tools（契約-grok許可拡張 改版1b）
+      // 許可構成の印（改版1c §2b）: --tools は resume に非継承で、広い構成で作られたセッションは後から狭められない。
+      // この印が一致しないセッションは resume しない（agentLoop 側で判定）
+      return { extraArgs, isolation, grokArgsTag: extraArgs.join(" ") };
+    },
     reviewOpts: (project, topicId) => ({ extraArgs: GROK_READ_ARGS, isolation: isolationFor("grok", "review", topicId, project) }),
-    fixOpts: (project, topicId) => ({ extraArgs: GROK_WRITE_ARGS, isolation: isolationFor("grok", "fix", topicId, project) }),
+    fixOpts: (project, topicId) => {
+      const isolation = isolationFor("grok", "fix", topicId, project);
+      return { extraArgs: grokWriteArgs(isolation), isolation };
+    },
   },
 };
 
@@ -3002,7 +3038,9 @@ function buildFixPrompt(item, agent, pc = null, offline = false) {
     (reviews || "（レビューはまだありません。成果物の品質を自己点検して改善してください）") +
     offlineNote +
     (agent === "grok"
-      ? `\n（Grok への注意: シェルは python3 / ffmpeg のみ・必ず 1 行で（複数行や git 等は権限拒否で修正全体が停止）。確認は read_file / list_dir / grep ツールで）`
+      ? (isolationModeFor(isolationFor("grok", "fix", itemOutcomeTopic(item), pc && pc.project), "grok") === "enforced"
+          ? `\n（Grok への注意: シェル（run_terminal_command）は複数行・複合も使えます。書き込みは pool 配下のみ・通信は x.ai 系のみが OS 層で強制され、外れた操作はエラーになりますが応答は続けてください。pool の相対パスは u2a2a/pool/ が正（/Users/sver/u2a2a/pool/… は誤り）。保護対象の読み取り拒否は想定内です）`
+          : `\n（Grok への注意: シェルは python3 / ffmpeg のみ・必ず 1 行で（複数行や git 等は権限拒否で修正全体が停止）。確認は read_file / list_dir / grep ツールで。pool の相対パスは u2a2a/pool/ が正（/Users/sver/u2a2a/pool/… は誤り）。保護対象の読み取り拒否は想定内です）`)
       : "") +
     commonRulesBlock("修正")
   );
@@ -3577,12 +3615,21 @@ async function agentLoop(topicId, agent) {
         // 起動オプションは runner テーブルから（claude: pool 限定の Edit 規則＋python3/ffmpeg、codex: cwd=pool の workspace-write、grok: allow 規則）
         const runner = RUNNERS[agent];
         const call = runner.call;
-        const hadSession = !!ta.sessionId;
         const opts = runner.threadOpts(topic, ta, pc.project);
+        // 契約-grok許可拡張 改版1c §2b: 許可構成の印が現在の構成と一致しないセッションは resume しない。
+        // --tools は resume に非継承（grok 仕様＋実測: 広い構成で作られたセッションでは spawn_subagent が残った）。
+        // 印の無い既存セッションにも後付けしない（codex）——不一致として新規にする
+        if (agent === "grok" && ta.sessionId && ta.grokArgsTag !== opts.grokArgsTag) {
+          logEvent("cli", "Grok の許可構成が変わったため、このトピックのセッションを新規にします（--tools は resume に引き継がれないため）", "info");
+          ta.sessionId = null;
+          ta.transcriptOffset = null;
+        }
+        const hadSession = !!ta.sessionId;
         opts.ctl = run.ctl;
         opts.onSessionId = (sid) => (run.sessionId = sid); // 早期捕捉（キャンセル時に interrupted として保持）
         const { text, sessionId, model, meta } = await call(prompt, ta.sessionId, a.modelOverride, (s) => actStep(actKey, s), opts);
         ta.sessionId = sessionId;
+        if (agent === "grok" && opts.grokArgsTag) ta.grokArgsTag = opts.grokArgsTag; // このセッションが作られた/続いた許可構成（改版1c）
         if (agent === "codex" && !hadSession) ta.codexPoolCwd = true; // 新方式（cwd=pool）で作られた印
         if (model) a.model = model;
         ta.lastSeenTs = msgs[msgs.length - 1].ts;

@@ -40,6 +40,20 @@ process.stdin.on("end", () => {
 });
 `;
 
+// 偽 grok: 自分の argv をスレッド返信の本文として返す（契約-grok許可拡張: enforced で Bash(*) が付くかの観測）
+const FAKE_GROK = `#!/usr/bin/env node
+const argv = process.argv.slice(2);
+if (argv.includes("-p")) {
+  process.stdout.write(JSON.stringify({ text: "pong", stopReason: "end_turn", sessionId: "g-ping", usage: { input_tokens: 1, output_tokens: 1 }, total_cost_usd: 0.0001, modelUsage: { "grok-4.6-build": {} } }) + "\\n", () => process.exit(0));
+} else {
+  const lines = [
+    JSON.stringify({ type: "text", data: "argv:" + argv.join(" ") }),
+    JSON.stringify({ type: "end", stopReason: "end_turn", sessionId: "g-1", usage: { input_tokens: 1, output_tokens: 1 }, num_turns: 1, total_cost_usd: 0.001, modelUsage: { "grok-4.6-build": {} } }),
+  ];
+  process.stdout.write(lines.join("\\n") + "\\n", () => process.exit(0));
+}
+`;
+
 // 偽 codex: 自分の argv を -o ファイルへ書く（P0-0: -s の値をスレッド返信として観測する）
 const FAKE_CODEX = `#!/usr/bin/env node
 const fs = require("fs");
@@ -83,7 +97,7 @@ async function waitFor(fn, label, ms = 20000) {
 let tmpA, serverA, portA, apiA, ctlA, topicA;
 
 // ---- B: srt なし＋資格検査 off ----
-let tmpB, serverB, portB, apiB;
+let tmpB, serverB, portB, apiB, topicB;
 
 before(async () => {
   // A
@@ -93,6 +107,7 @@ before(async () => {
   fs.writeFileSync(path.join(binA, "srt"), FAKE_SRT, { mode: 0o755 });
   fs.writeFileSync(path.join(binA, "claude"), FAKE_CLAUDE, { mode: 0o755 });
   fs.writeFileSync(path.join(binA, "codex"), FAKE_CODEX, { mode: 0o755 });
+  fs.writeFileSync(path.join(binA, "grok"), FAKE_GROK, { mode: 0o755 });
   ctlA = path.join(tmpA, "ctl.json");
   fs.writeFileSync(ctlA, JSON.stringify({}));
   fs.writeFileSync(path.join(binA, "srt") + ".env", ctlA);
@@ -105,8 +120,9 @@ before(async () => {
   let errA = ""; serverA.stderr.on("data", (d) => (errA += d));
   apiA = apiFor(portA, CRED);
   await waitFor(async () => { try { return (await apiA("GET", "/api/state")).status === 200; } catch { return false; } }, "server A start: " + errA, 15000);
-  for (const a of ["claude", "codex"]) await apiA("PATCH", "/api/agents/" + a, { auto: true });
-  topicA = (await apiA("GET", "/api/state")).body.topics[0].id;
+  await waitFor(async () => (await apiA("GET", "/api/state")).body.agents.grok.authed === true, "grok auth probe (A)");
+  for (const a of ["claude", "codex", "grok"]) await apiA("PATCH", "/api/agents/" + a, { auto: true });
+  topicA = (await apiA("POST", "/api/topics", { title: "GA", participants: ["claude", "codex", "grok"] })).body.id;
 
   // B
   tmpB = fs.mkdtempSync(path.join(os.tmpdir(), "yoseai-fixes-b-"));
@@ -114,6 +130,7 @@ before(async () => {
   const binB = path.join(tmpB, "bin"); fs.mkdirSync(binB);
   fs.writeFileSync(path.join(binB, "claude"), FAKE_CLAUDE, { mode: 0o755 });
   fs.writeFileSync(path.join(binB, "codex"), FAKE_CODEX, { mode: 0o755 });
+  fs.writeFileSync(path.join(binB, "grok"), FAKE_GROK, { mode: 0o755 });
   portB = 20000 + Math.floor(Math.random() * 20000);
   serverB = spawn(process.execPath, ["server.mjs"], {
     cwd: appB,
@@ -124,7 +141,10 @@ before(async () => {
   let errB = ""; serverB.stderr.on("data", (d) => (errB += d));
   apiB = apiFor(portB, null);
   await waitFor(async () => { try { return (await apiB("GET", "/api/state", null, true)).status === 200; } catch { return false; } }, "server B start: " + errB, 15000);
-  for (const a of ["claude", "codex"]) await apiB("PATCH", "/api/agents/" + a, { auto: true, });
+  await waitFor(async () => (await apiB("GET", "/api/state", null, true)).body.agents.grok.authed === true, "grok auth probe (B)");
+  for (const a of ["claude", "codex", "grok"]) await apiB("PATCH", "/api/agents/" + a, { auto: true });
+  // トピック作成と投稿が同ミリ秒だと lastSeenTs の厳密比較で未読ゼロになる競合があるため、ここで作っておく
+  topicB = (await apiB("POST", "/api/topics", { title: "GB", participants: ["claude", "grok"] }, true)).body.id;
 });
 
 after(async () => {
@@ -245,6 +265,54 @@ test("退避ファイルの最終回収に失敗した実行は成功になら�
   } finally {
     fs.writeFileSync(ctlA, JSON.stringify({}));
   }
+});
+
+test("enforced では grok に Bash(*) が付き、unprotected では従来規則のまま（契約-grok許可拡張）", async () => {
+  // A: enforced
+  const beforeA = (await apiA("GET", "/api/state")).body.messages.length;
+  assert.equal((await apiA("POST", "/api/messages", { author: "user", thread: "grok", topicId: topicA, text: "argv" })).status, 201);
+  const rA = await waitFor(async () => {
+    const msgs = (await apiA("GET", "/api/state")).body.messages;
+    return msgs.length > beforeA ? msgs.find((m) => m.author === "grok" && m.text.startsWith("argv:")) : null;
+  }, "grok argv reply (enforced)");
+  assert.ok(rA.text.includes("--always-approve"), "enforced は always-approve（Bash(*) 系は実測で無効だった）: " + rA.text);
+  assert.ok(rA.text.includes("--tools"), "正のホワイトリスト方式（--disallowed-tools は always-approve 併用時に効かない実測）");
+  assert.ok(!/--tools [^ ]*spawn_subagent/.test(rA.text), "spawn_subagent はホワイトリストに入れない");
+  // B: unprotected
+  const beforeB = (await apiB("GET", "/api/state", null, true)).body.messages.length;
+  assert.equal((await apiB("POST", "/api/messages", { author: "user", thread: "grok", topicId: topicB, text: "argv" }, true)).status, 201);
+  const rB = await waitFor(async () => {
+    const msgs = (await apiB("GET", "/api/state", null, true)).body.messages;
+    return msgs.length > beforeB ? msgs.find((m) => m.author === "grok" && m.text.startsWith("argv:")) : null;
+  }, "grok argv reply (unprotected)");
+  assert.ok(!rB.text.includes("--always-approve"), "unprotected は always-approve を付けない: " + rB.text);
+  assert.ok(rB.text.includes("Bash(python3:*)"), "従来規則は残る");
+});
+
+test("grok セッションの許可構成の印: 同一構成なら resume、印が無い/違うセッションは新規（改版1c §2b）", async () => {
+  // 1回目（前テストで grok は新規セッション・印が記録された）。2回目は同一構成なので --resume が付く。
+  // 前テストの返信を拾わないよう、投稿時刻より後の最後の返信だけを見る
+  const t0 = Date.now();
+  assert.equal((await apiA("POST", "/api/messages", { author: "user", thread: "grok", topicId: topicA, text: "argv2" })).status, 201);
+  const r2 = await waitFor(async () => {
+    const msgs = (await apiA("GET", "/api/state")).body.messages;
+    return msgs.findLast((m) => m.author === "grok" && m.text.startsWith("argv:") && m.ts >= t0) || null;
+  }, "grok resume reply");
+  assert.ok(r2.text.includes("--resume"), "印が一致するので resume される: " + r2.text.slice(0, 120));
+  // 印を意図的に不一致にする（既存セッションに後付けの適合印を与えない規律の裏返し）→ 次のランは新規セッション
+  const st = (await apiA("GET", "/api/state")).body;
+  const sid = st.topics.find((t) => t.id === topicA).agents.grok.sessionId;
+  assert.ok(sid, "セッションが記録されている");
+  // grokArgsTag を state 上で書き換える公開 API は無いので、resetAgent（印ごとセッションを捨てる既存操作）で代用し、
+  // リセット後の初回が --resume 無しで立つことを確認する
+  assert.equal((await apiA("PATCH", "/api/topics/" + topicA, { resetAgent: "grok" })).status, 200);
+  const t1 = Date.now();
+  assert.equal((await apiA("POST", "/api/messages", { author: "user", thread: "grok", topicId: topicA, text: "argv3" })).status, 201);
+  const r3 = await waitFor(async () => {
+    const msgs = (await apiA("GET", "/api/state")).body.messages;
+    return msgs.findLast((m) => m.author === "grok" && m.text.startsWith("argv:") && m.ts >= t1) || null;
+  }, "grok fresh reply after reset");
+  assert.ok(!r3.text.includes("--resume"), "リセット後は新規セッション: " + r3.text.slice(0, 120));
 });
 
 // ---- 回帰: ディレクトリへの /api/pool/file はプロセスを落とさず 404 ----
