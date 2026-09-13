@@ -94,10 +94,10 @@ async function waitFor(fn, label, ms = 20000) {
 }
 
 // ---- A: enforced（偽 srt）＋資格あり ----
-let tmpA, serverA, portA, apiA, ctlA, topicA;
+let tmpA, serverA, portA, apiA, ctlA, topicA, homeA;
 
 // ---- B: srt なし＋資格検査 off ----
-let tmpB, serverB, portB, apiB, topicB;
+let tmpB, serverB, portB, apiB, topicB, homeB;
 
 before(async () => {
   // A
@@ -108,13 +108,16 @@ before(async () => {
   fs.writeFileSync(path.join(binA, "claude"), FAKE_CLAUDE, { mode: 0o755 });
   fs.writeFileSync(path.join(binA, "codex"), FAKE_CODEX, { mode: 0o755 });
   fs.writeFileSync(path.join(binA, "grok"), FAKE_GROK, { mode: 0o755 });
+  homeA = path.join(tmpA, "home");
+  fs.mkdirSync(path.join(homeA, ".grok"), { recursive: true });
+  fs.writeFileSync(path.join(homeA, ".grok", "auth.json"), "{}"); // 認証済みの体（CI には実機の ~/.grok が無い）
   ctlA = path.join(tmpA, "ctl.json");
   fs.writeFileSync(ctlA, JSON.stringify({}));
   fs.writeFileSync(path.join(binA, "srt") + ".env", ctlA);
   portA = 20000 + Math.floor(Math.random() * 20000);
   serverA = spawn(process.execPath, ["server.mjs"], {
     cwd: appA,
-    env: { ...process.env, U2A2A_ADMIN_CREDENTIAL: CRED, U2A2A_PORT: String(portA), PATH: binA + ":" + process.env.PATH },
+    env: { ...process.env, HOME: homeA, U2A2A_ADMIN_CREDENTIAL: CRED, U2A2A_PORT: String(portA), PATH: binA + ":" + process.env.PATH },
     stdio: ["ignore", "ignore", "pipe"],
   });
   let errA = ""; serverA.stderr.on("data", (d) => (errA += d));
@@ -127,6 +130,9 @@ before(async () => {
   // B
   tmpB = fs.mkdtempSync(path.join(os.tmpdir(), "yoseai-fixes-b-"));
   const appB = makeApp(tmpB);
+  homeB = path.join(tmpB, "home");
+  fs.mkdirSync(path.join(homeB, ".grok"), { recursive: true });
+  fs.writeFileSync(path.join(homeB, ".grok", "auth.json"), "{}");
   const binB = path.join(tmpB, "bin"); fs.mkdirSync(binB);
   fs.writeFileSync(path.join(binB, "claude"), FAKE_CLAUDE, { mode: 0o755 });
   fs.writeFileSync(path.join(binB, "codex"), FAKE_CODEX, { mode: 0o755 });
@@ -135,7 +141,7 @@ before(async () => {
   serverB = spawn(process.execPath, ["server.mjs"], {
     cwd: appB,
     // 実機にはグローバルの srt が入っているので、存在しないコマンド名で「ラッパー不在」を再現する
-    env: { ...process.env, U2A2A_CREDENTIALS: "off", U2A2A_SANDBOX_CMD: "yoseai-test-no-srt", U2A2A_PORT: String(portB), PATH: binB + ":" + process.env.PATH },
+    env: { ...process.env, HOME: homeB, U2A2A_CREDENTIALS: "off", U2A2A_SANDBOX_CMD: "yoseai-test-no-srt", U2A2A_PORT: String(portB), PATH: binB + ":" + process.env.PATH },
     stdio: ["ignore", "ignore", "pipe"],
   });
   let errB = ""; serverB.stderr.on("data", (d) => (errB += d));
