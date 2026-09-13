@@ -173,6 +173,12 @@ test("grok 402: ⚠ 行・ta.lastError・availability=unavailable、別トピッ
   assert.equal(s.agents.grok.availability, "unavailable");
   assert.ok(s.agents.grok.lastError.includes("残高"), "バッジ用 a.lastError: " + s.agents.grok.lastError);
   assert.ok(!topicOf(s, topic2).agents.grok.lastError, "別トピックへ漏れない");
+  // 席全体の事情は topic2 にも複製される（次のテストで復帰時の一括クリアを見る）
+  assert.equal((await api("POST", "/api/messages", { author: "user", thread: "grok", topicId: topic2, text: "残高切れ試験2" })).status, 201);
+  await waitFor(async () => {
+    const st = await getState();
+    return topicOf(st, topic2).agents.grok.lastError ? st : null;
+  }, "⚠ in topic2 too");
 });
 
 test("claude の一般失敗: availability=unknown に更新される（受入⑧、unavailable が残らない）", async () => {
@@ -184,9 +190,11 @@ test("claude の一般失敗: availability=unknown に更新される（受入�
   }, "⚠ line for claude");
   assert.equal(s.agents.claude.availability, "unknown");
   assert.ok(topicOf(s, topic1).agents.claude.lastError);
+  // outcome の detail も定型のみ（生文 "boom" が agentOutcomes → API へ流れない——指摘#1）
+  assert.ok(!JSON.stringify(s.agentState || {}).includes("boom"), "agentState に生文が出ない");
 });
 
-test("成功で availability=available・ta.lastError が空へ戻る（受入④）", async () => {
+test("成功で availability=available・ta.lastError が空へ戻る。席全体の複製は全トピック消える（受入④・指摘#4）", async () => {
   writeCtl({});
   assert.equal((await api("POST", "/api/messages", { author: "user", thread: "grok", topicId: topic1, text: "回復試験" })).status, 201);
   const s = await waitFor(async () => {
@@ -195,6 +203,7 @@ test("成功で availability=available・ta.lastError が空へ戻る（受入�
   }, "grok recovery reply");
   assert.equal(s.agents.grok.availability, "available");
   assert.equal(topicOf(s, topic1).agents.grok.lastError, "");
+  assert.equal(topicOf(s, topic2).agents.grok.lastError, "", "残高切れ由来の複製は実行していないトピックからも消える（指摘#4）");
 });
 
 test("review 失敗も同じ可視化（3経路の網羅・codex レビュー）", async () => {

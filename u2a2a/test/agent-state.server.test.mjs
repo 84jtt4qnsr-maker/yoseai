@@ -242,7 +242,10 @@ test("3. 失敗は failed/error としてそのトピックに残り、global �
   assert.equal(g.agents.claude.byTopic[T2], undefined, "別トピックへ波及しない");
   assert.equal(g.agents.claude.outcomes.length, 1);
   assert.equal(g.agents.claude.outcomes[0].topicId, T1);
-  assert.match(g.agents.claude.outcomes[0].detail, /fake failure/);
+  // 契約-不在可視化 §2（99597f3 の後続修正）: outcome の detail は定型・分類済み短文のみ。
+  // 生文（fake failure）は API・state.json へ出ない——起動端末の stderr にだけ残る
+  assert.ok(!g.agents.claude.outcomes[0].detail.includes("fake failure"), "生文が outcome に出ない");
+  assert.match(g.agents.claude.outcomes[0].detail, /実行に失敗しました/);
   await idle();
   writeCtl({});
 });

@@ -3296,7 +3296,7 @@ function updateFlowCard(card, node, saved, origin) {
   const detailState = expanded ? messages.flatMap((m) => {
     const hop = (node.hops || []).find((h) => h.messageId === m.id);
     const paths = [...new Set(m.text.match(/u2a2a\/pool\/[^\s)"'`」()）]+/g) || [])].slice(0, 4);
-    return [m.id, m.text, JSON.stringify([m.author, m.thread, m.ts, provOf(m), m.taskId, m.test, m.cancelled, m.budget,
+    return [m.id, m.text, JSON.stringify([m.author, m.thread, m.ts, provOf(m), m.taskId, m.test, m.cancelled, m.failed, m.budget,
       m.meta ? metaText(m.meta) : null, m.meta?.status, hop?.seq, hop?.turn, rawView.has(m.id), expandedRelays.has(m.id),
       paths.map((path) => mediaFailed.has(path.slice("u2a2a/pool/".length)))])];
   }) : [];
@@ -4590,10 +4590,11 @@ function messageEl(m, { onChange, onOpenColumn }) {
     }));
   if (m.taskId) meta.appendChild(el("span", { text: "（タスク結果）" }));
   if (m.test) meta.appendChild(el("span", { text: "（🧪テスト）" }));
-  if (pv.trigger === "auto" && !m.cancelled && !m.budget) meta.appendChild(el("span", { text: "（自動応答）" }));
+  if (pv.trigger === "auto" && !m.cancelled && !m.failed && !m.budget) meta.appendChild(el("span", { text: "（自動応答）" }));
   if (pv.delivery === "qa-relay") meta.appendChild(el("span", { text: "（質疑）" }));
   if (pv.ingress === "cli-sync") meta.appendChild(el("span", { text: "（外部セッションから同期）" }));
   if (m.cancelled) meta.appendChild(el("span", { text: "（キャンセル）" }));
+  if (m.failed) meta.appendChild(el("span", { class: "stopped-note", text: "（失敗）" })); // ⚠ 行を普通の応答と見分ける（指摘#6）
   if (m.author === "grok" && m.meta?.status === "stopped") meta.appendChild(el("span", { class: "stopped-note", text: "権限要求または中断で停止" }));
 
   const isRaw = rawView.has(m.id);

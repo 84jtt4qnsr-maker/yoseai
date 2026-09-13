@@ -117,7 +117,7 @@ function defaultAgent(agentId = "claude") {
   // auto: 新しい環境は OFF から始める（最初の発言で CLI が走って課金されないように。ON は画面から選ぶ）。
   //   既存の state.json は loadState の移行で保存値を維持する（ここの既定値は新規作成時だけ効く）
   // authed: grok のみ判定する（null = 確認中）。claude / codex は従来どおり true 扱い
-  return { auto: false, lastError: "", model: "", modelOverride: "", authed: agentId === "grok" ? null : true, authCheckedTs: 0 };
+  return { auto: false, lastError: "", model: "", modelOverride: "", authed: agentId === "grok" ? null : true, authCheckedTs: 0, availability: null };
 }
 
 // 参加・宛先として選べるか（自動応答 ON かつ認証済み）
@@ -287,6 +287,7 @@ function loadState() {
           // schemaVersion 7: grok の認証状態は起動時に再判定する（保存値は「確認中」に戻す）
           authed: a === "grok" ? null : true,
           authCheckedTs: 0,
+          availability: null, // 再起動で再評価（未評価へ戻す。キーは常に存在させ /api/state の形を安定させる——指摘#8）
         };
       }
       for (const t of parsed.topics) {
@@ -1436,8 +1437,9 @@ function isolationError(reason) {
 // 実行失敗（キャンセル以外）を黙らせない: 依頼のあったスレッドに ⚠ 行を1通、トピック側 ta.lastError、
 // 可用性（unavailable / unknown）とバッジ用の a.lastError を1か所で更新する。
 // thread / review / fix の3経路の catch から共通で呼ぶ（分類関数を経路ごとに散らすと漏れる——契約 §1）
-function noteRunFailure(topicId, agent, e, kind) {
-  const cls = classifyBackendError(agent, e);
+// cli は実行バックエンドの CLI（第1段は席＝CLI。第2段で resolveBackend() が入っても差分がここで済むよう分離——指摘#5）
+function noteRunFailure(topicId, agent, e, kind, cli = agent) {
+  const cls = classifyBackendError(cli, e);
   const a = state.agents[agent];
   if (a) {
     a.availability = cls.availability; // unknown も上書きする（unavailable が残り続けない——契約 §4）
@@ -1469,6 +1471,8 @@ function noteRunFailure(topicId, agent, e, kind) {
 // 実行成功（stopped / cancelled を除く）で可用性とトピック側エラーを戻す（契約 §3・§4）
 function noteRunSuccess(topicId, agent) {
   const a = state.agents[agent];
+  const wasUnavailable = !!(a && a.availability === "unavailable");
+  const seatError = a ? a.lastError : "";
   if (a) {
     a.availability = "available";
     a.lastError = ""; // available と旧エラーを併存させない（契約 §4・codex レビュー）
@@ -1476,6 +1480,15 @@ function noteRunSuccess(topicId, agent) {
   const topic = findTopic(topicId);
   const ta = topic && topic.agents && topic.agents[agent];
   if (ta) ta.lastError = "";
+  // 残高切れ等の「席全体の事情」は各トピックに同じ短文で複製される。席が復帰したら全トピック分を消す
+  // （残すと、復帰後も別トピックの列で古い残高エラーが availability より先に表示され続ける——指摘#4）。
+  // 複製かどうかは文言の厳密一致で判定できる（unavailable の detail は定型）
+  if (wasUnavailable && seatError) {
+    for (const t of state.topics) {
+      const tta = t.agents && t.agents[agent];
+      if (tta && tta.lastError === seatError) tta.lastError = "";
+    }
+  }
 }
 
 // 退避ファイルを最後まで回収できなかった実行は成功にしない（修正リスト-確定 P1-2）。
@@ -2136,6 +2149,7 @@ async function checkGrokAuth() {
   let message = "";
   if (!fs.existsSync(GROK_AUTH_FILE)) {
     message = "未認証（grok login が必要）";
+    g.availability = "unknown"; // ログアウト後に「available」を残さない（契約 §4「証拠なしに利用可能を示さない」——指摘#7）
   } else {
     // プローブは ping を返すだけで何も書かないので、読み取りのみのプロファイル（grok/review）で起こす。
     // 隔離が blocked のときは起動されないので、認証は「不明」ではなく未認証扱いにせず、そのまま前回値を残す
@@ -2844,13 +2858,13 @@ async function runReview(itemId, reviewer, ropts = {}) {
       ts: Date.now(),
       ...reviewVersionFields(item, history),
     });
-    if (!e.cancelled) noteRunFailure(itemOutcomeTopic(item), reviewer, e, "レビュー"); // キャンセルは対象外（契約 §2）
+    const cls = e.cancelled ? null : noteRunFailure(itemOutcomeTopic(item), reviewer, e, "レビュー"); // キャンセルは対象外（契約 §2）
     noteOutcome(
       itemOutcomeTopic(item),
       reviewer,
       e.cancelled
         ? { type: "stopped", kind: "review", reason: "cancelled", runId: run.runId, itemId } // キャンセルは失敗として表示しない（合意§3）
-        : { type: "failed", kind: "review", reason: "error", runId: run.runId, itemId, detail: String(e.message || e) }
+        : { type: "failed", kind: "review", reason: "error", runId: run.runId, itemId, detail: cls.detail } // 生文を outcome に残さない（指摘#1）
     );
   } finally {
     finish();
@@ -2968,7 +2982,7 @@ async function runFix(itemId, agent, fopts = {}) {
     }
   } catch (e) {
     Object.assign(fix, { text: "（修正失敗: " + String(e.message || e).slice(0, 300) + "）", error: true, cancelled: !!e.cancelled, meta: fix.meta || e.meta || null });
-    if (!e.cancelled) noteRunFailure(itemOutcomeTopic(item), agent, e, "修正"); // キャンセルは対象外（契約 §2）
+    if (!e.cancelled) fix.publicDetail = noteRunFailure(itemOutcomeTopic(item), agent, e, "修正").detail; // キャンセルは対象外（契約 §2）
   }
   // 修正後の版を成否問わず保存（失敗・中断時は partial）→ ロック解除 → 正常完了かつ履歴保存に成功したときだけ自動再レビュー
   let historyOk = true;
@@ -2995,7 +3009,7 @@ async function runFix(itemId, agent, fopts = {}) {
     fix.stopped || fix.cancelled
       ? { type: "stopped", kind: "fix", ...(fix.cancelled ? { reason: "cancelled" } : {}), runId: run.runId, itemId }
       : fix.error
-        ? { type: "failed", kind: "fix", reason: "error", runId: run.runId, itemId, detail: fix.text }
+        ? { type: "failed", kind: "fix", reason: "error", runId: run.runId, itemId, detail: fix.publicDetail || "実行に失敗しました（分類外のエラー。詳細は起動端末のログに出力）" } // 生文を outcome に残さない（指摘#1）
         : !historyOk
           ? { type: "failed", kind: "fix", reason: "history", runId: run.runId, itemId, detail: fix.historyError }
           : { type: "completed", kind: "fix" }
@@ -3103,7 +3117,8 @@ async function runSummary(topic, msgs, trigger) {
       // 明示的な中断は失敗ではない（見送り扱い）
       setSummaryState(topic, { phase: "skipped", reason: "cancelled", detail: "", trigger });
     } else {
-      setSummaryState(topic, { phase: "failed", reason: "error", detail: String(e.message || e).slice(0, 200), trigger });
+      setSummaryState(topic, { phase: "failed", reason: "error", detail: classifyBackendError("claude", e).detail, trigger }); // summaryState も publicState で配信される。生文を載せない（#1 と同型）
+      console.error("[yoseai] 要約の失敗（生文・端末のみ）: " + String((e && e.message) || e || "").slice(0, 500));
       logEvent("summary", `スレッド要約の生成に失敗（${topic.title}）: ` + (e.message || e), "warn");
     }
   } finally {
@@ -3358,6 +3373,7 @@ async function agentLoop(topicId, agent) {
       if (pc.blockReason) {
         if (sameRelay()) stopRelay(topic, "error");
         a.lastError = pc.blockReason;
+        ta.lastError = pc.blockReason; // 列は ta のみを読む（契約 §3）。ここだけ書き漏れると理由が列から消える（指摘#2）
         state.messages.push({
           id: id(),
           topicId,
@@ -3405,9 +3421,15 @@ async function agentLoop(topicId, agent) {
         if (model) a.model = model;
         ta.lastSeenTs = msgs[msgs.length - 1].ts;
         const stopped = !!(meta && meta.status === "stopped");
-        a.lastError = stopped ? GROK_STOP_NOTE : ""; // 権限要求または中断で停止した応答は赤字で示す
-        if (stopped) ta.lastError = GROK_STOP_NOTE; // UI は ta を読む（契約 §3）。停止理由が列から消えないように（codex レビュー）
-        else noteRunSuccess(topicId, agent); // 成功系のみ可用性を戻す（stopped は戻さない——契約 §4）
+        // 権限要求または中断で停止した応答は赤字で示す（UI は ta を読む——契約 §3）。
+        // 成功時の a.lastError クリアは noteRunSuccess に一元化する: 先にここで消すと、
+        // 「席全体の複製を一括クリアする」判定材料（旧 a.lastError）が失われる（指摘#4 の回帰で発覚）
+        if (stopped) {
+          a.lastError = GROK_STOP_NOTE;
+          ta.lastError = GROK_STOP_NOTE;
+        } else {
+          noteRunSuccess(topicId, agent); // 成功系のみ可用性を戻す（stopped は戻さない——契約 §4）
+        }
         // 応答待ちの間にリレーが停止・別リレーになっていたら、この応答は旧リレーの発言。記録はするが中継・議題採用はしない
         const relayLive = sameRelay();
         const stale = !!relayIdAtStart && !relayLive;
@@ -3477,8 +3499,9 @@ async function agentLoop(topicId, agent) {
             ts: Date.now(),
           });
         } else {
-          noteRunFailure(topicId, agent, e, "応答"); // ⚠ 行・ta.lastError・可用性・a.lastError を一括（契約 §1〜§4）
-          noteOutcome(topicId, agent, { type: "failed", kind: "thread", reason: "error", runId: run.runId, detail: String(e.message || e) });
+          const cls = noteRunFailure(topicId, agent, e, "応答"); // ⚠ 行・ta.lastError・可用性・a.lastError を一括（契約 §1〜§4）
+          // outcome の detail も定型短文（生文は agentOutcomes → state.json / API へ永続配信されてしまう——指摘#1）
+          noteOutcome(topicId, agent, { type: "failed", kind: "thread", reason: "error", runId: run.runId, detail: cls.detail });
         }
       } finally {
         endRun(run.runId);
