@@ -40,6 +40,7 @@
     });
     let data;
     try { data = await response.json(); } catch { data = {error: '応答をJSONとして読めません。', code: 'invalid-response'}; }
+    if (response.status === 401) globalThis.YoseaiAccess?.onUnauthorized();
     if (!response.ok || data.code === 'invalid-response') {
       const error = new Error(data.error || '通信に失敗しました。');
       error.status = response.status; error.code = data.code; error.data = data; throw error;

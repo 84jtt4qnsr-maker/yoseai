@@ -11,6 +11,19 @@ import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as V from "../verification.mjs";
 
+// 管理資格（契約-資格隔離API.md §4）。サーバへ同じ値を U2A2A_ADMIN_CREDENTIAL で渡し、
+// ここでは全要求へ Authorization を足す（画面側の fetch 包みと同じ扱い）
+const CRED = "c".repeat(64);
+// 強制層は測らない（この機械に srt が入っていても結果が変わらないように、必ず不在にする）。
+// 隔離の統合そのものは isolation.server.test.mjs で見る
+const NO_SANDBOX = "u2a2a-sandbox-absent";
+const rawFetch = globalThis.fetch;
+globalThis.fetch = (input, init = {}) => {
+  const headers = new Headers(init.headers || undefined);
+  if (!headers.has("Authorization")) headers.set("Authorization", "Bearer " + CRED);
+  return rawFetch(input, { ...init, headers });
+};
+
 const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TOPIC_DIR = "topics/0123456789abcdef";
 const IMPL = TOPIC_DIR + "/impl-t";
@@ -69,7 +82,7 @@ function writeImpl(rel, { patch, commit, checks = () => [], files = {} }) {
 
 async function startServer() {
   port = 20000 + Math.floor(Math.random() * 20000);
-  server = spawn(process.execPath, ["server.mjs"], { cwd: appDir, env: { ...process.env, HOME: home, U2A2A_PORT: String(port) }, stdio: ["ignore", "pipe", "pipe"] });
+  server = spawn(process.execPath, ["server.mjs"], { cwd: appDir, env: { ...process.env, U2A2A_ADMIN_CREDENTIAL: CRED, U2A2A_SANDBOX_CMD: NO_SANDBOX, HOME: home, U2A2A_PORT: String(port) }, stdio: ["ignore", "pipe", "pipe"] });
   let err = "";
   server.stderr.on("data", (d) => (err += d));
   server.stdout.on("data", () => {});
@@ -102,7 +115,7 @@ before(async () => {
 
   appDir = path.join(tmp, "u2a2a");
   fs.mkdirSync(path.join(appDir, "public"), { recursive: true });
-  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "tray.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
+  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "tray.mjs", "credentials.mjs", "sandbox.mjs", "sandbox-profiles.json", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
   fs.writeFileSync(path.join(appDir, "public", "index.html"), "<html></html>");
   poolDir = path.join(appDir, "pool");
   home = path.join(tmp, "home");

@@ -238,7 +238,8 @@ test('integration loads script, mounts launcher, syncs SSE and task-completion d
  const html=fs.readFileSync(new URL('../public/index.html',import.meta.url),'utf8');
  assert.match(html,/<script src="\/tray-ui.js"><\/script>/);
  assert.match(html,/trayUI.update\(state.tray\)/);
- assert.match(html,/es.onerror = \(\) => trayUI.disconnect\(\)/);
+ // SSEは既存yoseaiOpenEvents＋LiveConnection。エラー時に切断表示が呼ばれることを見る
+ assert.match(html,/onDisconnect: \(\) => \{\s*trayUI.disconnect\(\)/);
  assert.match(html,/trayUI.downstream\(t.id\)/);
  assert.match(html,/setViewMode\("columns"\)/);
  const inline=html.split('<script>')[1].split('</script>')[0];new vm.Script(inline);

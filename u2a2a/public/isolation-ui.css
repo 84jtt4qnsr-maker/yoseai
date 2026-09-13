@@ -1,0 +1,14 @@
+.isolation-panel { display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px; padding:8px 16px; border-bottom:1px solid var(--line); background:var(--panel); font-size:12px; }
+.isolation-panel strong { color:var(--text); }
+.isolation-panel[data-mode="unprotected"] strong,.isolation-panel[data-mode="enforced"][data-verified="false"] strong { color:#ecc779; }
+.isolation-panel[data-mode="blocked"] { border-left:4px solid #ed8f8f; }
+.isolation-panel[data-mode="blocked"] strong { color:#ed8f8f; }
+.isolation-panel[data-verified="true"] strong { color:#8ed4ac; }
+.isolation-panel details { flex-basis:100%; color:var(--dim); }
+.isolation-panel details p { margin:6px 0; overflow-wrap:anywhere; }
+.credential-dialog { width:min(540px,calc(100vw - 32px)); box-sizing:border-box; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:24px; }
+.credential-dialog::backdrop { background:#000a; }
+.credential-dialog label { display:block; }
+.credential-dialog input { display:block; box-sizing:border-box; width:100%; margin:8px 0; padding:10px; color:var(--text); background:var(--bg); border:1px solid var(--line); border-radius:6px; }
+.credential-dialog p { line-height:1.7; font-size:13px; }
+.credential-dialog button { margin:8px 8px 0 0; }

@@ -9,6 +9,19 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+// 管理資格（契約-資格隔離API.md §4）。サーバへ同じ値を U2A2A_ADMIN_CREDENTIAL で渡し、
+// ここでは全要求へ Authorization を足す（画面側の fetch 包みと同じ扱い）
+const CRED = "c".repeat(64);
+// 強制層は測らない（この機械に srt が入っていても結果が変わらないように、必ず不在にする）。
+// 隔離の統合そのものは isolation.server.test.mjs で見る
+const NO_SANDBOX = "u2a2a-sandbox-absent";
+const rawFetch = globalThis.fetch;
+globalThis.fetch = (input, init = {}) => {
+  const headers = new Headers(init.headers || undefined);
+  if (!headers.has("Authorization")) headers.set("Authorization", "Bearer " + CRED);
+  return rawFetch(input, { ...init, headers });
+};
+
 const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // 偽 claude / codex: stdin のプロンプトと引数を記録し、制御どおりに応答する
@@ -17,7 +30,7 @@ const fs = require("fs");
 const path = require("path");
 const kind = ${JSON.stringify(kind)};
 let ctl = {};
-try { ctl = JSON.parse(fs.readFileSync(process.env.U2A2A_FAKE_CTL, "utf8")); } catch (e) {}
+try { ctl = JSON.parse(fs.readFileSync(fs.readFileSync(__filename + ".env", "utf8").trim(), "utf8")); } catch (e) {}
 const c = ctl[kind] || {};
 let prompt = "";
 process.stdin.setEncoding("utf8");
@@ -46,7 +59,7 @@ const FAKE_GROK = `#!/usr/bin/env node
 const fs = require("fs");
 const path = require("path");
 let ctl = {};
-try { ctl = JSON.parse(fs.readFileSync(process.env.U2A2A_FAKE_CTL, "utf8")); } catch (e) {}
+try { ctl = JSON.parse(fs.readFileSync(fs.readFileSync(__filename + ".env", "utf8").trim(), "utf8")); } catch (e) {}
 const c = ctl.grok || {};
 const argv = process.argv.slice(2);
 const n = Date.now() + "-" + Math.random().toString(16).slice(2, 8);
@@ -137,9 +150,11 @@ async function say(topicId, thread, text) {
 
 async function startServer() {
   port = 20000 + Math.floor(Math.random() * 20000);
+  // spawnEnv の許可リスト化で U2A2A_FAKE_* は子へ渡らない。偽 CLI の隣へ控えを置く
+  for (const f of fs.readdirSync(fakeBin)) if (!f.endsWith(".env")) fs.writeFileSync(path.join(fakeBin, f) + ".env", ctlFile);
   server = spawn(process.execPath, ["server.mjs"], {
     cwd: appDir,
-    env: { ...process.env, HOME: home, U2A2A_PORT: String(port), PATH: fakeBin + ":" + process.env.PATH, U2A2A_FAKE_CTL: ctlFile },
+    env: { ...process.env, U2A2A_ADMIN_CREDENTIAL: CRED, U2A2A_SANDBOX_CMD: NO_SANDBOX, HOME: home, U2A2A_PORT: String(port), PATH: fakeBin + ":" + process.env.PATH },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let err = "";
@@ -182,7 +197,7 @@ before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u2a2a-grok-"));
   appDir = path.join(tmp, "u2a2a");
   fs.mkdirSync(path.join(appDir, "public"), { recursive: true });
-  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "tray.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
+  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "tray.mjs", "credentials.mjs", "sandbox.mjs", "sandbox-profiles.json", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
   fs.writeFileSync(path.join(appDir, "public", "index.html"), "<html></html>");
   poolDir = path.join(appDir, "pool");
   fs.mkdirSync(poolDir);

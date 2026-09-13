@@ -1047,6 +1047,8 @@
 <header>
   <h1>Yoseai</h1>
   <span class="sub">よせあい ／ ユーザー ⇄ 参加エージェント ／ やり取りから生まれたタスクを各アプリで作業し、結果を再入力する</span>
+  <!-- 隔離の状態（契約-資格隔離API.md §2.4）。未保護・未検証のときこそ出し続ける -->
+  <span id="isolation-badge" class="small" role="status" hidden></span>
   <button id="budget-btn" class="small" style="margin-left:auto" title="実行の上限設定（コスト・回数・時間）">⚙ 上限</button>
   <button type="button" id="usage-btn" class="small" title="発言・レビュー・修正・要約の使用量内訳">📊 使用量</button>
   <button id="projects-btn" class="small">📁 プロジェクト</button>
@@ -1326,11 +1328,57 @@
 
 <div id="toast"></div>
 
+<!-- 管理資格（契約-資格隔離API.md §4.1）。サーバを起動した端末に出た URL の #t=… から受け取る。
+     フラグメントはサーバへ送られないので、アクセスログにも Referer にも載らない。
+     受け取ったらすぐ URL から消し、sessionStorage（タブを閉じれば消える）に置く。
+     以降の同一オリジン要求すべてに Authorization を足すため、ここで fetch を包む。
+     他のスクリプトより先に読み込むこと（既定の fetch を掴んでいる場所があるため） -->
+<script>
+(function () {
+  const KEY = "yoseai.credential";
+  const m = /[#&]t=([0-9a-f]{64})(?![0-9a-f])/.exec(location.hash || "");
+  if (m) {
+    try { sessionStorage.setItem(KEY, m[1]); } catch (e) { /* プライベートモード等。その場合は 1 回きりで使う */ }
+    history.replaceState(null, "", location.pathname + location.search); // 履歴・共有リンクに資格を残さない
+  }
+  let fallback = m ? m[1] : "";
+  const token = () => { try { return sessionStorage.getItem(KEY) || fallback; } catch (e) { return fallback; } };
+  window.yoseaiCredential = token;
+
+  const raw = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    const t = token();
+    if (!t) return raw(input, init);
+    const href = typeof input === "string" ? input : (input && input.url) || "";
+    let sameOrigin = true;
+    try { sameOrigin = new URL(href, location.href).origin === location.origin; } catch (e) { sameOrigin = false; }
+    if (!sameOrigin) return raw(input, init); // 外部へ資格を送らない
+    const headers = new Headers((init && init.headers) || (typeof Request !== "undefined" && input instanceof Request ? input.headers : undefined));
+    if (!headers.has("Authorization")) headers.set("Authorization", "Bearer " + t);
+    return raw(input, Object.assign({}, init, { headers }));
+  };
+
+  // EventSource はヘッダを付けられないので、使い捨ての切符を取ってから開く（§4.2）
+  window.yoseaiOpenEvents = async function () {
+    if (!token()) return new EventSource("/api/events");
+    const r = await window.fetch("/api/events/ticket", { method: "POST" });
+    if (!r.ok) throw new Error("SSE の切符を取得できませんでした（" + r.status + "）");
+    const t = await r.json();
+    return new EventSource("/api/events?ticket=" + encodeURIComponent(t.ticket));
+  };
+})();
+</script>
+<link rel="stylesheet" href="/isolation-ui.css">
+<script src="/isolation-ui.js"></script>
 <script src="/onboarding-ui.js"></script>
 <script src="/avatars.js"></script>
 <script src="/verification-ui.js"></script>
 <script src="/tray-ui.js"></script>
 <script>
+const isolationUI = new YoseaiIsolation.Controller();
+const YoseaiAccess = globalThis.YoseaiAccess = isolationUI.client;
+document.querySelector('header').after(isolationUI.panel);
+isolationUI.bindFiles();
 const NAMES = Object.assign(Object.create(null), { user: "ユーザー" });
 const STATUS_LABEL = { queued: "キュー", working: "作業中", returned: "結果あり", done: "完了" };
 let state = { messages: [], tasks: [], pool: [], topics: [], projects: [], agents: {}, running: {}, reviewPending: {}, fixPending: {}, activity: {}, runs: [], events: [], storageMetrics: {} };
@@ -1476,6 +1524,7 @@ async function api(path, method = "GET", body, { silent = false } = {}) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
+    if (res.status === 401) isolationUI.lock("資格が無効または失効しています。端末の新しいURLを入力してください。");
     if (!silent) toast(err.error || "エラーが発生しました");
     throw Object.assign(new Error(err.error || "取得に失敗しました（HTTP " + res.status + "）"), { status: res.status, data: err });
   }
@@ -1988,7 +2037,7 @@ function inlineMd(raw) {
     /!\[([^\]]*)\]\((?:(https?:[^)\s]+)|(?:\/api\/pool\/file\/|u2a2a\/pool\/)([^)\s]+))\)/g,
     (_, alt, abs, rel) => {
       const src = abs || "/api/pool/file/" + rel;
-      return '<img src="' + src + '" alt="' + alt + '" loading="lazy">';
+      return '<img ' + (YoseaiAccess.isApi(src) ? 'data-yoseai-src' : 'src') + '="' + src + '" alt="' + alt + '" loading="lazy">';
     }
   );
   s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
@@ -2123,6 +2172,7 @@ function el(tag, attrs = {}, children = []) {
   for (const [k, v] of Object.entries(attrs)) {
     if (k === "text") node.textContent = v;
     else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else if (k === "src" && YoseaiAccess.isApi(v)) YoseaiAccess.setSource(node, v);
     else node.setAttribute(k, v);
   }
   for (const c of children) node.appendChild(c);
@@ -3537,8 +3587,21 @@ if (typeof ResizeObserver !== "undefined") new ResizeObserver(() => {
 
 
 // ---- render ----
+// 隔離の状態は label をそのまま出す（文言はサーバの describeIsolation が持つ。UI で言い換えない）
+function renderIsolationBadge() {
+  const el = document.getElementById("isolation-badge");
+  if (!el) return;
+  const iso = state.isolation;
+  if (!iso || !iso.label) { el.hidden = true; return; }
+  el.hidden = false;
+  el.textContent = (iso.mode === "enforced" && iso.verified ? "🛡 " : "⚠ ") + iso.label + (iso.credentials === false ? "／資格の検査なし" : "");
+  el.title = iso.reason || (iso.unverified || []).length ? "未確認: " + (iso.unverified || []).join(" / ") + (iso.reason ? "／" + iso.reason : "") : "";
+  el.style.color = iso.mode === "enforced" && iso.verified ? "" : "#b45309";
+}
+
 function render() {
   ensureTopic();
+  renderIsolationBadge();
   const topicId = currentTopic()?.id || null;
   let nextView = flowLoadState === "ready" ? requestedView() : "columns";
   let graph = null;
@@ -3823,12 +3886,11 @@ function poolPreviewEl(p) {
     return body;
   }
   if (extOf(p.file) === "html" || extOf(p.file) === "htm") {
-    // HTML は iframe でその場実行（ゲーム・デモ対応）。
-    // allow-same-origin がないと localStorage 等で成果物側が停止するため付与
-    // （ローカル単一ユーザーのツールで、プール内容は自分のエージェント由来という前提）
+    // Bootstrap owns a credential in sessionStorage: artifacts must not inherit that origin.
+    // Blob previews use an opaque sandbox; relative assets need a separate viewer contract.
     body.appendChild(el("iframe", {
       src: url + "?v=" + (p.mtime || 0),
-      sandbox: "allow-scripts allow-same-origin allow-pointer-lock",
+      sandbox: "allow-scripts allow-pointer-lock",
       style: "width:100%;height:420px;border:1px solid var(--line);border-radius:8px;background:#0e1116;",
     }));
     return body;
@@ -5288,17 +5350,30 @@ function wireAgent(agent) {
     openCtxMenu(r.left, r.bottom + 4, items);
   });
 }
-// ---- live sync ----
-const es = new EventSource("/api/events");
-es.onerror = () => trayUI.disconnect();
-es.onmessage = (e) => {
-  state = JSON.parse(e.data);
+// ---- live sync: original bootstrap owns credentials and SSE ticket issuance ----
+function receiveState(next) {
+  state = next;
+  isolationUI.update(state.isolation);
+  YoseaiAccess.resume();
   if (state.tray) trayUI.update(state.tray);
   else trayUI.disconnect("判断トレイAPIはまだ利用できません。");
   noteMessageSearchUpdate();
   render();
-};
-render();
+}
+const live = new YoseaiIsolation.LiveConnection({
+  onState: receiveState,
+  onUnauthorized: () => isolationUI.lock("資格が無効または未入力です。起動端末の新しいURLを入力してください。"),
+  onDisconnect: () => {
+    trayUI.disconnect();isolationUI.update(null);
+    isolationUI.reason.textContent = "接続が途切れました。再接続時に保護状態を確認します。403の場合は端末と同じローカルURLで開いてください。";
+  },
+});
+isolationUI.onLock = () => {live.stop();YoseaiAccess.clear();trayUI.disconnect("資格の確認が必要です。");};
+window.addEventListener('pagehide', () => live.stop());
+window.addEventListener('pageshow', e => {if(e.persisted && window.yoseaiCredential())live.start();});
+render(); // Show the normal shell and operating guidance even before credential entry.
+if(window.yoseaiCredential())live.start();
+else isolationUI.open();
 </script>
 <script type="module">
   try {

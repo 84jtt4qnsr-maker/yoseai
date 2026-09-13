@@ -48,6 +48,7 @@
     });
     let data;
     try { data=await response.json(); } catch { throw new Error('サーバの応答を読み取れません。再読込してください。'); }
+    if (response.status === 401) globalThis.YoseaiAccess?.onUnauthorized();
     if (!response.ok) {
       const err=new Error(data.error || '操作を受け付けられませんでした。');
       Object.assign(err,{code:data.code,status:response.status,data}); throw err;

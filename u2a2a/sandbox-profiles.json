@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "_note": "契約-資格隔離API.md §3。統合者の srt スパイク実測（probes/integrator/settings-*.json、srt-08/09/10）が出発点。write の資格・キャッシュ行は「無いと CLI が動かなかった」実測に基づく。読み取りは既定で許可され、denyRead だけが効く（sandbox-runtime に allowRead が無い）",
+  "_selection": "agent と phase の一致が具体的なものが勝つ。agent 一致+phase 一致 > agent 一致+* > * +phase 一致 > *+*。review を phase: \"*\" より効かせるため、エージェントごとに review を別行で置く",
+  "profiles": [
+    {
+      "agent": "claude",
+      "phase": "*",
+      "fs": {
+        "write": ["<poolTopicDir>", "<home>/.claude", "<home>/.claude.json", "<home>/.claude.json.backup", "<home>/Library/Caches/claude-cli-nodejs", "<tmpDir>"],
+        "denyRead": ["<dataDir>", "<profilesPath>", "<home>/.codex", "<home>/.grok"],
+        "denyWrite": []
+      },
+      "net": { "allowDomains": ["*.anthropic.com", "api.anthropic.com", "statsig.anthropic.com", "sentry.io", "*.sentry.io"], "loopback": [] },
+      "unverified": ["controlSocket", "mcp", "execFiles"]
+    },
+    {
+      "agent": "claude",
+      "phase": "review",
+      "fs": {
+        "write": ["<home>/.claude", "<home>/.claude.json", "<home>/.claude.json.backup", "<home>/Library/Caches/claude-cli-nodejs", "<tmpDir>"],
+        "denyRead": ["<dataDir>", "<profilesPath>", "<home>/.codex", "<home>/.grok"],
+        "denyWrite": ["<poolDir>", "<repoRoot>"]
+      },
+      "net": { "allowDomains": ["*.anthropic.com", "api.anthropic.com", "statsig.anthropic.com", "sentry.io", "*.sentry.io"], "loopback": [] },
+      "unverified": ["controlSocket", "mcp", "execFiles"]
+    },
+    {
+      "agent": "codex",
+      "phase": "*",
+      "fs": {
+        "write": ["<poolTopicDir>", "<home>/.codex", "<tmpDir>"],
+        "denyRead": ["<dataDir>", "<profilesPath>", "<home>/.claude", "<home>/.grok"],
+        "denyWrite": []
+      },
+      "net": { "allowDomains": ["*.openai.com", "api.openai.com", "chatgpt.com", "*.chatgpt.com"], "loopback": [] },
+      "unverified": ["mcp", "execFiles"]
+    },
+    {
+      "agent": "codex",
+      "phase": "fix",
+      "fs": {
+        "write": ["<poolDir>", "<home>/.codex", "<tmpDir>"],
+        "denyRead": ["<dataDir>", "<profilesPath>", "<home>/.claude", "<home>/.grok"],
+        "denyWrite": []
+      },
+      "net": { "allowDomains": ["*.openai.com", "api.openai.com", "chatgpt.com", "*.chatgpt.com"], "loopback": [] },
+      "unverified": ["mcp", "execFiles"]
+    },
+    {
+      "agent": "codex",
+      "phase": "review",
+      "fs": {
+        "write": ["<home>/.codex", "<tmpDir>"],
+        "denyRead": ["<dataDir>", "<profilesPath>", "<home>/.claude", "<home>/.grok"],
+        "denyWrite": ["<poolDir>", "<repoRoot>"]
+      },
+      "net": { "allowDomains": ["*.openai.com", "api.openai.com", "chatgpt.com", "*.chatgpt.com"], "loopback": [] },
+      "unverified": ["mcp", "execFiles"]
+    },
+    {
+      "agent": "grok",
+      "phase": "*",
+      "fs": {
+        "write": ["<poolTopicDir>", "<home>/.grok", "<tmpDir>"],
+        "denyRead": ["<dataDir>", "<profilesPath>", "<home>/.claude", "<home>/.codex"],
+        "denyWrite": []
+      },
+      "net": { "allowDomains": ["*.x.ai", "api.x.ai", "*.grok.com"], "loopback": [] },
+      "unverified": ["mcp", "execFiles"]
+    },
+    {
+      "agent": "grok",
+      "phase": "review",
+      "fs": {
+        "write": ["<home>/.grok", "<tmpDir>"],
+        "denyRead": ["<dataDir>", "<profilesPath>", "<home>/.claude", "<home>/.codex"],
+        "denyWrite": ["<poolDir>", "<repoRoot>"]
+      },
+      "net": { "allowDomains": ["*.x.ai", "api.x.ai", "*.grok.com"], "loopback": [] },
+      "unverified": ["mcp", "execFiles"]
+    }
+  ]
+}

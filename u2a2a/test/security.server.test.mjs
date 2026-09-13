@@ -10,6 +10,19 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+// 管理資格（契約-資格隔離API.md §4）。サーバへ同じ値を U2A2A_ADMIN_CREDENTIAL で渡し、
+// ここでは全要求へ Authorization を足す（画面側の fetch 包みと同じ扱い）
+const CRED = "c".repeat(64);
+// 強制層は測らない（この機械に srt が入っていても結果が変わらないように、必ず不在にする）。
+// 隔離の統合そのものは isolation.server.test.mjs で見る
+const NO_SANDBOX = "u2a2a-sandbox-absent";
+const rawFetch = globalThis.fetch;
+globalThis.fetch = (input, init = {}) => {
+  const headers = new Headers(init.headers || undefined);
+  if (!headers.has("Authorization")) headers.set("Authorization", "Bearer " + CRED);
+  return rawFetch(input, { ...init, headers });
+};
+
 const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // 呼ばれたら記録して終わる偽 CLI。grok の認証プローブ（-p）は記録しない（起動時に必ず走るため）
@@ -18,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const kind = ${JSON.stringify(kind)};
 const argv = process.argv.slice(2);
-const log = process.env.U2A2A_FAKE_LOG;
+const log = fs.readFileSync(__filename + ".env", "utf8").trim();
 const done = (line) => process.stdout.write(line + "\\n", () => process.exit(0));
 if (kind === "grok") {
   if (argv.includes("-p")) done(JSON.stringify({ text: "pong", stopReason: "end_turn", sessionId: "g-ping", usage: {}, total_cost_usd: 0 }));
@@ -46,7 +59,9 @@ const cliCalls = () => fs.readdirSync(logDir);
 function raw(method, p, { headers = {}, body = null, hostHeader = null } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: "127.0.0.1", port, path: p, method, headers: { ...(body ? { "content-type": "application/json", "content-length": Buffer.byteLength(body) } : {}), ...headers } },
+      // 管理資格を既定で付ける（このスイートは fetch でなく生 http.request を使うため、冒頭の包みは効かない）。
+      // 呼び出し側が Authorization を明示した場合はそちらを優先する
+      { host: "127.0.0.1", port, path: p, method, headers: { Authorization: "Bearer " + CRED, ...(body ? { "content-type": "application/json", "content-length": Buffer.byteLength(body) } : {}), ...headers } },
       (res) => {
         let text = "";
         res.setEncoding("utf8");
@@ -84,9 +99,11 @@ async function waitFor(fn, label, ms = 20000) {
 
 async function startServer() {
   port = 20000 + Math.floor(Math.random() * 20000);
+  // spawnEnv の許可リスト化で U2A2A_FAKE_* は子へ渡らない。偽 CLI の隣へ控えを置く
+  for (const f of fs.readdirSync(fakeBin)) if (!f.endsWith(".env")) fs.writeFileSync(path.join(fakeBin, f) + ".env", logDir);
   server = spawn(process.execPath, ["server.mjs"], {
     cwd: appDir,
-    env: { ...process.env, HOME: home, U2A2A_PORT: String(port), PATH: fakeBin + ":" + process.env.PATH, U2A2A_FAKE_LOG: logDir },
+    env: { ...process.env, U2A2A_ADMIN_CREDENTIAL: CRED, U2A2A_SANDBOX_CMD: NO_SANDBOX, HOME: home, U2A2A_PORT: String(port), PATH: fakeBin + ":" + process.env.PATH },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let err = "";
@@ -115,7 +132,7 @@ before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "u2a2a-security-"));
   appDir = path.join(tmp, "u2a2a");
   fs.mkdirSync(path.join(appDir, "public"), { recursive: true });
-  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "tray.mjs", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
+  for (const f of ["server.mjs", "lib.mjs", "verification.mjs", "tray.mjs", "credentials.mjs", "sandbox.mjs", "sandbox-profiles.json", "package.json", "public/flow-graph.js", "public/usage.js"]) fs.copyFileSync(path.join(SRC, f), path.join(appDir, f));
   fs.writeFileSync(path.join(appDir, "public", "index.html"), "<html>u2a2a</html>");
   home = path.join(tmp, "home");
   fs.mkdirSync(home);
@@ -219,9 +236,12 @@ test("5. Host が違えば GET も静的配信も 403（DNS リバインディ�
   assert.equal((await raw("GET", "/api/state", { hostHeader: "127.0.0.1" })).status, 403, "ポート無しも 403");
 });
 
-test("6. SSE（/api/events）は正規の Origin で継続する", async () => {
+test("6. SSE（/api/events）は正規の Origin で継続する（切符方式・契約 §4.2）", async () => {
+  // EventSource はヘッダを付けられないため、資格で切符を取り、クエリで渡す
+  const tk = await api("POST", "/api/events/ticket");
+  assert.ok(tk.status < 300 && tk.body?.ticket, "切符の取得: " + tk.status);
   const received = await new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: "/api/events", method: "GET", headers: { origin: origin(), accept: "text/event-stream" } }, (res) => {
+    const req = http.request({ host: "127.0.0.1", port, path: "/api/events?ticket=" + encodeURIComponent(tk.body.ticket), method: "GET", headers: { origin: origin(), accept: "text/event-stream" } }, (res) => {
       if (res.statusCode !== 200) return resolve({ status: res.statusCode, data: "" });
       res.setEncoding("utf8");
       res.once("data", (d) => {

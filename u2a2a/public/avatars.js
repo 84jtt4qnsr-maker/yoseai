@@ -1,6 +1,7 @@
 /* SPEC-アバター状態 v1 adapter. No server state inference. */
 (() => {
   'use strict';
+  const source = (node, url) => globalThis.YoseaiAccess ? globalThis.YoseaiAccess.setSource(node,url) : (node.src=url);
   const IDS = ['claude', 'codex', 'grok'];
   const LETTER = { claude: 'C', codex: 'X', grok: 'G' };
   const TITLE = { idle:'待機', working:'作業中', reviewing:'レビュー中', waiting:'入力待ち', halted:'停止中', failed:'エラー', off:'自動応答OFF' };
@@ -72,7 +73,7 @@
       if (status === 'failed') entry.image=null;
     };
     img.onload=()=>settle('loaded'); img.onerror=()=>settle('failed');
-    img.src=ART+encodeURIComponent(PORTRAITS[agent][0]);
+    source(img,ART+encodeURIComponent(PORTRAITS[agent][0]));
   }
   function enablePortraitLink(node, agent) {
     node.href=ART+encodeURIComponent(PORTRAITS[agent][1]);
@@ -271,7 +272,7 @@
       if(!asset){p.sprite=null;p.loaded=false;p.failed=false;p.image=null;p.placeholder=null;p.still.removeAttribute('src');p.still.hidden=true;p.fallback.hidden=false;return;}
       const placeholder=safeURL(asset.still?.url), sprite=asset.spriteVersionNumber===2 ? safeURL(asset.sprite?.url) : null;
       if(!placeholder){p.placeholder=null;p.still.removeAttribute('src');p.still.hidden=true;p.fallback.hidden=false;}
-      if(placeholder && p.placeholder!==placeholder){p.placeholder=placeholder;p.still.src=placeholder;}
+      if(placeholder && p.placeholder!==placeholder){p.placeholder=placeholder;source(p.still,placeholder);}
       if(sprite!==p.sprite){p.sprite=sprite;p.loaded=false;p.failed=false;p.image=null;p.spriteNode.hidden=true;}
       this.loadSprite(p);
     }
@@ -285,8 +286,8 @@
       const url=p.sprite,img=new Image();p.image=img;
       img.onload=async()=>{try {await img.decode();}catch{} if(p.sprite!==url)return;
         if(img.naturalWidth!==1536 || img.naturalHeight!==2288){p.failed=true;return;}
-        p.loaded=true;p.spriteNode.style.backgroundImage=`url(${JSON.stringify(url)})`;this.sync();};
-      img.onerror=()=>{if(p.sprite===url){p.failed=true;p.image=null;this.refreshStale(url);}};img.src=url;
+        p.loaded=true;p.spriteNode.style.backgroundImage=`url(${JSON.stringify(img.src)})`;this.sync();};
+      img.onerror=()=>{if(p.sprite===url){p.failed=true;p.image=null;this.refreshStale(url);}};source(img,url);
     }
     create(agent) {
       const node=document.createElement('a');node.className='flow-pet';node.style.setProperty('--avatar-color',`var(--${agent})`);
